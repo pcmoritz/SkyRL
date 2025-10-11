@@ -207,13 +207,13 @@ class TinkerEngine:
         padded_inputs = [seq + [0] * (max_len - len(seq)) for seq in all_input_ids]
         padded_targets = [seq + [0] * (max_len - len(seq)) for seq in all_targets]
 
-        input_ids = torch.tensor(padded_inputs, dtype=torch.int32, device=self.device)
-        target_ids = torch.tensor(padded_targets, dtype=torch.int32, device=self.device)
+        input_ids = torch.tensor(padded_inputs, dtype=torch.long, device=self.device)
+        target_ids = torch.tensor(padded_targets, dtype=torch.long, device=self.device)
         adapter_indices = torch.tensor(all_adapter_indices, dtype=torch.int32, device=self.device)
 
         # Create attention mask (1 for real tokens, 0 for padding)
         attention_mask = torch.tensor(
-            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in all_input_ids], dtype=torch.int32, device=self.device
+            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in all_input_ids], dtype=torch.long, device=self.device
         )
         loss_mask = torch.tensor(
             [all_token_weights[i] + [0] * (max_len - len(all_input_ids[i])) for i in range(len(all_token_weights))],
@@ -346,14 +346,9 @@ class TinkerEngine:
                 elif 'lora_B' in name:
                     adapter_state_dict[name] = param[adapter_index, :lora_rank, :].clone()
 
-        # Create a temporary model to save
-        temp_model = nn.Module()
-        temp_model.register_parameter('adapter_params', nn.Parameter(torch.zeros(1)))  # Dummy
-        for name, param in adapter_state_dict.items():
-            temp_model.register_buffer(name, param)
-
-        # Save only the LoRA adapter weights
-        save_checkpoint(self.config, temp_model, output_dir / "adapter_model.safetensors")
+        # Save the adapter weights directly using safetensors
+        import safetensors.torch
+        safetensors.torch.save_file(adapter_state_dict, output_dir / "adapter_model.safetensors")
 
         # Save LoRA config
         lora_config = LoraConfig(
