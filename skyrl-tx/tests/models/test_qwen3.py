@@ -1,9 +1,6 @@
 import os
 import tempfile
 
-from flax import nnx
-import jax
-import jax.numpy as jnp
 import numpy as np
 from peft import LoraConfig, get_peft_model
 import pytest
@@ -17,11 +14,8 @@ from tx.models.qwen3 import Qwen3MoeSparseMoeBlock
 from tx.utils.models import load_checkpoint
 
 
-@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("tp", [1])  # TP=2 not supported in PyTorch version yet
 def test_qwen3(tp: int):
-    if not jax._src.xla_bridge.backends_are_initialized():  # ty: ignore
-        jax.config.update("jax_num_cpu_devices", 2)
-
     if tp > 1 and os.getenv("CI"):
         pytest.skip("TP > 1 currently runs out of memory in the CI")
 
@@ -42,24 +36,35 @@ def test_qwen3(tp: int):
         hf_model.save_pretrained(tmp, safe_serialization=True)
 
         config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
-        mesh = jax.make_mesh((1, tp), ("dp", "tp"))
-        with jax.set_mesh(mesh):
-            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        model = Qwen3ForCausalLM(config, dtype=torch.float32)
         load_checkpoint(tmp, config, model)
+        model.eval()
 
-        outputs = model(batch.input_ids.numpy(), attention_mask=batch.attention_mask.numpy(), output_hidden_states=True)
-        assert np.allclose(hf_outputs.hidden_states[0], outputs["hidden_states"][0], rtol=1e-6)
-        assert np.allclose(hf_outputs.hidden_states[1], outputs["hidden_states"][1], rtol=1e-3, atol=1e-3)
-        assert np.allclose(hf_outputs.hidden_states[-1], outputs["hidden_states"][-1], rtol=1e-3, atol=1e-3)
+        with torch.no_grad():
+            outputs = model(batch.input_ids, attention_mask=batch.attention_mask, output_hidden_states=True)
+
+        # Convert to numpy for comparison
+        hf_hidden_0 = hf_outputs.hidden_states[0].numpy()
+        hf_hidden_1 = hf_outputs.hidden_states[1].numpy()
+        hf_hidden_last = hf_outputs.hidden_states[-1].numpy()
+
+        our_hidden_0 = outputs["hidden_states"][0].numpy()
+        our_hidden_1 = outputs["hidden_states"][1].numpy()
+        our_hidden_last = outputs["hidden_states"][-1].numpy()
+
+        assert np.allclose(hf_hidden_0, our_hidden_0, rtol=1e-6)
+        assert np.allclose(hf_hidden_1, our_hidden_1, rtol=1e-3, atol=1e-3)
+        assert np.allclose(hf_hidden_last, our_hidden_last, rtol=1e-3, atol=1e-3)
 
 
-def load_moe_base_weights(jax_moe_layer: Qwen3MoeSparseMoeBlock, hf_moe_layer: HFQwen3MoeSparseMoeBlock) -> None:
-    """Load base weights from HF MoE layer to JAX MoE layer."""
-    jax_moe_layer.gate.kernel[:] = hf_moe_layer.gate.weight.detach().numpy().T
-    for i, expert in enumerate(hf_moe_layer.experts):
-        jax_moe_layer.experts.gate_proj.weight[i, :, :] = expert.gate_proj.weight.detach().numpy().T
-        jax_moe_layer.experts.up_proj.weight[i, :, :] = expert.up_proj.weight.detach().numpy().T
-        jax_moe_layer.experts.down_proj.weight[i, :, :] = expert.down_proj.weight.detach().numpy().T
+def load_moe_base_weights(torch_moe_layer: Qwen3MoeSparseMoeBlock, hf_moe_layer: HFQwen3MoeSparseMoeBlock) -> None:
+    """Load base weights from HF MoE layer to PyTorch MoE layer."""
+    with torch.no_grad():
+        torch_moe_layer.gate.weight.copy_(hf_moe_layer.gate.weight)
+        for i, expert in enumerate(hf_moe_layer.experts):
+            torch_moe_layer.experts.gate_proj.weight[i, :, :] = expert.gate_proj.weight.T
+            torch_moe_layer.experts.up_proj.weight[i, :, :] = expert.up_proj.weight.T
+            torch_moe_layer.experts.down_proj.weight[i, :, :] = expert.down_proj.weight.T
 
 
 def test_qwen3_moe_layer():
@@ -72,36 +77,37 @@ def test_qwen3_moe_layer():
     with torch.no_grad():
         hf_final_hidden_states, hf_router_logits = hf_moe_layer.forward(x)
 
-    mesh = jax.make_mesh((1, 1), ("dp", "tp"))
-    with jax.set_mesh(mesh):
-        moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
-        load_moe_base_weights(moe_layer, hf_moe_layer)
+    moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=torch.float32)
+    load_moe_base_weights(moe_layer, hf_moe_layer)
+    moe_layer.eval()
 
-    final_hidden_states, router_logits = moe_layer(x.numpy(), return_router_logits=True)
+    with torch.no_grad():
+        final_hidden_states, router_logits = moe_layer(x, return_router_logits=True)
 
-    assert np.allclose(hf_router_logits, router_logits, rtol=1e-4)
-    assert np.allclose(hf_final_hidden_states, final_hidden_states, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(hf_router_logits, router_logits, rtol=1e-4)
+    assert torch.allclose(hf_final_hidden_states, final_hidden_states, rtol=1e-2, atol=1e-2)
 
 
 def load_lora_weights(
-    jax_module: LoRAMixin,
+    torch_module: LoRAMixin,
     adapter_idx: int,
     lora_A_weights: np.ndarray,
     lora_B_weights: np.ndarray,
     scaling: float,
     rank: int,
 ) -> None:
-    """Load LoRA weights from numpy arrays to JAX module."""
+    """Load LoRA weights from numpy arrays to PyTorch module."""
     assert (
-        jax_module.lora_A is not None
-        and jax_module.lora_B is not None
-        and jax_module.lora_scaling is not None
-        and jax_module.lora_ranks is not None
+        torch_module.lora_A is not None
+        and torch_module.lora_B is not None
+        and torch_module.lora_scaling is not None
+        and torch_module.lora_ranks is not None
     )
-    jax_module.lora_A.value = jax_module.lora_A.value.at[adapter_idx].set(jnp.array(lora_A_weights))
-    jax_module.lora_B.value = jax_module.lora_B.value.at[adapter_idx].set(jnp.array(lora_B_weights))
-    jax_module.lora_scaling.value = jax_module.lora_scaling.value.at[adapter_idx].set(scaling)
-    jax_module.lora_ranks.value = jax_module.lora_ranks.value.at[adapter_idx].set(rank)
+    with torch.no_grad():
+        torch_module.lora_A[adapter_idx] = torch.from_numpy(lora_A_weights).to(torch_module.lora_A.dtype)
+        torch_module.lora_B[adapter_idx] = torch.from_numpy(lora_B_weights).to(torch_module.lora_B.dtype)
+        torch_module.lora_scaling[adapter_idx] = scaling
+        torch_module.lora_ranks[adapter_idx] = rank
 
 
 def test_qwen3_moe_layer_lora():
@@ -117,33 +123,34 @@ def test_qwen3_moe_layer_lora():
     hf_moe_layer = hf_model.model.layers[0].mlp
     x = torch.randn(3, 4, config.hidden_size)
 
-    mesh = jax.make_mesh((1, 1), ("dp", "tp"))
-    with jax.set_mesh(mesh):
-        moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
-        load_moe_base_weights(moe_layer, hf_moe_layer)
+    moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=torch.float32)
+    load_moe_base_weights(moe_layer, hf_moe_layer)
 
-        # Set LoRA weights for all adapters
-        rng = np.random.default_rng(42)
-        scaling = 2.0
-        rank = config.max_lora_rank
-        for adapter_idx in range(config.max_lora_adapters):
-            for proj in [moe_layer.experts.gate_proj, moe_layer.experts.up_proj, moe_layer.experts.down_proj]:
-                assert proj.lora_A is not None and proj.lora_B is not None
-                lora_A = rng.normal(0, 1.0, proj.lora_A.value.shape[1:])
-                lora_B = rng.normal(0, 1.0, proj.lora_B.value.shape[1:])
-                load_lora_weights(proj, adapter_idx, lora_A, lora_B, scaling, rank)
+    # Set LoRA weights for all adapters
+    rng = np.random.default_rng(42)
+    scaling = 2.0
+    rank = config.max_lora_rank
+    for adapter_idx in range(config.max_lora_adapters):
+        for proj in [moe_layer.experts.gate_proj, moe_layer.experts.up_proj, moe_layer.experts.down_proj]:
+            assert proj.lora_A is not None and proj.lora_B is not None
+            lora_A = rng.normal(0, 1.0, proj.lora_A.shape[1:])
+            lora_B = rng.normal(0, 1.0, proj.lora_B.shape[1:])
+            load_lora_weights(proj, adapter_idx, lora_A, lora_B, scaling, rank)
 
-        # Test with different adapters per sample
-        adapter_indices = jnp.array([0, 2, 1])
-        output_with_lora, _ = moe_layer(x.numpy(), adapter_indices=adapter_indices, return_router_logits=True)
+    moe_layer.eval()
+    # Test with different adapters per sample
+    adapter_indices = torch.tensor([0, 2, 1], dtype=torch.int32)
+    with torch.no_grad():
+        output_with_lora, _ = moe_layer(x, adapter_indices=adapter_indices, return_router_logits=True)
 
-        # Test each sample by comparing with merged weights for its adapter
-        for sample_idx in range(len(adapter_indices)):
-            adapter_idx = int(adapter_indices[sample_idx])
+    # Test each sample by comparing with merged weights for its adapter
+    for sample_idx in range(len(adapter_indices)):
+        adapter_idx = int(adapter_indices[sample_idx])
 
-            # Create merged model by adding LoRA weights to base weights
-            moe_layer_merged = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(1 + adapter_idx))
-            moe_layer_merged.gate.kernel[:] = moe_layer.gate.kernel[:]
+        # Create merged model by adding LoRA weights to base weights
+        moe_layer_merged = Qwen3MoeSparseMoeBlock(config, dtype=torch.float32)
+        with torch.no_grad():
+            moe_layer_merged.gate.weight.copy_(moe_layer.gate.weight)
 
             for proj_name in ["gate_proj", "up_proj", "down_proj"]:
                 proj = getattr(moe_layer.experts, proj_name)
@@ -151,18 +158,20 @@ def test_qwen3_moe_layer_lora():
 
                 # For each expert, merge: base + scaling * (lora_A @ lora_B)
                 for expert_idx in range(config.num_experts):
-                    lora_A = proj.lora_A.value[adapter_idx, expert_idx, :, :]
-                    lora_B = proj.lora_B.value[adapter_idx, expert_idx, :, :]
+                    lora_A = proj.lora_A[adapter_idx, expert_idx, :, :]
+                    lora_B = proj.lora_B[adapter_idx, expert_idx, :, :]
                     lora_delta = scaling * (lora_A @ lora_B)
 
                     merged_weight = proj.weight[expert_idx, :, :] + lora_delta
-                    proj_merged.weight.value = proj_merged.weight.value.at[expert_idx, :, :].set(merged_weight)
+                    proj_merged.weight[expert_idx, :, :] = merged_weight
 
-            # Run merged model on this sample
-            x_sample = x[sample_idx : sample_idx + 1].numpy()
+        moe_layer_merged.eval()
+        # Run merged model on this sample
+        x_sample = x[sample_idx : sample_idx + 1]
+        with torch.no_grad():
             output_merged, _ = moe_layer_merged(x_sample, return_router_logits=True)
 
-            assert np.allclose(output_with_lora[sample_idx : sample_idx + 1], output_merged, rtol=1e-3, atol=1e-3)
+        assert torch.allclose(output_with_lora[sample_idx : sample_idx + 1], output_merged, rtol=1e-3, atol=1e-3)
 
 
 def test_qwen3_lora():
@@ -204,10 +213,9 @@ def test_qwen3_lora():
         config.max_lora_adapters = len(lora_adapters)
         config.max_lora_rank = max(cfg.r for cfg in lora_configs)
 
-        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
-        with jax.set_mesh(mesh):
-            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
-            load_checkpoint(base_tmp, config, model)
+        model = Qwen3ForCausalLM(config, dtype=torch.float32)
+        load_checkpoint(base_tmp, config, model)
+        model.eval()
 
         # Get outputs from all HF models
         hf_outputs_list = []
@@ -241,14 +249,20 @@ def test_qwen3_lora():
                         )
 
         # Use different adapter indices for each input
-        adapter_indices = jnp.arange(len(lora_adapters), dtype=jnp.int32)
-        outputs = model(
-            batch.input_ids.numpy(),
-            attention_mask=batch.attention_mask.numpy(),
-            output_hidden_states=True,
-            adapter_indices=adapter_indices,
-        )
+        adapter_indices = torch.arange(len(lora_adapters), dtype=torch.int32)
+        with torch.no_grad():
+            outputs = model(
+                batch.input_ids,
+                attention_mask=batch.attention_mask,
+                output_hidden_states=True,
+                adapter_indices=adapter_indices,
+            )
 
         # Compare outputs with corresponding adapters
         for idx in range(len(lora_adapters)):
-            assert np.allclose(hf_outputs_list[idx].logits[0], outputs["logits"][idx], rtol=1e-3, atol=1e-3)
+            assert torch.allclose(
+                hf_outputs_list[idx].logits[0],
+                outputs["logits"][idx],
+                rtol=1e-3,
+                atol=1e-3
+            )

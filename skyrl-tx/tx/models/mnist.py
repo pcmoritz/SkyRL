@@ -1,24 +1,25 @@
-from flax import nnx
-from functools import partial
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class Mnist(nnx.Module):
+class Mnist(nn.Module):
 
-    def __init__(self, *, rngs: nnx.Rngs):
-        self.conv1 = nnx.Conv(1, 32, kernel_size=(3, 3), rngs=rngs)
-        self.batch_norm1 = nnx.BatchNorm(32, rngs=rngs)
-        self.dropout1 = nnx.Dropout(rate=0.025, rngs=rngs)
-        self.conv2 = nnx.Conv(32, 64, kernel_size=(3, 3), rngs=rngs)
-        self.batch_norm2 = nnx.BatchNorm(64, rngs=rngs)
-        self.avg_pool = partial(nnx.avg_pool, window_shape=(2, 2), strides=(2, 2))
-        self.linear1 = nnx.Linear(3136, 256, rngs=rngs)
-        self.dropout2 = nnx.Dropout(rate=0.025, rngs=rngs)
-        self.linear2 = nnx.Linear(256, 10, rngs=rngs)
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(3, 3))
+        self.batch_norm1 = nn.BatchNorm2d(32)
+        self.dropout1 = nn.Dropout(p=0.025)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(3, 3))
+        self.batch_norm2 = nn.BatchNorm2d(64)
+        self.linear1 = nn.Linear(3136, 256)
+        self.dropout2 = nn.Dropout(p=0.025)
+        self.linear2 = nn.Linear(256, 10)
 
-    def __call__(self, x):
-        x = self.avg_pool(nnx.relu(self.batch_norm1(self.dropout1(self.conv1(x)))))
-        x = self.avg_pool(nnx.relu(self.batch_norm2(self.conv2(x))))
+    def forward(self, x):
+        x = F.avg_pool2d(F.relu(self.batch_norm1(self.dropout1(self.conv1(x)))), kernel_size=2, stride=2)
+        x = F.avg_pool2d(F.relu(self.batch_norm2(self.conv2(x))), kernel_size=2, stride=2)
         x = x.reshape(x.shape[0], -1)  # flatten
-        x = nnx.relu(self.dropout2(self.linear1(x)))
+        x = F.relu(self.dropout2(self.linear1(x)))
         x = self.linear2(x)
         return x

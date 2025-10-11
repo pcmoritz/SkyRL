@@ -5,33 +5,32 @@ import os
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
-from flax import nnx
-import jax.numpy as jnp
-import optax
-import safetensors.numpy
+import torch
+import torch.nn as nn
+import safetensors.torch
 from transformers import PretrainedConfig
 
 from tx import models
 
 if TYPE_CHECKING:
-    import torch
+    pass
 
 
-def get_dtype(dtype: str | torch.dtype) -> jnp.dtype:
-    "Convert torch dtype to jax dtype."
+def get_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    "Convert dtype string to torch dtype."
 
     match str(dtype):
         case "torch.float32" | "float32":
-            return jnp.float32
+            return torch.float32
         case "torch.bfloat16" | "bfloat16":
-            return jnp.bfloat16
+            return torch.bfloat16
         case "torch.float16" | "float16":
-            return jnp.float16
+            return torch.float16
         case _:
-            raise ValueError(f"Unsupported torch dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def get_model_class(config: PretrainedConfig) -> Callable[..., nnx.Module]:
+def get_model_class(config: PretrainedConfig) -> Callable[..., nn.Module]:
     "Get the correct model class based on the config."
 
     for architecture in config.architectures or []:
@@ -41,72 +40,100 @@ def get_model_class(config: PretrainedConfig) -> Callable[..., nnx.Module]:
     raise ValueError(f"None of the architectures {config.architectures} is currently supported.")
 
 
-def get_param_key(path: tuple) -> str:
+def get_param_key(path: str) -> str:
     "Get the safetensors key for a given model path."
-    if path[-1] in {"embedding", "kernel"}:
-        path = (*path[:-1], "weight")
-    elif path[-1] in {"lora_A", "lora_B"}:
-        path = (*path, "weight")
-    return ".".join(map(str, path))
+    parts = path.split('.')
+    if parts[-1] in {"weight"}:
+        return path
+    elif parts[-1] in {"lora_A", "lora_B"}:
+        return path + ".weight"
+    return path
 
 
-def get_expert_key(path: tuple, expert_idx: int) -> str:
+def get_expert_key(path: str, expert_idx: int) -> str:
     "Get the safetensors key for an expert weight model path."
-    path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
-    return ".".join(map(str, path)) + ".weight"
+    parts = path.split('.')
+    parts = [s if s != "weight" else f"experts.{expert_idx}.weight" for s in parts]
+    return ".".join(parts)
 
 
-def load_checkpoint(checkpoint_dir: str | os.PathLike, config: PretrainedConfig, model: nnx.Module) -> None:
+def load_checkpoint(checkpoint_dir: str | os.PathLike, config: PretrainedConfig, model: nn.Module) -> None:
     tensors = {}
     for file in Path(checkpoint_dir).glob("*.safetensors"):
-        tensors.update(safetensors.numpy.load_file(file))
-    model_params = nnx.to_flat_state(nnx.state(model))
-    updates = []
-    for path, param in model_params:
-        key = get_param_key(path)
+        tensors.update(safetensors.torch.load_file(file))
+
+    state_dict = model.state_dict()
+    updates = {}
+
+    for name, param in state_dict.items():
+        key = get_param_key(name)
         # Skip LoRA parameters that are not in the checkpoint
-        if "lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path:
+        if "lora_A" in name or "lora_B" in name or "lora_scaling" in name or "lora_ranks" in name:
             continue
-        if "experts" in path:
-            # In order to load the expert weights, we concatenate the relevant tensors
-            expert_tensors = [tensors[get_expert_key(path, i)].T for i in range(config.num_experts)]
-            tensors[key] = jnp.stack(expert_tensors, axis=0)
+        if "experts" in name and "weight" in name:
+            # In order to load the expert weights, we stack the relevant tensors
+            # HF stores each expert as Linear with shape [out, in]
+            # We need [num_experts, in, out] for grouped_mm
+            expert_tensors = [tensors[get_expert_key(name, i)].T for i in range(config.num_experts)]
+            tensor_value = torch.stack(expert_tensors, dim=0)
         else:
-            tensors[key] = tensors[key] if "embed_tokens" in path else tensors[key].T
-        if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
-            tensors[key] = tensors[key].reshape(param.shape)
-        assert param.shape == tensors[key].shape, f"shape mismatch for {key}"
-        updates.append((path, tensors[key]))
-    nnx.update(model, nnx.from_flat_state(updates))
+            if key not in tensors:
+                continue
+            # HF and PyTorch both use [out, in] for Linear weights, so no transpose needed
+            tensor_value = tensors[key]
+
+        # Handle attention projection reshaping
+        if any(proj in name for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            tensor_value = tensor_value.reshape(param.shape)
+
+        assert param.shape == tensor_value.shape, f"shape mismatch for {name}: {param.shape} != {tensor_value.shape}"
+        updates[name] = tensor_value
+
+    model.load_state_dict(updates, strict=False)
 
 
-def save_checkpoint(config: PretrainedConfig, model: nnx.Module, filename: str | os.PathLike) -> None:
-    model_params = nnx.to_flat_state(nnx.state(model))
+def save_checkpoint(config: PretrainedConfig, model: nn.Module, filename: str | os.PathLike) -> None:
+    state_dict = model.state_dict()
     tensors = {}
-    for path, param in model_params:
-        if "rngs" in path:
+
+    for name, param in state_dict.items():
+        if "lora_scaling" in name or "lora_ranks" in name:
+            # Skip LoRA config buffers, keep LoRA weights
             continue
-        key = get_param_key(path)
-        if "experts" in path:
+
+        key = get_param_key(name)
+
+        if "experts" in name and "weight" in name:
+            # Save each expert weight separately
             for i in range(config.num_experts):
-                tensors[get_expert_key(path, i)] = param[i, :, :].T
+                tensors[get_expert_key(name, i)] = param[i, :, :]
             continue
-        if "q_proj" in path or "k_proj" in path or "v_proj" in path:
-            param = param.reshape(param.shape[0], -1)
-        elif "o_proj" in path:
-            param = param.reshape(-1, param.shape[-1])
-        tensors[key] = param if "embed_tokens" in path else param.T
-    safetensors.numpy.save_file(tensors, filename)
+
+        param_to_save = param
+        if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            param_to_save = param.reshape(param.shape[0], -1)
+        elif "o_proj" in name:
+            param_to_save = param.reshape(-1, param.shape[-1])
+
+        # HF and PyTorch both use [out, in] for Linear weights, so no transpose needed
+        tensors[key] = param_to_save
+
+    safetensors.torch.save_file(tensors, filename)
 
 
 class OptimizerName(str, Enum):
     adamw = "adamw"
+    sgd = "sgd"
 
 
-def get_optimizer(optimizer_name: OptimizerName, optimizer_args: dict) -> optax.GradientTransformation:
+def get_optimizer(optimizer_name: OptimizerName, optimizer_args: dict, parameters) -> torch.optim.Optimizer:
     match (optimizer_name, optimizer_args):
         case (OptimizerName.adamw, {"learning_rate": lr, **kwargs}):
-            return optax.adamw(lr, **kwargs)
+            # Extract weight_decay if present, otherwise default to 0.0
+            weight_decay = kwargs.pop("weight_decay", 0.0)
+            return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+        case (OptimizerName.sgd, {"learning_rate": lr, **kwargs}):
+            return torch.optim.SGD(parameters, lr=lr, **kwargs)
         case (_, {"learning_rate": _}):
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
         case _:

@@ -2,11 +2,11 @@ import importlib
 from operator import attrgetter
 from typing import Callable, Iterator
 
-import jax
+import torch
 from datasets import Dataset
 from transformers import PreTrainedTokenizer
 
-LoaderIterator = Iterator[tuple[dict[str, jax.Array], dict[str, str]]]
+LoaderIterator = Iterator[tuple[dict[str, torch.Tensor], dict[str, str]]]
 
 
 def get_loader(loader_name: str) -> Callable[[PreTrainedTokenizer, Dataset, int], LoaderIterator]:

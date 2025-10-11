@@ -5,11 +5,11 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from sqlmodel import create_engine, Session, select, func
+from copy import deepcopy
 
-import jax
-import jax.numpy as jnp
-from flax import nnx
-import optax
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig
 from huggingface_hub import snapshot_download
 
@@ -34,6 +34,7 @@ class TinkerEngine:
         max_lora_adapters: int,
         max_lora_rank: int,
         db_path=DB_PATH,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """Initialize the engine with a database connection and base model."""
         self.db_engine = create_engine(f"sqlite:///{db_path}", echo=False)
@@ -43,6 +44,7 @@ class TinkerEngine:
         self.accumulated_grads = {}  # Store accumulated gradients per LoRA adapter: model_id -> grads
         self.max_lora_adapters = max_lora_adapters  # Maximum number of LoRA adapters
         self.max_lora_rank = max_lora_rank  # Maximum LoRA rank
+        self.device = torch.device(device)
 
         # Initialize the shared base model
         self.config = AutoConfig.from_pretrained(self.base_model_name)
@@ -57,19 +59,17 @@ class TinkerEngine:
         checkpoint_path = snapshot_download(self.base_model_name, allow_patterns=["*.safetensors"])
 
         # Create model and load weights
-        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
-        with jax.set_mesh(mesh):
-            self.model = model_class(self.config, dtype=get_dtype(self.config.dtype), rngs=nnx.Rngs(0))
-            load_checkpoint(checkpoint_path, self.config, self.model)
+        torch.manual_seed(0)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(0)
 
-            # Create optimizer that only targets LoRA A and B parameters
-            def is_lora_param(path, value):
-                return any(name in path for name in ["lora_A", "lora_B"])
+        self.model = model_class(self.config, dtype=get_dtype(self.config.dtype), device=self.device)
+        self.model = self.model.to(self.device)
+        load_checkpoint(checkpoint_path, self.config, self.model)
 
-            self.optimizer = nnx.Optimizer(self.model, optax.adamw(LEARNING_RATE), wrt=is_lora_param)
-
-            # Split model into LoRA and non-LoRA parameters
-            self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, is_lora_param, ...)
+        # Create optimizer that only targets LoRA parameters
+        lora_params = [p for n, p in self.model.named_parameters() if 'lora_A' in n or 'lora_B' in n]
+        self.optimizer = torch.optim.AdamW(lora_params, lr=LEARNING_RATE)
 
         logger.info(
             f"Initialized base model {self.base_model_name} with max_lora_adapters={max_lora_adapters}, max_lora_rank={max_lora_rank}"
@@ -207,51 +207,60 @@ class TinkerEngine:
         padded_inputs = [seq + [0] * (max_len - len(seq)) for seq in all_input_ids]
         padded_targets = [seq + [0] * (max_len - len(seq)) for seq in all_targets]
 
-        input_ids = jnp.array(padded_inputs, dtype=jnp.int32)
-        target_ids = jnp.array(padded_targets, dtype=jnp.int32)
-        adapter_indices = jnp.array(all_adapter_indices, dtype=jnp.int32)
+        input_ids = torch.tensor(padded_inputs, dtype=torch.int32, device=self.device)
+        target_ids = torch.tensor(padded_targets, dtype=torch.int32, device=self.device)
+        adapter_indices = torch.tensor(all_adapter_indices, dtype=torch.int32, device=self.device)
 
         # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = jnp.array(
-            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in all_input_ids], dtype=jnp.int32
+        attention_mask = torch.tensor(
+            [[1] * len(seq) + [0] * (max_len - len(seq)) for seq in all_input_ids], dtype=torch.int32, device=self.device
         )
-        loss_mask = jnp.array(
+        loss_mask = torch.tensor(
             [all_token_weights[i] + [0] * (max_len - len(all_input_ids[i])) for i in range(len(all_token_weights))],
-            dtype=jnp.int32,
+            dtype=torch.float32,
+            device=self.device,
         )
 
-        # Compute per-example losses and gradients using nnx.split pattern
-        def loss_for_lora(lora_params):
-            merged_model = nnx.merge(self.graphdef, lora_params, self.non_lora_params)
-            logits = merged_model(input_ids, attention_mask=attention_mask, adapter_indices=adapter_indices)["logits"]
-            # Compute per-example losses (don't average yet)
-            per_token_losses = optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits, labels=target_ids, where=loss_mask
-            )
-            # Average over sequence length for each example
-            per_example_losses = per_token_losses.mean(axis=-1)
-            # Return mean loss for gradient computation, but also return per-token losses
-            return per_example_losses.mean(), (logits, per_token_losses)
+        # Forward pass
+        self.model.train()
+        logits = self.model(input_ids, attention_mask=attention_mask, adapter_indices=adapter_indices)["logits"]
 
-        loss_and_grad_fn = nnx.value_and_grad(loss_for_lora, has_aux=True)
-        (avg_loss, (logits, per_token_losses)), lora_grads = loss_and_grad_fn(self.lora_params)
+        # Compute per-token losses
+        per_token_losses = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            target_ids.reshape(-1),
+            reduction='none'
+        ).reshape(logits.shape[0], logits.shape[1])
 
-        # Compute logprobs for the target tokens
-        all_logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
-        target_logprobs = jnp.take_along_axis(all_logprobs, target_ids[..., None], axis=-1)  # [B, T, 1]
-        target_logprobs = target_logprobs.squeeze(-1)  # [B, T]
+        # Apply loss mask
+        per_token_losses = per_token_losses * loss_mask
+
+        # Average over sequence length for each example
+        per_example_losses = per_token_losses.sum(dim=-1) / loss_mask.sum(dim=-1).clamp(min=1)
+        avg_loss = per_example_losses.mean()
+
+        # Backward pass
+        avg_loss.backward()
 
         # Extract and accumulate gradients for each model_id's specific adapter
         for request_id, model_id, start_idx, end_idx in request_batch_slices:
             adapter_index = self.models[model_id].adapter_index
 
             # Extract gradients for this specific adapter index
-            adapter_grads = jax.tree.map(lambda g: g[adapter_index], lora_grads)
+            adapter_grads = {}
+            for name, param in self.model.named_parameters():
+                if ('lora_A' in name or 'lora_B' in name) and param.grad is not None:
+                    # Extract gradient for this adapter index
+                    adapter_grads[name] = param.grad[adapter_index].clone()
 
             if self.accumulated_grads[model_id] is None:
                 self.accumulated_grads[model_id] = adapter_grads
             else:
                 raise NotImplementedError("Gradient accumulation not yet implemented")
+
+        # Compute logprobs for the target tokens
+        all_logprobs = F.log_softmax(logits, dim=-1)  # [B, T, V]
+        target_logprobs = torch.gather(all_logprobs, 2, target_ids.unsqueeze(-1).long()).squeeze(-1)  # [B, T]
 
         # Compute per-request results with correct per-request losses
         for request_id, model_id, start_idx, end_idx in request_batch_slices:
@@ -260,8 +269,8 @@ class TinkerEngine:
             for i in range(start_idx, end_idx):
                 # Trim padding, and extract losses for this example's tokens
                 seq_len = len(all_input_ids[i])
-                token_losses = per_token_losses[i, :seq_len].astype(jnp.float32)
-                token_logprobs = target_logprobs[i, :seq_len].astype(jnp.float32)
+                token_losses = per_token_losses[i, :seq_len].float()
+                token_logprobs = target_logprobs[i, :seq_len].float()
                 loss_fn_outputs.append(
                     {
                         "elementwise_loss": {"data": token_losses.tolist(), "dtype": "float32", "shape": [seq_len]},
@@ -274,6 +283,9 @@ class TinkerEngine:
                 loss_fn_outputs=loss_fn_outputs,
                 metrics={},
             )
+
+        # Zero out gradients after processing
+        self.optimizer.zero_grad()
 
         return results
 
@@ -290,19 +302,18 @@ class TinkerEngine:
             logger.warning(f"No accumulated gradients for model {model_id}, skipping optimizer step")
             return types.OptimStepOutput()
 
-        # Create full gradient structure with zeros for all adapters except this one
-        def expand_adapter_grads(lora_param, adapter_grad):
-            # Create zeros for all adapters with the same shape as lora_param
-            full_grads = jnp.zeros_like(lora_param)
-            # Set gradients for this specific adapter
-            return full_grads.at[adapter_index].set(adapter_grad)
+        # Set gradients for LoRA parameters at this adapter index
+        for name, param in self.model.named_parameters():
+            if name in adapter_grads:
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+                param.grad[adapter_index] = adapter_grads[name]
 
-        full_lora_grads = jax.tree.map(expand_adapter_grads, self.lora_params, adapter_grads)
-
-        # Apply optimizer update -- going forward we need to figure out how to use different learning rates per adapter
+        # Apply optimizer step
         adam_params = request_data.adam_params
         assert adam_params.lr == LEARNING_RATE, f"Currently we only support a fixed learning rate {LEARNING_RATE}"
-        self.optimizer.update(self.lora_params, full_lora_grads)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
 
         # Clear accumulated gradients
         self.accumulated_grads[model_id] = None
@@ -324,27 +335,25 @@ class TinkerEngine:
         output_dir = Path(self.checkpoints_base_path) / model_id / checkpoint_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Collect LoRA rank for each layer and then the LoRA parameters for adapter_index
+        # Extract adapter-specific LoRA parameters
+        adapter_state_dict = {}
+        for name, param in self.model.state_dict().items():
+            if 'lora_A' in name or 'lora_B' in name:
+                # Get the rank for this adapter
+                lora_rank = self.models[model_id].lora_config.rank
+                if 'lora_A' in name:
+                    adapter_state_dict[name] = param[adapter_index, :, :lora_rank].clone()
+                elif 'lora_B' in name:
+                    adapter_state_dict[name] = param[adapter_index, :lora_rank, :].clone()
 
-        layer_rank = {
-            path[:-2]: int(node[adapter_index])
-            for path, node in jax.tree.flatten_with_path(self.non_lora_params)[0]
-            if len(path) >= 2 and getattr(path[-2], "key", None) == "lora_ranks"
-        }
-
-        def extract_adapter_params(path, p):
-            rank = layer_rank[path[:-2]]
-            if path[-2].key == "lora_A":
-                return p[adapter_index, :, :rank]
-            elif path[-2].key == "lora_B":
-                return p[adapter_index, :rank, :]
-            else:
-                return p[adapter_index]
-
-        adapter_lora_params = jax.tree.map_with_path(extract_adapter_params, self.lora_params)
+        # Create a temporary model to save
+        temp_model = nn.Module()
+        temp_model.register_parameter('adapter_params', nn.Parameter(torch.zeros(1)))  # Dummy
+        for name, param in adapter_state_dict.items():
+            temp_model.register_buffer(name, param)
 
         # Save only the LoRA adapter weights
-        save_checkpoint(self.config, adapter_lora_params, output_dir / "adapter_model.safetensors")
+        save_checkpoint(self.config, temp_model, output_dir / "adapter_model.safetensors")
 
         # Save LoRA config
         lora_config = LoraConfig(
@@ -485,6 +494,13 @@ def main():
         help="Maximum LoRA rank (default: 32)",
         metavar="RANK",
     )
+    parser.add_option(
+        "--device",
+        dest="device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use (cuda or cpu)",
+        metavar="DEVICE",
+    )
 
     (options, args) = parser.parse_args()
 
@@ -498,6 +514,7 @@ def main():
         checkpoints_base_path=options.checkpoints_base_path,
         max_lora_adapters=options.max_lora_adapters,
         max_lora_rank=options.max_lora_rank,
+        device=options.device,
     ).run()
 
 

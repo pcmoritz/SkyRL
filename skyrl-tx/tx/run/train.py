@@ -3,9 +3,8 @@ from pathlib import Path
 import sys
 
 from datasets import Dataset, load_dataset
-import jax
-from flax import nnx
-import optax
+import torch
+import torch.nn.functional as F
 from transformers import AutoConfig, AutoTokenizer
 import typer
 
@@ -18,16 +17,29 @@ app = typer.Typer()
 
 def loss_fn(model, batch):
     logits = model(batch["text"], attention_mask=batch["attention_mask"])["logits"]
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=batch["target"])
-    return loss.mean(), logits
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        batch["target"].reshape(-1),
+        reduction='mean'
+    )
+    return loss, logits
 
 
-@nnx.jit
-def train_step(model, optimizer: nnx.Optimizer, batch):
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(model, batch)
-    gradnorm = optax.global_norm(grads)
-    optimizer.update(model, grads)
+def train_step(model, optimizer: torch.optim.Optimizer, batch):
+    optimizer.zero_grad()
+    loss, logits = loss_fn(model, batch)
+
+    loss.backward()
+
+    # Compute gradient norm
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    gradnorm = total_norm ** 0.5
+
+    optimizer.step()
     return loss, gradnorm
 
 
@@ -45,14 +57,14 @@ def train(
     save_steps: int = typer.Option(500, "--save-steps", help="Number of steps between checkpoints"),
     max_steps: int | None = typer.Option(None, "--max-steps", help="The maximum number of training steps"),
     batch_size: int = typer.Option(..., "--batch-size", help="Batch size of each training batch"),
-    optimizer_name: OptimizerName = typer.Option("adamw", "--optimizer", help="Which optax optimizer to use"),
+    optimizer_name: OptimizerName = typer.Option("adamw", "--optimizer", help="Which optimizer to use"),
     optimizer_args: dict = typer.Option(
         '{"learning_rate": 1e-5, "weight_decay": 0.1}',
         "--optimizer-args",
-        help="Arguments for the optax optimizer (in JSON format)",
+        help="Arguments for the optimizer (in JSON format)",
         parser=json.loads,
     ),
-    tp_size: int = typer.Option(1, "--tp-size", help="Tensor parallelism degree to use for the model"),
+    device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "--device", help="Device to use for training"),
     tracker_name: ExperimentTracker | None = typer.Option(
         None, "--tracker", help="Experiment tracker to report results to"
     ),
@@ -63,11 +75,6 @@ def train(
         parser=json.loads,
     ),
 ) -> None:
-    if not jax._src.xla_bridge.backends_are_initialized():  # ty: ignore
-        jax.config.update("jax_num_cpu_devices", tp_size)
-        # If you want to debug NaNs, add the following:
-        # jax.config.update("jax_debug_nans", True)
-
     output_dir.mkdir(parents=True, exist_ok=True)
     add_file_handler(output_dir / "tx.log")
     logger.info(f"tx was invoked with 'tx {' '.join(sys.argv[1:])}'")
@@ -80,10 +87,16 @@ def train(
     loader = get_loader(loader_name)
 
     model_class = get_model_class(config)
-    mesh = jax.make_mesh((1, tp_size), ("dp", "tp"))
-    with jax.set_mesh(mesh):
-        model = model_class(config, dtype=get_dtype(config.dtype), rngs=nnx.Rngs(0))
-        optimizer = nnx.Optimizer(model, get_optimizer(optimizer_name, optimizer_args), wrt=nnx.Param)
+    device_obj = torch.device(device)
+
+    # Set manual seed for reproducibility
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(0)
+
+    model = model_class(config, dtype=get_dtype(config.dtype), device=device_obj)
+    model = model.to(device_obj)
+    optimizer = get_optimizer(optimizer_name, optimizer_args, model.parameters())
 
     if load_checkpoint_path:
         load_checkpoint(load_checkpoint_path, config, model)
@@ -93,9 +106,12 @@ def train(
         if max_steps and step >= max_steps:
             break
 
+        # Move batch to device
+        batch = {k: v.to(device_obj) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
         model.train()
         loss, gradnorm = train_step(model, optimizer, batch)
-        tracker.log({"epoch": step / num_steps, **metrics, "gradnorm": gradnorm.item(), "loss": loss.item()}, step)
+        tracker.log({"epoch": step / num_steps, **metrics, "gradnorm": gradnorm, "loss": loss.item()}, step)
 
         if step % save_steps == 0:
             logger.info(f"Saving checkpoint to {output_dir}")

@@ -1,21 +1,53 @@
-from flax import nnx
-import jax
-from jax import numpy as jnp
+import torch
+import torch.nn as nn
+from typing import Callable
 
 from tx.layers.util import Param, prepare_routing
 
 
+def grouped_mm(x: torch.Tensor, weights: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
+    """Grouped matrix multiplication with CPU fallback.
+
+    Args:
+        x: Input tensor [N, in_features] where tokens are sorted by group
+        weights: Weight tensor [num_groups, in_features, out_features]
+        group_sizes: Number of tokens per group [num_groups]
+
+    Returns:
+        Output tensor [N, out_features]
+    """
+    # Use native grouped_mm on GPU/MPS
+    if x.device.type in ['cuda', 'mps']:
+        return torch._grouped_mm(x, weights, group_sizes)
+
+    # CPU fallback: loop over groups
+    outputs = []
+    start_idx = 0
+    for group_idx, group_size in enumerate(group_sizes):
+        group_size = int(group_size)
+        if group_size > 0:
+            x_group = x[start_idx:start_idx + group_size]  # [group_size, in_features]
+            w_group = weights[group_idx]  # [in_features, out_features]
+            output_group = x_group @ w_group  # [group_size, out_features]
+            outputs.append(output_group)
+            start_idx += group_size
+
+    return torch.cat(outputs, dim=0) if outputs else torch.empty(0, weights.shape[-1], device=x.device, dtype=x.dtype)
+
+
 class LoRAMixin:
-    """A mixin for flax NNX modules to add multi-adapter LoRA support.
+    """A mixin for PyTorch modules to add multi-adapter LoRA support.
     This mixin adds LoRA parameters (lora_A, lora_B) and methods to apply
     the low-rank adaptation to a base module's output. It is designed to
-    be used with layers like nnx.Linear.
+    be used with layers like nn.Linear.
     """
 
-    lora_scaling: nnx.Variable | None
-    lora_ranks: nnx.Variable | None
-    lora_A: nnx.Param | None
-    lora_B: nnx.Param | None
+    lora_scaling: torch.Tensor | None
+    lora_ranks: torch.Tensor | None
+    lora_A: nn.Parameter | None
+    lora_B: nn.Parameter | None
+    max_lora_adapters: int
+    max_lora_rank: int
 
     def init_lora(
         self,
@@ -24,10 +56,8 @@ class LoRAMixin:
         max_lora_rank: int,
         shape_A: tuple[int, ...],
         shape_B: tuple[int, ...],
-        sharding_A: jax.sharding.PartitionSpec,
-        sharding_B: jax.sharding.PartitionSpec,
-        dtype: jnp.dtype,
-        rngs: nnx.Rngs,
+        dtype: torch.dtype,
+        device: torch.device | None = None,
     ) -> None:
         self.max_lora_adapters = max_lora_adapters
         self.max_lora_rank = max_lora_rank
@@ -38,54 +68,51 @@ class LoRAMixin:
             self.lora_A = None
             self.lora_B = None
         else:
-            self.lora_scaling = nnx.Variable(jnp.full((max_lora_adapters,), 1.0, dtype=dtype))
-            self.lora_ranks = nnx.Variable(jnp.full((max_lora_adapters,), max_lora_rank, dtype=jnp.int32))
-            self.lora_A = Param(
-                *shape_A,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.he_uniform(), sharding_A),
-                rngs=rngs,
-            )
-            self.lora_B = Param(
-                *shape_B,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.zeros_init(), sharding_B),
-                rngs=rngs,
-            )
+            # Register as buffers (non-trainable by default)
+            self.register_buffer('lora_scaling', torch.full((max_lora_adapters,), 1.0, dtype=dtype, device=device))
+            self.register_buffer('lora_ranks', torch.full((max_lora_adapters,), max_lora_rank, dtype=torch.int32, device=device))
+
+            # Initialize LoRA matrices
+            lora_A = torch.empty(*shape_A, dtype=dtype, device=device)
+            nn.init.kaiming_uniform_(lora_A)
+            self.lora_A = nn.Parameter(lora_A)
+
+            lora_B = torch.zeros(*shape_B, dtype=dtype, device=device)
+            self.lora_B = nn.Parameter(lora_B)
 
     def apply_lora(
         self,
-        x: jax.Array,
-        base_output: jax.Array,
-        adapter_indices: jax.Array | None,
-    ) -> jax.Array:
+        x: torch.Tensor,
+        base_output: torch.Tensor,
+        adapter_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
         if self.max_lora_adapters == 0 or adapter_indices is None:
             return base_output
 
         (batch_size, seq_len, in_features) = x.shape
-        assert len(self.lora_A.shape) == 3 and self.lora_A.value.shape[1] == in_features
+        assert len(self.lora_A.shape) == 3 and self.lora_A.shape[1] == in_features
         assert adapter_indices.shape[0] == batch_size
 
         x_flat = x.reshape(-1, in_features)
-        adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
+        adapter_indices_expanded = adapter_indices.repeat_interleave(seq_len)
 
-        # Sort tokens to prepare for ragged_dot
+        # Sort tokens to prepare for grouped_mm
         x_sorted, group_sizes, unsort_indices, _ = prepare_routing(
             x_flat, adapter_indices_expanded, self.max_lora_adapters
         )
 
-        # Apply LoRA using ragged_dot: x @ A @ B
-        intermediate = jax.lax.ragged_dot(x_sorted, self.lora_A.value, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B.value, group_sizes)
+        # Apply LoRA using grouped_mm: x @ A @ B
+        intermediate = grouped_mm(x_sorted, self.lora_A, group_sizes)
+        lora_output_sorted = grouped_mm(intermediate, self.lora_B, group_sizes)
 
         # Unsort, reshape, scale
         lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
-        lora_output = lora_output * self.lora_scaling.value[adapter_indices, None, None]
+        lora_output = lora_output * self.lora_scaling[adapter_indices, None, None]
         return base_output + lora_output.reshape(base_output.shape)
 
 
-class LoRALinear(LoRAMixin, nnx.Linear):
-    """An nnx.Linear layer with multi-adapter LoRA support."""
+class LoRALinear(LoRAMixin, nn.Linear):
+    """An nn.Linear layer with multi-adapter LoRA support."""
 
     def __init__(
         self,
@@ -94,48 +121,36 @@ class LoRALinear(LoRAMixin, nnx.Linear):
         *,
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
-        dtype: jnp.dtype = jnp.float32,
-        param_dtype: jnp.dtype | None = None,
+        dtype: torch.dtype = torch.float32,
+        param_dtype: torch.dtype | None = None,
         use_bias: bool = True,
-        kernel_init: nnx.Initializer | None = None,
-        bias_init: nnx.Initializer | None = None,
-        rngs: nnx.Rngs,
+        device: torch.device | None = None,
     ) -> None:
         param_dtype = param_dtype or dtype
-        if use_bias and bias_init is None:
-            bias_init = nnx.initializers.zeros_init()
 
         super().__init__(
             in_features,
             out_features,
-            use_bias=use_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=kernel_init,
-            bias_init=bias_init,
-            rngs=rngs,
+            bias=use_bias,
+            dtype=param_dtype,
+            device=device,
         )
-        assert (
-            self.kernel.value.sharding is not None
-        ), "LoRALinear layer needs sharding, you can specify it by using nnx.with_partitioning on the kernel_init"
-        sharding = self.kernel.value.sharding.spec
+
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
             shape_A=(max_lora_adapters, in_features, max_lora_rank),
             shape_B=(max_lora_adapters, max_lora_rank, out_features),
-            sharding_A=jax.sharding.PartitionSpec(None, sharding[0], None),
-            sharding_B=jax.sharding.PartitionSpec(None, None, sharding[1]),
             dtype=param_dtype,
-            rngs=rngs,
+            device=device,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        base_out = super().__call__(x)
+    def forward(self, x: torch.Tensor, adapter_indices: torch.Tensor | None = None) -> torch.Tensor:
+        base_out = super().forward(x)
         return self.apply_lora(x, base_out, adapter_indices)
 
 
-class LoRAExpert(LoRAMixin, nnx.Module):
+class LoRAExpert(LoRAMixin, nn.Module):
     """Expert layer with multi-adapter LoRA support."""
 
     def __init__(
@@ -146,66 +161,68 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         *,
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
-        dtype: jnp.dtype = jnp.float32,
-        kernel_init: nnx.Initializer | None = None,
-        rngs: nnx.Rngs,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | None = None,
     ) -> None:
+        super().__init__()
         self.num_experts = num_experts
         self.in_features = in_features
         self.out_features = out_features
 
-        self.weight = Param(num_experts, in_features, out_features, dtype=dtype, kernel_init=kernel_init, rngs=rngs)
+        # Initialize expert weights
+        weight = torch.empty(num_experts, in_features, out_features, dtype=dtype, device=device)
+        nn.init.kaiming_normal_(weight)
+        self.weight = nn.Parameter(weight)
 
-        assert self.weight.value.sharding is not None, "LoRAExpert layer needs sharding"
-        sharding = self.weight.value.sharding.spec
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
             shape_A=(max_lora_adapters, num_experts, in_features, max_lora_rank),
             shape_B=(max_lora_adapters, num_experts, max_lora_rank, out_features),
-            sharding_A=jax.sharding.PartitionSpec(None, sharding[0], sharding[1], None),
-            sharding_B=jax.sharding.PartitionSpec(None, sharding[0], None, sharding[2]),
             dtype=dtype,
-            rngs=rngs,
+            device=device,
         )
 
-    def __call__(
+    def forward(
         self,
-        x: jax.Array,
-        group_sizes: jax.Array,
-        adapter_indices_sorted: jax.Array | None = None,
-    ) -> jax.Array:
-        base_out = jax.lax.ragged_dot(x, self.weight.value, group_sizes)
+        x: torch.Tensor,
+        group_sizes: torch.Tensor,
+        adapter_indices_sorted: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        base_out = grouped_mm(x, self.weight, group_sizes)
 
         if self.max_lora_adapters == 0 or adapter_indices_sorted is None:
             return base_out
 
         # Reconstruct expert indices from group_sizes
-        expert_indices = jnp.repeat(jnp.arange(self.num_experts), group_sizes, total_repeat_length=x.shape[0])
+        expert_indices = torch.repeat_interleave(
+            torch.arange(self.num_experts, device=x.device),
+            group_sizes
+        )
 
         # Flatten (adapter, expert) into a single routing dimension.
         flattened_indices = adapter_indices_sorted * self.num_experts + expert_indices
         num_flattened_groups = self.max_lora_adapters * self.num_experts
 
         # Reshape lora_A and lora_B to merge (max_lora_adapters, num_experts) dimensions
-        lora_A_reshaped = self.lora_A.value.reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
-        lora_B_reshaped = self.lora_B.value.reshape(num_flattened_groups, self.max_lora_rank, self.out_features)
+        lora_A_reshaped = self.lora_A.reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
+        lora_B_reshaped = self.lora_B.reshape(num_flattened_groups, self.max_lora_rank, self.out_features)
 
         # Sort tokens by combined index
         x_sorted, combined_group_sizes, unsort_indices, _ = prepare_routing(x, flattened_indices, num_flattened_groups)
 
-        # Apply LoRA using ragged_dot: x @ A @ B
-        intermediate = jax.lax.ragged_dot(x_sorted, lora_A_reshaped, combined_group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B_reshaped, combined_group_sizes)
+        # Apply LoRA using grouped_mm: x @ A @ B
+        intermediate = grouped_mm(x_sorted, lora_A_reshaped, combined_group_sizes)
+        lora_output_sorted = grouped_mm(intermediate, lora_B_reshaped, combined_group_sizes)
 
         # Unsort and apply scaling
         lora_output = lora_output_sorted[unsort_indices]
-        lora_output = lora_output * self.lora_scaling.value[adapter_indices_sorted, None]
+        lora_output = lora_output * self.lora_scaling[adapter_indices_sorted, None]
 
         return base_out + lora_output
 
 
-def update_adapter_config(model: nnx.Module, adapter_index: int, lora_rank: int, lora_alpha: float):
+def update_adapter_config(model: nn.Module, adapter_index: int, lora_rank: int, lora_alpha: float):
     """Update lora_ranks and lora_scaling for a specific adapter across all LoRA layers.
 
     Note: This method needs to be called BEFORE any training happens, you should not update
@@ -220,17 +237,14 @@ def update_adapter_config(model: nnx.Module, adapter_index: int, lora_rank: int,
         lora_alpha: Alpha value to use for computing scaling (alpha / rank)
     """
     scaling = lora_alpha / lora_rank
-    state = nnx.state(model)
 
-    def update_lora_config(path, value):
-        if path[-2].key == "lora_ranks":
-            return value.at[adapter_index].set(lora_rank)
-        if path[-2].key == "lora_scaling":
-            return value.at[adapter_index].set(scaling)
-        if path[-2].key == "lora_A":
-            # Zero out columns beyond the rank for this adapter; lora_B is already zero
-            return value.at[adapter_index, :, lora_rank:].set(0.0)
-        return value
-
-    updated_state = jax.tree.map_with_path(update_lora_config, state)
-    nnx.update(model, updated_state)
+    for name, module in model.named_modules():
+        if isinstance(module, LoRAMixin) and hasattr(module, 'lora_ranks'):
+            if module.lora_ranks is not None:
+                module.lora_ranks[adapter_index] = lora_rank
+            if module.lora_scaling is not None:
+                module.lora_scaling[adapter_index] = scaling
+            if module.lora_A is not None:
+                # Zero out columns beyond the rank for this adapter; lora_B is already zero
+                with torch.no_grad():
+                    module.lora_A.data[adapter_index, :, lora_rank:] = 0.0
