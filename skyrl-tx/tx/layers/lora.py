@@ -87,13 +87,14 @@ class LoRAMixin:
             intermediate = self.lora_A.value[adapter_indices_sorted, x_sorted, :]
         else:
             # Linear path: x @ A
-            intermediate = jax.lax.ragged_dot(x_sorted, self.lora_A.value, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B.value, group_sizes)
+            intermediate = jax.lax.ragged_dot(x_sorted, self.lora_A.value, group_sizes, precision="bfloat16", preferred_element_type="bfloat16")
+        lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B.value, group_sizes, precision="bfloat16", preferred_element_type="bfloat16")
 
         # Unsort, reshape, scale
         lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
         lora_output = lora_output * self.lora_scaling.value[adapter_indices, None, None]
-        return base_output + lora_output.reshape(base_output.shape)
+        # HERE
+        return base_output.astype("bfloat16") + lora_output.reshape(base_output.shape).astype("bfloat16") # ).astype("bfloat16") ## HERE
 
 
 class LoRAEmbed(LoRAMixin, nnx.Embed):
@@ -106,7 +107,7 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
         *,
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype,
         param_dtype: jnp.dtype | None = None,
         embedding_init: nnx.Initializer,
         rngs: nnx.Rngs,
@@ -152,7 +153,7 @@ class LoRALinear(LoRAMixin, nnx.Linear):
         *,
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype,
         param_dtype: jnp.dtype | None = None,
         use_bias: bool,
         kernel_init: nnx.Initializer,
@@ -170,7 +171,7 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=kernel_init,
-            bias_init=bias_init,
+            # bias_init=bias_init,
             rngs=rngs,
         )
         assert (
@@ -204,7 +205,7 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         *,
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype,
         kernel_init: nnx.Initializer,
         rngs: nnx.Rngs,
     ) -> None:

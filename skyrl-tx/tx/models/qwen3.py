@@ -19,7 +19,7 @@ class RMSNorm(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        return self.weight * x / rms
+        return (self.weight * x / rms).astype(x.dtype)
 
 
 def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta: int) -> jax.Array:
@@ -28,7 +28,7 @@ def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta:
     x = (position_ids[..., None] / timescale[None, None, :])[..., None, :]
     sin, cos = jnp.sin(x), jnp.cos(x)
     a, b = jnp.split(inputs, 2, axis=-1)
-    return jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype(inputs.dtype)
+    return jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype("bfloat16")
 
 
 class Qwen3Attention(nnx.Module):
@@ -107,11 +107,11 @@ class Qwen3Attention(nnx.Module):
         # Project and reshape to [B, T, num_heads, head_dim]
         q = self.q_norm(self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim))
         k = self.k_norm(self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim).astype("bfloat16")
+        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim)
 
         # Apply RoPE
-        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta).astype("bfloat16")
-        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta).astype("bfloat16")
+        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
+        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
 
         # Handle KV cache: insert new k,v into the cache at the current position
         if kv_cache is not None:
@@ -355,6 +355,8 @@ class Qwen3Model(nnx.Module):
         )
 
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
+        # Cast embeddings to model dtype to ensure all computations are in the correct precision
+        hidden_states = hidden_states.astype(self.norm.weight.dtype)
         all_hidden_states: list[jax.Array] = []
         updated_keys, updated_values = [], []
 
