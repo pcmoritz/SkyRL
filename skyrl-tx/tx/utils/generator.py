@@ -197,21 +197,25 @@ class GeneratorMixin:
         stop_tokens = jnp.array(stop_tokens, dtype=jnp.int32)
 
         # Pre-allocate KV cache at max_length
+        # Infer dtype from model's layer norm to match the model's computation dtype
+        model_dtype = self.model.norm.weight.dtype
         kv_cache = KVCache.allocate(
             batch_size=batch_size,
             max_length=max_length,
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads,
-            dtype=jnp.bfloat16,
+            dtype=model_dtype,
         )
+
+        # Compute positions from unpadded attention mask
+        positions = compute_positions(attention_mask)
 
         # Pad attention mask to max_length before prefill
         pad_length = max_length - prompt_length
         attention_mask_padded = jnp.pad(attention_mask, ((0, 0), (0, pad_length)))
 
         # Prefill: process full prompt and populate the pre-allocated cache
-        positions = compute_positions(attention_mask)
         outputs = self._prefill_fn(self, input_ids, attention_mask_padded, positions, adapter_indices, kv_cache)
         kv_cache = outputs.kv_cache
 

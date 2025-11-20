@@ -28,7 +28,7 @@ def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta:
     x = (position_ids[..., None] / timescale[None, None, :])[..., None, :]
     sin, cos = jnp.sin(x), jnp.cos(x)
     a, b = jnp.split(inputs, 2, axis=-1)
-    return jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype("bfloat16")
+    return jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype(inputs.dtype)
 
 
 class Qwen3Attention(nnx.Module):
@@ -122,13 +122,15 @@ class Qwen3Attention(nnx.Module):
         updated_cache = (k, v)
 
         # Attention (causal only during prefill, GQA handled natively by dot_product_attention)
+        # Prefill if processing more than 1 token, decode if processing exactly 1 token
+        is_prefill = T > 1
         attn_output = jax.nn.dot_product_attention(
             q,
             k,
             v,
             scale=1.0 / self.head_dim**0.5,
             mask=attention_mask[:, None, None, :].astype(bool),
-            is_causal=kv_cache is None,
+            is_causal=is_prefill,
         )
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
@@ -378,8 +380,9 @@ class Qwen3Model(nnx.Module):
         if output_hidden_states:
             all_hidden_states.append(hidden_states)
 
-        # Update cache position: +1 for decode step, or +seq_len for prefill
-        new_cache_position = kv_cache.cache_position + input_ids.shape[1] if kv_cache is not None else input_ids.shape[1]
+        # Update cache position: increment by number of actual tokens processed
+        # With pre-allocated cache, kv_cache is always provided, so always increment
+        new_cache_position = kv_cache.cache_position + input_ids.shape[1]
 
         return ModelOutput(
             last_hidden_state=hidden_states,
