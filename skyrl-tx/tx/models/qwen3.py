@@ -116,8 +116,11 @@ class Qwen3Attention(nnx.Module):
         # Handle KV cache: insert new k,v into the cache at the current position
         if kv_cache is not None:
             k_cache, v_cache, cache_position = kv_cache
-            k = jax.lax.dynamic_update_slice(k_cache, k, (0, cache_position, 0, 0))
-            v = jax.lax.dynamic_update_slice(v_cache, v, (0, cache_position, 0, 0))
+            # Cast k,v to match cache dtype to handle mixed precision scenarios
+            k = jax.lax.dynamic_update_slice(k_cache, k.astype(k_cache.dtype), (0, cache_position, 0, 0))
+            v = jax.lax.dynamic_update_slice(v_cache, v.astype(v_cache.dtype), (0, cache_position, 0, 0))
+            # Cast q to match k,v dtype for attention
+            q = q.astype(k.dtype)
 
         updated_cache = (k, v)
 
@@ -326,6 +329,7 @@ class Qwen3Model(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        self.dtype = dtype
 
         self.embed_tokens = LoRAEmbed(
             num_embeddings=config.vocab_size,
@@ -357,8 +361,6 @@ class Qwen3Model(nnx.Module):
         )
 
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
-        # Cast embeddings to model dtype to ensure all computations are in the correct precision
-        hidden_states = hidden_states.astype(self.norm.weight.dtype)
         all_hidden_states: list[jax.Array] = []
         updated_keys, updated_values = [], []
 
@@ -381,8 +383,7 @@ class Qwen3Model(nnx.Module):
             all_hidden_states.append(hidden_states)
 
         # Update cache position: increment by number of actual tokens processed
-        # With pre-allocated cache, kv_cache is always provided, so always increment
-        new_cache_position = kv_cache.cache_position + input_ids.shape[1]
+        new_cache_position = kv_cache.cache_position + input_ids.shape[1] if kv_cache is not None else input_ids.shape[1]
 
         return ModelOutput(
             last_hidden_state=hidden_states,

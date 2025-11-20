@@ -197,15 +197,15 @@ class GeneratorMixin:
         stop_tokens = jnp.array(stop_tokens, dtype=jnp.int32)
 
         # Pre-allocate KV cache at max_length
-        # Infer dtype from model's layer norm to match the model's computation dtype
-        model_dtype = self.model.norm.weight.dtype
+        # Infer actual computation dtype from embedding weights (may differ from initialization dtype)
+        actual_dtype = self.model.embed_tokens.embedding.value.dtype
         kv_cache = KVCache.allocate(
             batch_size=batch_size,
             max_length=max_length,
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads,
-            dtype=model_dtype,
+            dtype=actual_dtype,
         )
 
         # Compute positions from unpadded attention mask
