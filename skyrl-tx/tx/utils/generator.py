@@ -21,22 +21,14 @@ class KVCache:
     values: list[jax.Array]
     cache_position: int
 
-    def pad_to_length(self, max_length: int) -> KVCache:
-        """Pad KV cache to a specified maximum length.
-
-        Args:
-            max_length: Target length to pad the cache to.
-
-        Returns:
-            New KVCache with padded keys and values.
-        """
-        # k and v have shape [B, T, num_heads, head_dim]
-        cache_pad_length = max_length - self.keys[0].shape[1]
-        pad_spec = ((0, 0), (0, cache_pad_length), (0, 0), (0, 0))
+    @staticmethod
+    def allocate(batch_size: int, max_length: int, num_layers: int, num_kv_heads: int, head_dim: int, dtype: jnp.dtype) -> KVCache:
+        """Allocate a KV cache pre-allocated to max_length with zeros."""
+        shape = (batch_size, max_length, num_kv_heads, head_dim)
         return KVCache(
-            keys=[jnp.pad(k, pad_spec) for k in self.keys],
-            values=[jnp.pad(v, pad_spec) for v in self.values],
-            cache_position=self.cache_position,
+            keys=[jnp.zeros(shape, dtype=dtype) for _ in range(num_layers)],
+            values=[jnp.zeros(shape, dtype=dtype) for _ in range(num_layers)],
+            cache_position=0,
         )
 
 
@@ -158,9 +150,16 @@ class GeneratorMixin:
     @staticmethod
     @jax.jit
     def _prefill_fn(
-        model, input_ids: jax.Array, attention_mask: jax.Array, positions: jax.Array, adapter_indices: jax.Array | None
+        model,
+        input_ids: jax.Array,
+        attention_mask: jax.Array,
+        positions: jax.Array,
+        adapter_indices: jax.Array | None,
+        kv_cache: KVCache,
     ):
-        return model(input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+        return model(
+            input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices, kv_cache=kv_cache
+        )
 
     def generate(
         self,
@@ -197,14 +196,27 @@ class GeneratorMixin:
             stop_tokens.append(stop + [-1] * (max_stop_tokens - len(stop)))
         stop_tokens = jnp.array(stop_tokens, dtype=jnp.int32)
 
-        # Prefill: process full prompt
-        positions = compute_positions(attention_mask)
-        outputs = self._prefill_fn(self, input_ids, attention_mask, positions, adapter_indices)
-        kv_cache = outputs.kv_cache.pad_to_length(max_length)
+        # Pre-allocate KV cache at max_length
+        kv_cache = KVCache.allocate(
+            batch_size=batch_size,
+            max_length=max_length,
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_dim=getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads,
+            dtype=jnp.bfloat16,
+        )
 
-        # Pad inputs to max_length
+        # Pad attention mask to max_length before prefill
         pad_length = max_length - prompt_length
-        attention_mask = jnp.pad(attention_mask, ((0, 0), (0, pad_length)))
+        attention_mask_padded = jnp.pad(attention_mask, ((0, 0), (0, pad_length)))
+
+        # Prefill: process full prompt and populate the pre-allocated cache
+        positions = compute_positions(attention_mask)
+        outputs = self._prefill_fn(self, input_ids, attention_mask_padded, positions, adapter_indices, kv_cache)
+        kv_cache = outputs.kv_cache
+
+        # Use the padded attention mask for decode loop
+        attention_mask = attention_mask_padded
         generated_ids = jnp.pad(input_ids, ((0, 0), (0, pad_length)))
         all_logprobs = jnp.zeros((batch_size, max_length), dtype=outputs.logits.dtype)
         stop_pos = jnp.full((batch_size, 1), -1, dtype=jnp.int32)

@@ -107,13 +107,13 @@ class Qwen3Attention(nnx.Module):
         # Project and reshape to [B, T, num_heads, head_dim]
         q = self.q_norm(self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim))
         k = self.k_norm(self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim).astype("bfloat16")
 
         # Apply RoPE
-        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
-        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
+        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta).astype("bfloat16")
+        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta).astype("bfloat16")
 
-        # Handle KV cache
+        # Handle KV cache: insert new k,v into the cache at the current position
         if kv_cache is not None:
             k_cache, v_cache, cache_position = kv_cache
             k = jax.lax.dynamic_update_slice(k_cache, k, (0, cache_position, 0, 0))
@@ -376,8 +376,8 @@ class Qwen3Model(nnx.Module):
         if output_hidden_states:
             all_hidden_states.append(hidden_states)
 
-        # Increment cache_position if cache exists, or use sequence length for new cache
-        new_cache_position = kv_cache.cache_position + 1 if kv_cache is not None else input_ids.shape[1]
+        # Update cache position: +1 for decode step, or +seq_len for prefill
+        new_cache_position = kv_cache.cache_position + input_ids.shape[1] if kv_cache is not None else input_ids.shape[1]
 
         return ModelOutput(
             last_hidden_state=hidden_states,
