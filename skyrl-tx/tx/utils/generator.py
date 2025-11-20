@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+import functools
 
 import jax
 from jax import lax
@@ -156,11 +157,13 @@ class GeneratorMixin:
     """Adds autoregressive generation with KV caching to causal language models."""
 
     @staticmethod
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=("max_length",))
     def _prefill_fn(
-        model, input_ids: jax.Array, attention_mask: jax.Array, positions: jax.Array, adapter_indices: jax.Array | None
+        model, input_ids: jax.Array, attention_mask: jax.Array, positions: jax.Array, max_length: int, adapter_indices: jax.Array | None
     ):
-        return model(input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+        outputs = model(input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+        outputs.kv_cache = outputs.kv_cache.pad_to_length(max_length)
+        return outputs
 
     def generate(
         self,
@@ -199,8 +202,7 @@ class GeneratorMixin:
 
         # Prefill: process full prompt
         positions = compute_positions(attention_mask)
-        outputs = self._prefill_fn(self, input_ids, attention_mask, positions, adapter_indices)
-        kv_cache = outputs.kv_cache.pad_to_length(max_length)
+        outputs = self._prefill_fn(self, input_ids, attention_mask, positions, max_length, adapter_indices)
 
         # Pad inputs to max_length
         pad_length = max_length - prompt_length
@@ -214,7 +216,7 @@ class GeneratorMixin:
             temperatures=temperatures,
             stop_tokens=stop_tokens,
             adapter_indices=adapter_indices,
-            kv_cache=kv_cache,
+            kv_cache=outputs.kv_cache,
             rngs=rngs,
             generated_ids=generated_ids,
             attention_mask=attention_mask,
