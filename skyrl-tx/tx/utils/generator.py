@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 from jax import lax
@@ -148,15 +149,26 @@ class GeneratorMixin:
     """Adds autoregressive generation with KV caching to causal language models."""
 
     @staticmethod
-    @jax.jit
+    @partial(jax.jit, static_argnames=("max_length",))
     def _prefill_fn(
         model,
         input_ids: jax.Array,
         attention_mask: jax.Array,
         positions: jax.Array,
         adapter_indices: jax.Array | None,
-        kv_cache: KVCache,
+        max_length: int,
     ):
+        # Pre-allocate KV cache inside JIT for efficiency
+        batch_size = input_ids.shape[0]
+        actual_dtype = model.model.embed_tokens.embedding.value.dtype
+        kv_cache = KVCache.allocate(
+            batch_size=batch_size,
+            max_length=max_length,
+            num_layers=model.config.num_hidden_layers,
+            num_kv_heads=model.config.num_key_value_heads,
+            head_dim=getattr(model.config, "head_dim", None) or model.config.hidden_size // model.config.num_attention_heads,
+            dtype=actual_dtype,
+        )
         return model(
             input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices, kv_cache=kv_cache
         )
@@ -196,18 +208,6 @@ class GeneratorMixin:
             stop_tokens.append(stop + [-1] * (max_stop_tokens - len(stop)))
         stop_tokens = jnp.array(stop_tokens, dtype=jnp.int32)
 
-        # Pre-allocate KV cache at max_length
-        # Infer actual computation dtype from embedding weights (may differ from initialization dtype)
-        actual_dtype = self.model.embed_tokens.embedding.value.dtype
-        kv_cache = KVCache.allocate(
-            batch_size=batch_size,
-            max_length=max_length,
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads,
-            dtype=actual_dtype,
-        )
-
         # Compute positions from unpadded attention mask
         positions = compute_positions(attention_mask)
 
@@ -216,8 +216,8 @@ class GeneratorMixin:
         attention_mask_padded = jnp.pad(attention_mask, ((0, 0), (0, pad_length)))
 
         # Prefill: process full prompt and populate the pre-allocated cache
-        outputs = self._prefill_fn(self, input_ids, attention_mask_padded, positions, adapter_indices, kv_cache)
-        kv_cache = outputs.kv_cache
+        # Cache allocation happens inside _prefill_fn to be JIT compiled
+        outputs = self._prefill_fn(self, input_ids, attention_mask_padded, positions, adapter_indices, max_length)
 
         # Use the padded attention mask for decode loop
         attention_mask = attention_mask_padded
@@ -230,7 +230,7 @@ class GeneratorMixin:
             temperatures=temperatures,
             stop_tokens=stop_tokens,
             adapter_indices=adapter_indices,
-            kv_cache=kv_cache,
+            kv_cache=outputs.kv_cache,
             rngs=rngs,
             generated_ids=generated_ids,
             attention_mask=attention_mask,
