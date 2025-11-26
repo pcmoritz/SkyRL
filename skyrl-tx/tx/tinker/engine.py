@@ -135,10 +135,36 @@ class TinkerEngine:
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
             update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
-        print("\nModel parameter dtypes:")
-        for path, value in nnx.to_flat_state(nnx.state(self.model)):
-            if hasattr(value, 'dtype'):
-                print(f"  {path}: {value.dtype}")
+        # Print activation dtypes by running a dummy forward pass
+        print("\nModel activation dtypes:")
+        dummy_input_ids = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
+        dummy_adapter_indices = jnp.array([[0, 0, 0, 0]], dtype=jnp.int32)
+
+        def trace_activations(module, method_name='__call__'):
+            """Wrap module methods to print activation dtypes."""
+            original_method = getattr(module, method_name)
+
+            def wrapped(*args, **kwargs):
+                result = original_method(*args, **kwargs)
+                if hasattr(result, 'dtype'):
+                    print(f"  {module.__class__.__name__}.{method_name} output: {result.dtype}")
+                elif hasattr(result, 'logits'):
+                    print(f"  {module.__class__.__name__}.{method_name} output.logits: {result.logits.dtype}")
+                return result
+
+            setattr(module, method_name, wrapped)
+
+        # Trace key modules
+        for name, module in self.model.__dict__.items():
+            if isinstance(module, nnx.Module) and hasattr(module, '__call__'):
+                trace_activations(module)
+
+        # Run forward pass
+        try:
+            output = self.model(dummy_input_ids, adapter_indices=dummy_adapter_indices)
+            print(f"  Final output dtype: {output.logits.dtype}")
+        except Exception as e:
+            print(f"  Could not run forward pass: {e}")
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
