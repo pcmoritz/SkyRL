@@ -54,6 +54,14 @@ class EngineConfig(BaseModel):
         default=Path("/tmp/lora_models"),
         description="Directory where LoRA models will be extracted for external inference engines",
     )
+    profile: bool = Field(
+        default=False,
+        description="Enable JAX profiler to capture traces for TensorBoard",
+    )
+    profile_dir: Path = Field(
+        default=Path("/tmp/jax_profiles"),
+        description="Directory where JAX profiler traces will be saved",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

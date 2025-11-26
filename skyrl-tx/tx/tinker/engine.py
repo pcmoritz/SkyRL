@@ -1,9 +1,10 @@
 """Background engine for processing training requests."""
 
 import argparse
+import os
 import time
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -281,6 +282,33 @@ class TinkerEngine:
             logger.info(f"JIT compilation for {mode} seq_len={seq_len} took {elapsed:.2f}s")
         else:
             yield
+
+    @contextmanager
+    def _profiler_context(self, name: str):
+        """Context manager for JAX profiler tracing.
+
+        Captures a trace that can be viewed in TensorBoard. The trace is saved to
+        the configured profile_dir with a timestamped subdirectory.
+
+        Args:
+            name: A descriptive name for the trace (e.g., 'train_step', 'sample')
+        """
+        if not self.config.profile:
+            yield
+            return
+
+        # Create output directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        trace_dir = self.config.profile_dir / f"{name}_{timestamp}"
+        os.makedirs(trace_dir, exist_ok=True)
+
+        logger.info(f"Starting JAX profiler trace: {name} -> {trace_dir}")
+        jax.profiler.start_trace(str(trace_dir))
+        try:
+            yield
+        finally:
+            jax.profiler.stop_trace()
+            logger.info(f"JAX profiler trace saved to {trace_dir}")
 
     def _forward_backward(
         self,
@@ -644,7 +672,7 @@ class TinkerEngine:
         # Collect generated sequences across batches
         all_sequences: list[types.GeneratedSequence] = []
 
-        with jax.set_mesh(self.mesh):
+        with jax.set_mesh(self.mesh), self._profiler_context("sample"):
             model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
             for batch_start in range(0, total_batch_size, max_batch_size):
                 batch_end = min(batch_start + max_batch_size, total_batch_size)
