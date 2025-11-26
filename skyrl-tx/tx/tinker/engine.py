@@ -135,6 +135,11 @@ class TinkerEngine:
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
             update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
+        print("\nModel parameter dtypes:")
+        for path, value in nnx.state(self.model).flat_state().items():
+            if hasattr(value, 'dtype'):
+                print(f"  {path}: {value.dtype}")
+
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
         )
