@@ -194,10 +194,14 @@ class TinkerEngine:
         # Restore original methods
         for module_name, original_method in original_methods.items():
             parts = module_name.split('.')
+            # Skip the "model" prefix we added
+            if parts[0] == "model":
+                parts = parts[1:]
             obj = self.model
             for part in parts[:-1]:
                 obj = getattr(obj, part)
-            setattr(obj, parts[-1].__call__ if len(parts) == 1 else '__call__', original_method)
+            final_obj = getattr(obj, parts[-1])
+            final_obj.__call__ = original_method
 
         # Print captured activations
         for name, (shape, dtype) in sorted(activations.items()):
