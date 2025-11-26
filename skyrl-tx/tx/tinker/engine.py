@@ -139,30 +139,27 @@ class TinkerEngine:
         print("\nModel activation dtypes:")
 
         seq_len = 1
+        input_ids = jnp.ones((1, seq_len), dtype=jnp.int32)
+        adapter_indices = jnp.zeros((1, seq_len), dtype=jnp.int32)
+        attention_mask = jnp.ones((1, seq_len), dtype=jnp.int32)
+        positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
 
-        def forward_with_debug():
-            input_ids = jnp.ones((1, seq_len), dtype=jnp.int32)
-            adapter_indices = jnp.zeros((1, seq_len), dtype=jnp.int32)
-            attention_mask = jnp.ones((1, seq_len), dtype=jnp.int32)
-            positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-
+        try:
             # Embed layer
-            x = self.model.embed_tokens(input_ids, adapter_indices)
+            x = self.model.model.embed_tokens(input_ids, adapter_indices)
             jax.debug.print("  embed_tokens: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
 
             # First layer
-            if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
-                x = self.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
-                jax.debug.print("  layers.0: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
+            x = self.model.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+            jax.debug.print("  layers.0: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
+
+            # Norm
+            x = self.model.model.norm(x)
+            jax.debug.print("  norm: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
 
             # Run full forward
             output = self.model(input_ids, adapter_indices=adapter_indices, attention_mask=attention_mask, positions=positions)
             jax.debug.print("  final_output.logits: shape={s}, dtype={d}", s=output.logits.shape, d=output.logits.dtype)
-
-            return output
-
-        try:
-            forward_with_debug()
         except Exception as e:
             print(f"  Forward pass failed: {e}")
 
