@@ -199,8 +199,14 @@ class TinkerEngine:
                 parts = parts[1:]
             obj = self.model
             for part in parts[:-1]:
-                obj = getattr(obj, part)
-            final_obj = getattr(obj, parts[-1])
+                if part.isdigit():
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            if parts[-1].isdigit():
+                final_obj = obj[int(parts[-1])]
+            else:
+                final_obj = getattr(obj, parts[-1])
             final_obj.__call__ = original_method
 
         # Print captured activations
