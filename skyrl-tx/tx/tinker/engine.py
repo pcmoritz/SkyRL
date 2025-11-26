@@ -135,43 +135,34 @@ class TinkerEngine:
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
             update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
-        # Print activation dtypes by running a dummy forward pass
-        print("\nModel activation dtypes:")
-        dummy_input_ids = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
-        dummy_adapter_indices = jnp.array([[0, 0, 0, 0]], dtype=jnp.int32)
-        dummy_attention_mask = jnp.ones((1, 4), dtype=jnp.int32)
-        dummy_positions = jnp.arange(4, dtype=jnp.int32)[None, :]
+        # Print activation dtypes by tracing with jax.eval_shape
+        print("\nModel activation dtypes (from eval_shape):")
+        dummy_input_ids = jax.ShapeDtypeStruct((1, 4), jnp.int32)
+        dummy_adapter_indices = jax.ShapeDtypeStruct((1, 4), jnp.int32)
+        dummy_attention_mask = jax.ShapeDtypeStruct((1, 4), jnp.int32)
+        dummy_positions = jax.ShapeDtypeStruct((1, 4), jnp.int32)
 
-        def trace_activations(module, method_name='__call__'):
-            """Wrap module methods to print activation dtypes."""
-            original_method = getattr(module, method_name)
-
-            def wrapped(*args, **kwargs):
-                result = original_method(*args, **kwargs)
-                if hasattr(result, 'dtype'):
-                    print(f"  {module.__class__.__name__}.{method_name} output: {result.dtype}")
-                elif hasattr(result, 'logits'):
-                    print(f"  {module.__class__.__name__}.{method_name} output.logits: {result.logits.dtype}")
-                return result
-
-            setattr(module, method_name, wrapped)
-
-        # Trace key modules
-        for name, module in self.model.__dict__.items():
-            if isinstance(module, nnx.Module) and hasattr(module, '__call__'):
-                trace_activations(module)
-
-        # Run forward pass
-        try:
-            output = self.model(
-                dummy_input_ids,
-                adapter_indices=dummy_adapter_indices,
-                attention_mask=dummy_attention_mask,
-                positions=dummy_positions
+        def forward_fn():
+            return self.model(
+                jnp.ones((1, 4), dtype=jnp.int32),
+                adapter_indices=jnp.zeros((1, 4), dtype=jnp.int32),
+                attention_mask=jnp.ones((1, 4), dtype=jnp.int32),
+                positions=jnp.arange(4, dtype=jnp.int32)[None, :]
             )
-            print(f"  Final output dtype: {output.logits.dtype}")
+
+        try:
+            output_shape = jax.eval_shape(forward_fn)
+            print(f"  Model output.logits: shape={output_shape.logits.shape}, dtype={output_shape.logits.dtype}")
+            if hasattr(output_shape, 'hidden_states') and output_shape.hidden_states is not None:
+                print(f"  Model output.hidden_states: dtype={output_shape.hidden_states.dtype}")
         except Exception as e:
-            print(f"  Could not run forward pass: {e}")
+            print(f"  Could not eval_shape forward pass: {e}")
+            print(f"  Trying direct forward pass to check output dtype...")
+            try:
+                output = forward_fn()
+                print(f"  Model output.logits: shape={output.logits.shape}, dtype={output.logits.dtype}")
+            except Exception as e2:
+                print(f"  Forward pass also failed: {e2}")
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
