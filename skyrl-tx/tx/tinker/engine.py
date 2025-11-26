@@ -136,9 +136,7 @@ class TinkerEngine:
             update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
         print("\nModel parameter dtypes:")
-        flat_state = nnx.state(self.model).flat_state()
-        for path in flat_state:
-            value = flat_state[path]
+        for path, value in nnx.to_flat_state(nnx.state(self.model)):
             if hasattr(value, 'dtype'):
                 print(f"  {path}: {value.dtype}")
 
