@@ -139,6 +139,7 @@ class TinkerEngine:
         print("\nModel activation dtypes:")
         dummy_input_ids = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
         dummy_adapter_indices = jnp.array([[0, 0, 0, 0]], dtype=jnp.int32)
+        dummy_attention_mask = jnp.ones((1, 4), dtype=jnp.int32)
 
         def trace_activations(module, method_name='__call__'):
             """Wrap module methods to print activation dtypes."""
@@ -161,7 +162,7 @@ class TinkerEngine:
 
         # Run forward pass
         try:
-            output = self.model(dummy_input_ids, adapter_indices=dummy_adapter_indices)
+            output = self.model(dummy_input_ids, adapter_indices=dummy_adapter_indices, attention_mask=dummy_attention_mask)
             print(f"  Final output dtype: {output.logits.dtype}")
         except Exception as e:
             print(f"  Could not run forward pass: {e}")
