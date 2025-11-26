@@ -137,32 +137,24 @@ class TinkerEngine:
 
         # Print activation dtypes by tracing with jax.eval_shape
         print("\nModel activation dtypes (from eval_shape):")
-        dummy_input_ids = jax.ShapeDtypeStruct((1, 4), jnp.int32)
-        dummy_adapter_indices = jax.ShapeDtypeStruct((1, 4), jnp.int32)
-        dummy_attention_mask = jax.ShapeDtypeStruct((1, 4), jnp.int32)
-        dummy_positions = jax.ShapeDtypeStruct((1, 4), jnp.int32)
 
-        def forward_fn():
+        def forward_fn(seq_len):
             return self.model(
-                jnp.ones((1, 4), dtype=jnp.int32),
-                adapter_indices=jnp.zeros((1, 4), dtype=jnp.int32),
-                attention_mask=jnp.ones((1, 4), dtype=jnp.int32),
-                positions=jnp.arange(4, dtype=jnp.int32)[None, :]
+                jnp.ones((1, seq_len), dtype=jnp.int32),
+                adapter_indices=jnp.zeros((1, seq_len), dtype=jnp.int32),
+                attention_mask=jnp.ones((1, seq_len), dtype=jnp.int32),
+                positions=jnp.arange(seq_len, dtype=jnp.int32)[None, :]
             )
 
-        try:
-            output_shape = jax.eval_shape(forward_fn)
-            print(f"  Model output.logits: shape={output_shape.logits.shape}, dtype={output_shape.logits.dtype}")
-            if hasattr(output_shape, 'hidden_states') and output_shape.hidden_states is not None:
-                print(f"  Model output.hidden_states: dtype={output_shape.hidden_states.dtype}")
-        except Exception as e:
-            print(f"  Could not eval_shape forward pass: {e}")
-            print(f"  Trying direct forward pass to check output dtype...")
+        # Try different sequence lengths to find one that works
+        for seq_len in [1, 2, 8, 16]:
             try:
-                output = forward_fn()
-                print(f"  Model output.logits: shape={output.logits.shape}, dtype={output.logits.dtype}")
-            except Exception as e2:
-                print(f"  Forward pass also failed: {e2}")
+                output_shape = jax.eval_shape(lambda: forward_fn(seq_len))
+                print(f"  Model output.logits (seq_len={seq_len}): shape={output_shape.logits.shape}, dtype={output_shape.logits.dtype}")
+                break
+            except Exception as e:
+                if seq_len == 16:
+                    print(f"  Could not run forward pass with any sequence length. Last error: {e}")
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
