@@ -154,7 +154,20 @@ class TinkerEngine:
             print(f"  embed_tokens: shape={x.shape}, dtype={x.dtype}")
 
             # First layer (returns tuple of hidden_states, cache)
-            x, _ = self.model.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+            layer_0 = self.model.model.layers[0]
+            residual = x
+            x_norm = layer_0.input_layernorm(x)
+            print(f"  layers.0.input_layernorm: shape={x_norm.shape}, dtype={x_norm.dtype}")
+
+            # Check q, k, v projections
+            q = layer_0.self_attn.q_proj(x_norm, adapter_indices)
+            k = layer_0.self_attn.k_proj(x_norm, adapter_indices)
+            v = layer_0.self_attn.v_proj(x_norm, adapter_indices)
+            print(f"  layers.0.self_attn.q: shape={q.shape}, dtype={q.dtype}")
+            print(f"  layers.0.self_attn.k: shape={k.shape}, dtype={k.dtype}")
+            print(f"  layers.0.self_attn.v: shape={v.shape}, dtype={v.dtype}")
+
+            x, _ = layer_0(residual, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
             print(f"  layers.0: shape={x.shape}, dtype={x.dtype}")
 
             # Middle layer (if exists)
