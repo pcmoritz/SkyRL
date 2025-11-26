@@ -145,23 +145,34 @@ class TinkerEngine:
         positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
 
         try:
-            # Embed layer
+            # Run full forward and capture intermediate outputs
+            output = self.model(input_ids, adapter_indices=adapter_indices, attention_mask=attention_mask, positions=positions)
+            print(f"  final_output.logits: shape={output.logits.shape}, dtype={output.logits.dtype}")
+
+            # Now manually trace through layers to see intermediate dtypes
             x = self.model.model.embed_tokens(input_ids, adapter_indices)
-            jax.debug.print("  embed_tokens: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
+            print(f"  embed_tokens: shape={x.shape}, dtype={x.dtype}")
 
             # First layer
             x = self.model.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
-            jax.debug.print("  layers.0: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
+            print(f"  layers.0: shape={x.shape}, dtype={x.dtype}")
+
+            # Middle layer (if exists)
+            if len(self.model.model.layers) > 10:
+                x = self.model.model.layers[len(self.model.model.layers)//2](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+                print(f"  layers.{len(self.model.model.layers)//2}: shape={x.shape}, dtype={x.dtype}")
+
+            # Last layer
+            x = self.model.model.layers[-1](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+            print(f"  layers.{len(self.model.model.layers)-1}: shape={x.shape}, dtype={x.dtype}")
 
             # Norm
             x = self.model.model.norm(x)
-            jax.debug.print("  norm: shape={s}, dtype={d}", s=x.shape, d=x.dtype)
-
-            # Run full forward
-            output = self.model(input_ids, adapter_indices=adapter_indices, attention_mask=attention_mask, positions=positions)
-            jax.debug.print("  final_output.logits: shape={s}, dtype={d}", s=output.logits.shape, d=output.logits.dtype)
+            print(f"  norm: shape={x.shape}, dtype={x.dtype}")
         except Exception as e:
             print(f"  Forward pass failed: {e}")
+            import traceback
+            traceback.print_exc()
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
