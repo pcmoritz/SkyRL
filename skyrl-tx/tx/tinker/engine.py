@@ -153,17 +153,17 @@ class TinkerEngine:
             x = self.model.model.embed_tokens(input_ids, adapter_indices)
             print(f"  embed_tokens: shape={x.shape}, dtype={x.dtype}")
 
-            # First layer
-            x = self.model.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+            # First layer (returns tuple of hidden_states, cache)
+            x, _ = self.model.model.layers[0](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
             print(f"  layers.0: shape={x.shape}, dtype={x.dtype}")
 
             # Middle layer (if exists)
             if len(self.model.model.layers) > 10:
-                x = self.model.model.layers[len(self.model.model.layers)//2](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+                x, _ = self.model.model.layers[len(self.model.model.layers)//2](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
                 print(f"  layers.{len(self.model.model.layers)//2}: shape={x.shape}, dtype={x.dtype}")
 
             # Last layer
-            x = self.model.model.layers[-1](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+            x, _ = self.model.model.layers[-1](x, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
             print(f"  layers.{len(self.model.model.layers)-1}: shape={x.shape}, dtype={x.dtype}")
 
             # Norm
