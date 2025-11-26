@@ -135,26 +135,73 @@ class TinkerEngine:
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
             update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
-        # Print activation dtypes by tracing with jax.eval_shape
-        print("\nModel activation dtypes (from eval_shape):")
+        # Print activation dtypes by capturing intermediate values
+        print("\nModel activation dtypes:")
 
-        def forward_fn(seq_len):
-            return self.model(
+        activations = {}
+
+        def capture_activation(name):
+            def wrapper(x):
+                if hasattr(x, 'dtype') and hasattr(x, 'shape'):
+                    activations[name] = (x.shape, x.dtype)
+                return x
+            return wrapper
+
+        # Monkey-patch key operations to capture activations
+        original_methods = {}
+
+        def patch_module(module, module_name):
+            if hasattr(module, '__call__') and isinstance(module, nnx.Module):
+                original_methods[module_name] = module.__call__
+                original_call = module.__call__
+
+                def wrapped_call(*args, **kwargs):
+                    result = original_call(*args, **kwargs)
+                    if hasattr(result, 'dtype') and hasattr(result, 'shape'):
+                        activations[module_name] = (result.shape, result.dtype)
+                    elif hasattr(result, 'logits'):  # Handle output objects
+                        if hasattr(result.logits, 'dtype'):
+                            activations[f"{module_name}.logits"] = (result.logits.shape, result.logits.dtype)
+                    return result
+
+                module.__call__ = wrapped_call
+
+        # Recursively patch all modules
+        def patch_all_modules(obj, prefix=""):
+            for name, module in obj.__dict__.items():
+                if isinstance(module, nnx.Module):
+                    full_name = f"{prefix}.{name}" if prefix else name
+                    patch_module(module, full_name)
+                    # Recursively patch submodules
+                    if hasattr(module, '__dict__'):
+                        patch_all_modules(module, full_name)
+
+        patch_all_modules(self.model, "model")
+
+        # Run forward pass
+        seq_len = 1
+        try:
+            output = self.model(
                 jnp.ones((1, seq_len), dtype=jnp.int32),
                 adapter_indices=jnp.zeros((1, seq_len), dtype=jnp.int32),
                 attention_mask=jnp.ones((1, seq_len), dtype=jnp.int32),
                 positions=jnp.arange(seq_len, dtype=jnp.int32)[None, :]
             )
+            activations["final_output.logits"] = (output.logits.shape, output.logits.dtype)
+        except Exception as e:
+            print(f"  Forward pass failed: {e}")
 
-        # Try different sequence lengths to find one that works
-        for seq_len in [1, 2, 8, 16]:
-            try:
-                output_shape = jax.eval_shape(lambda: forward_fn(seq_len))
-                print(f"  Model output.logits (seq_len={seq_len}): shape={output_shape.logits.shape}, dtype={output_shape.logits.dtype}")
-                break
-            except Exception as e:
-                if seq_len == 16:
-                    print(f"  Could not run forward pass with any sequence length. Last error: {e}")
+        # Restore original methods
+        for module_name, original_method in original_methods.items():
+            parts = module_name.split('.')
+            obj = self.model
+            for part in parts[:-1]:
+                obj = getattr(obj, part)
+            setattr(obj, parts[-1].__call__ if len(parts) == 1 else '__call__', original_method)
+
+        # Print captured activations
+        for name, (shape, dtype) in sorted(activations.items()):
+            print(f"  {name}: shape={shape}, dtype={dtype}")
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
