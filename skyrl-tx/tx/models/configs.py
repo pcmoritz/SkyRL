@@ -31,3 +31,8 @@ class Qwen3Config(PretrainedConfig):
         self.max_lora_adapters = max_lora_adapters
         self.max_lora_rank = max_lora_rank
         self.shard_attention_heads = shard_attention_heads
+
+    def __repr__(self):
+        """Custom repr to avoid instantiation issues in to_diff_dict."""
+        config_str = super().__repr__()
+        return f"{self.__class__.__name__}(config={config_str}, max_lora_adapters={self.max_lora_adapters}, max_lora_rank={self.max_lora_rank}, shard_attention_heads={self.shard_attention_heads})"
