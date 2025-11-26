@@ -77,16 +77,27 @@ class GenerateOutput:
     logprobs: list[list[float]]
 
 
-def batched_sample_token(logits: jax.Array, *, temperatures: jax.Array, sample_keys: jax.Array) -> jax.Array:
-    """Sample next token per-example using a per-example PRNGKey."""
+def batched_sample_token(
+    logits: jax.Array, *, temperatures: jax.Array, sample_keys: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Sample next token per-example using a per-example PRNGKey.
+
+    Returns:
+        Tuple of (next_token, logprobs) where logprobs are the log probabilities for all tokens.
+    """
+    # Compute log_softmax once and reuse for both sampling and logprobs
+    logprobs = jax.nn.log_softmax(logits, axis=-1)
+
     temperatures = temperatures[:, None]
     zero_temp_mask = temperatures == 0.0
-    scaled_logits = logits / jnp.where(zero_temp_mask, 1.0, temperatures)
-    # Draw one sample per example
-    sampled = jax.vmap(lambda key, logit: jax.random.categorical(key, logit, axis=-1))(sample_keys, scaled_logits)
-    greedy = jnp.argmax(logits, axis=-1)
+    scaled_logprobs = logprobs / jnp.where(zero_temp_mask, 1.0, temperatures)
+
+    # Draw one sample per example using log probabilities (categorical accepts logits or log-probs)
+    sampled = jax.vmap(lambda key, lp: jax.random.categorical(key, lp, axis=-1))(sample_keys, scaled_logprobs)
+    greedy = jnp.argmax(logprobs, axis=-1)
     next_token = jnp.where(zero_temp_mask, greedy[:, None], sampled[:, None])
-    return next_token
+
+    return next_token, logprobs
 
 
 def compute_positions(attention_mask: jax.Array) -> jax.Array:
@@ -103,9 +114,8 @@ def next_token_and_logprobs(s: DecodeState) -> tuple[jax.Array, jax.Array, jax.A
     """Sample next token and compute logprobs, updating the logprobs array."""
     split_keys = jax.vmap(jax.random.split)(s.rngs)
     next_rngs, sample_keys = split_keys[:, 0], split_keys[:, 1]
-    next_token = batched_sample_token(s.logits, temperatures=s.temperatures, sample_keys=sample_keys)
+    next_token, logprobs = batched_sample_token(s.logits, temperatures=s.temperatures, sample_keys=sample_keys)
 
-    logprobs = jax.nn.log_softmax(s.logits, axis=-1)
     sampled_logprobs = jnp.take_along_axis(logprobs, next_token, axis=-1)  # [batch_size, 1]
     all_logprobs = lax.dynamic_update_slice(s.all_logprobs, sampled_logprobs, (0, s.kv_cache.cache_position))
 
