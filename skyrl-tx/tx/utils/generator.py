@@ -90,7 +90,7 @@ def batched_sample_token(
 
     temperatures = temperatures[:, None]
     zero_temp_mask = temperatures == 0.0
-    scaled_logprobs = logprobs / jnp.where(zero_temp_mask, 1.0, temperatures)
+    scaled_logprobs = logprobs / jnp.where(zero_temp_mask, jnp.ones_like(temperatures), temperatures)
 
     # Draw one sample per example using log probabilities (categorical accepts logits or log-probs)
     sampled = jax.vmap(lambda key, lp: jax.random.categorical(key, lp, axis=-1))(sample_keys, scaled_logprobs)
@@ -192,7 +192,7 @@ class GeneratorMixin:
         assert len(sampling_params) == batch_size
         max_new_tokens = max(sampling_param.max_tokens for sampling_param in sampling_params)
         max_length = tx.utils.models.round_up_seq_len(prompt_length + max_new_tokens)
-        temperatures = jnp.array([sampling_param.temperature for sampling_param in sampling_params])
+        temperatures = jnp.array([sampling_param.temperature for sampling_param in sampling_params], dtype=jnp.bfloat16)
 
         # One PRNGKey per provided seed. If the caller supplies identical seeds, the corresponding
         # per-request streams will be identical.
