@@ -111,32 +111,42 @@ def compute_positions(attention_mask: jax.Array) -> jax.Array:
 
 
 def next_token_and_logprobs(s: DecodeState) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Sample next token and compute logprobs, updating the logprobs array."""
+    """Sample next token and compute logprobs.
+
+    Returns:
+        Tuple of (next_rngs, next_token, sampled_logprob, stop_pos)
+    """
     split_keys = jax.vmap(jax.random.split)(s.rngs)
     next_rngs, sample_keys = split_keys[:, 0], split_keys[:, 1]
     next_token, logprobs = batched_sample_token(s.logits, temperatures=s.temperatures, sample_keys=sample_keys)
 
-    sampled_logprobs = jnp.take_along_axis(logprobs, next_token, axis=-1)  # [batch_size, 1]
-    all_logprobs = lax.dynamic_update_slice(s.all_logprobs, sampled_logprobs, (0, s.kv_cache.cache_position))
+    sampled_logprob = jnp.take_along_axis(logprobs, next_token, axis=-1)  # [batch_size, 1]
 
     # Check if sampled token is in stop tokens and update stop position
     is_stop = jnp.any(next_token == s.stop_tokens, axis=1, keepdims=True)
     # Only update stop_pos if not already stopped (stop_pos == -1)
     stop_pos = jnp.where((s.stop_pos == -1) & is_stop, s.kv_cache.cache_position, s.stop_pos)
 
-    return next_rngs, next_token, all_logprobs, stop_pos
+    return next_rngs, next_token, sampled_logprob, stop_pos
 
 
-def decode_fn(s: DecodeState, _) -> tuple[DecodeState, None]:
-    """Decode one token step for use with jax.lax.scan."""
-    rngs, next_token, all_logprobs, stop_pos = next_token_and_logprobs(s)
+@jax.tree_util.register_dataclass
+@dataclass
+class DecodeOutput:
+    """Per-step output from decode loop, collected by scan."""
+    token: jax.Array        # [batch_size, 1]
+    logprob: jax.Array      # [batch_size, 1]
 
-    generated_ids = lax.dynamic_update_slice(s.generated_ids, next_token, (0, s.kv_cache.cache_position))
-    attention_mask = lax.dynamic_update_slice(
-        s.attention_mask,
-        jnp.ones((s.generated_ids.shape[0], 1), dtype=s.attention_mask.dtype),
-        (0, s.kv_cache.cache_position),
-    )
+
+def decode_fn(s: DecodeState, _) -> tuple[DecodeState, DecodeOutput]:
+    """Decode one token step for use with jax.lax.scan.
+
+    Returns per-step outputs separately to avoid dynamic_update_slice overhead.
+    """
+    rngs, next_token, sampled_logprob, stop_pos = next_token_and_logprobs(s)
+
+    # Update attention mask for next step (we still need this for the model)
+    attention_mask = s.attention_mask.at[:, s.kv_cache.cache_position].set(1)
 
     outputs = s.model(
         next_token,
@@ -152,14 +162,15 @@ def decode_fn(s: DecodeState, _) -> tuple[DecodeState, None]:
         adapter_indices=s.adapter_indices,
         kv_cache=outputs.kv_cache,
         rngs=rngs,
-        generated_ids=generated_ids,
+        generated_ids=s.generated_ids,  # Don't update here anymore
         attention_mask=attention_mask,
         last_positions=s.last_positions + 1,
         logits=outputs.logits[:, -1, :],
-        all_logprobs=all_logprobs,
+        all_logprobs=s.all_logprobs,  # Don't update here anymore
         stop_pos=stop_pos,
     )
-    return next_state, None
+    # Return per-step outputs to be stacked by scan
+    return next_state, DecodeOutput(token=next_token, logprob=sampled_logprob)
 
 
 class GeneratorMixin:
@@ -233,28 +244,37 @@ class GeneratorMixin:
             all_logprobs=all_logprobs,
             stop_pos=stop_pos,
         )
-        final_state, _ = jax.lax.scan(decode_fn, initial_state, xs=None, length=max_new_tokens - 1)
+        final_state, scan_outputs = jax.lax.scan(decode_fn, initial_state, xs=None, length=max_new_tokens - 1)
 
         # Sample final token
-        rngs, next_token, all_logprobs, stop_pos = next_token_and_logprobs(final_state)
-        generated_ids = lax.dynamic_update_slice(
-            final_state.generated_ids, next_token, (0, final_state.kv_cache.cache_position)
-        )
+        rngs, next_token, final_logprob, stop_pos = next_token_and_logprobs(final_state)
+
+        # Concatenate all tokens and logprobs from scan outputs + final token
+        # scan_outputs.token has shape [max_new_tokens - 1, batch_size, 1]
+        # Transpose to [batch_size, max_new_tokens - 1] and concat with final token
+        all_tokens = jnp.concatenate([
+            scan_outputs.token.squeeze(-1).T,  # [batch_size, max_new_tokens - 1]
+            next_token,  # [batch_size, 1]
+        ], axis=1)
+        all_logprobs = jnp.concatenate([
+            scan_outputs.logprob.squeeze(-1).T,  # [batch_size, max_new_tokens - 1]
+            final_logprob,  # [batch_size, 1]
+        ], axis=1)
 
         # Compute end position for each sequence: stop_pos + 1 if stopped, else prompt_length + max_tokens
         end_positions = jnp.where(
             stop_pos[:, 0] >= 0,
-            stop_pos[:, 0] + 1,
-            prompt_length + jnp.array([sp.max_tokens for sp in sampling_params]),
+            stop_pos[:, 0] + 1 - prompt_length,  # Convert to relative position
+            jnp.array([sp.max_tokens for sp in sampling_params]),
         )
 
         # Single device-to-host transfer for all data
-        generated_ids_host, stop_pos_host, all_logprobs_host, end_positions_host = jax.device_get(
-            (generated_ids[:, prompt_length:], stop_pos, all_logprobs[:, prompt_length:], end_positions - prompt_length)
+        all_tokens_host, stop_pos_host, all_logprobs_host, end_positions_host = jax.device_get(
+            (all_tokens, stop_pos, all_logprobs, end_positions)
         )
 
         return GenerateOutput(
-            generated_ids=[generated_ids_host[i][: end_positions_host[i]].tolist() for i in range(batch_size)],
+            generated_ids=[all_tokens_host[i][: end_positions_host[i]].tolist() for i in range(batch_size)],
             stop_reasons=["stop" if stop_pos_host[i, 0] >= 0 else "length" for i in range(batch_size)],
             logprobs=[all_logprobs_host[i][: end_positions_host[i]].tolist() for i in range(batch_size)],
         )
