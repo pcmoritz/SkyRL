@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI):
         logger.info("Using internal engine for inference")
 
     # Build subprocess command with engine config parameters
+    # cmd = ["uv", "run", "--env-file", "/home/ray/.env", "--extra", "tinker", "-m", "tx.tinker.engine"]
     cmd = ["uv", "run", "--extra", "tinker", "-m", "tx.tinker.engine"]
     cmd.extend(config_to_argv(app.state.engine_config))
 
