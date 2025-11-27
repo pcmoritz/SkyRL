@@ -2,6 +2,17 @@
 
 import argparse
 import os
+
+# Set XLA flags for better GPU performance before importing JAX
+os.environ.setdefault('XLA_FLAGS', ' '.join([
+    '--xla_gpu_enable_latency_hiding_scheduler=true',
+    '--xla_gpu_enable_async_all_reduce=true',
+    '--xla_gpu_enable_async_all_gather=true',
+    '--xla_gpu_enable_async_reduce_scatter=true',
+    '--xla_gpu_enable_triton_gemm=true',
+    '--xla_gpu_all_reduce_combine_threshold_bytes=134217728',  # 128MB - combine small all-reduces
+]))
+
 import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
