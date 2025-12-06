@@ -2,6 +2,7 @@ from flax import nnx
 import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
+from flash_attn_jax import flash_mha
 
 from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed
 from tx.layers.util import Param, prepare_routing
@@ -125,13 +126,12 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Attention (causal only during prefill, GQA handled natively by dot_product_attention)
-        attn_output = jax.nn.dot_product_attention(
+        # Attention using flash_mha (causal only during prefill, GQA handled natively)
+        attn_output = flash_mha(
             q,
             k,
             v,
-            scale=1.0 / self.head_dim**0.5,
-            mask=attention_mask[:, None, None, :].astype(bool),
+            softmax_scale=1.0 / self.head_dim**0.5,
             is_causal=kv_cache is None,
         )
 
