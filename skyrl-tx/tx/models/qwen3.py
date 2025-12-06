@@ -18,8 +18,12 @@ class RMSNorm(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        return self.weight * x / rms
+        # Compute variance in float32 for numerical stability (matches HuggingFace)
+        input_dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
+        x_normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
+        return self.weight * x_normed.astype(input_dtype)
 
 
 def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta: int) -> jax.Array:

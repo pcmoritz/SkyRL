@@ -118,9 +118,9 @@ def test_vllm_tx_alignment_greedy(vllm_model, tx_model):
             f"vLLM tokens: {vllm_tokens}"
         )
 
-        # Compare logprobs (should be very close)
+        # Compare logprobs (should be close, allowing for bfloat16 numerical differences)
         for i, (tx_lp, vllm_lp) in enumerate(zip(tx_logprobs, vllm_logprobs)):
-            assert np.isclose(tx_lp, vllm_lp, rtol=1e-3, atol=1e-3), (
+            assert np.isclose(tx_lp, vllm_lp, rtol=1e-2, atol=1e-2), (
                 f"Logprob mismatch for prompt '{prompt}' at position {i}:\n"
                 f"TX: {tx_lp}, vLLM: {vllm_lp}, diff: {abs(tx_lp - vllm_lp)}"
             )
