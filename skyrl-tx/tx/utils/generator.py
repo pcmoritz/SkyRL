@@ -81,7 +81,8 @@ def compute_prompt_logprobs(prefill_logits: jax.Array, input_ids: jax.Array) -> 
     """Compute log probabilities of prompt tokens from prefill logits"""
     # TODO: Optimize memory usage by avoiding allocation of full vocab dimension.
     logits_for_prompt = prefill_logits[:, :-1, :]
-    log_probs = jax.nn.log_softmax(logits_for_prompt, axis=-1)
+    # Compute log_softmax in float32 for numerical stability (matches vLLM behavior)
+    log_probs = jax.nn.log_softmax(logits_for_prompt.astype(jnp.float32), axis=-1)
     prompt_tokens = input_ids[:, 1:]
     prompt_logprobs = jnp.take_along_axis(log_probs, prompt_tokens[..., None], axis=-1).squeeze(-1)
     return prompt_logprobs
@@ -131,7 +132,8 @@ class GeneratorMixin:
             )
             greedy = jnp.argmax(s.logits, axis=-1)
             next_token = jnp.where(zero_temp_mask[:, None], greedy[:, None], sampled[:, None])
-            log_probs = jax.nn.log_softmax(s.logits, axis=-1)
+            # Compute log_softmax in float32 for numerical stability (matches vLLM behavior)
+            log_probs = jax.nn.log_softmax(s.logits.astype(jnp.float32), axis=-1)
             sampled_logprob = jnp.take_along_axis(log_probs, next_token, axis=-1)
 
             # Track first stop token position (-1 means not stopped yet)
