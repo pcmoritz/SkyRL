@@ -28,6 +28,7 @@ def vllm_model():
         dtype="bfloat16",
         max_model_len=1024,
         tensor_parallel_size=4,
+        gpu_memory_utilization=0.5,
     )
     yield llm
 
