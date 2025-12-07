@@ -54,6 +54,42 @@ def run_vllm_generation(prompts: list[str], tokenizer, max_tokens: int = 20) -> 
     return results
 
 
+def run_vllm_generation_batched(prompts: list[str], tokenizer, max_tokens: int = 20) -> dict:
+    """Run vLLM generation with batched prompts (different lengths)."""
+    llm = LLM(
+        model=MODEL_NAME,
+        dtype="bfloat16",
+        max_model_len=1024,
+        tensor_parallel_size=4,
+    )
+
+    # Tokenize all prompts
+    all_tokens = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
+
+    # Generate all at once (vLLM handles batching internally)
+    vllm_params = VLLMSamplingParams(temperature=0.0, max_tokens=max_tokens)
+    batch_prompts = [{"prompt_token_ids": tokens} for tokens in all_tokens]
+    vllm_outputs = llm.generate(batch_prompts, sampling_params=vllm_params)
+
+    results = {}
+    for prompt, tokens, output in zip(prompts, all_tokens, vllm_outputs):
+        vllm_tokens = list(output.outputs[0].token_ids)
+        results[prompt] = {"tokens": tokens, "generated": vllm_tokens}
+
+    # Clean up vLLM
+    destroy_model_parallel()
+    del llm
+    gc.collect()
+
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except:
+        pass
+
+    return results
+
+
 def run_tx_generation(prompts: list[str], vllm_results: dict, tokenizer, max_tokens: int = 20):
     """Run TX generation and compare with vLLM results."""
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -95,15 +131,19 @@ def run_tx_generation(prompts: list[str], vllm_results: dict, tokenizer, max_tok
                     break
 
             print(f"\nPrompt: {prompt!r}")
-            print(f"TX tokens:   {tx_tokens}")
-            print(f"vLLM tokens: {vllm_tokens}")
-            print(f"TX text:   {tokenizer.decode(tx_tokens)!r}")
-            print(f"vLLM text: {tokenizer.decode(vllm_tokens)!r}")
+            print(f"TX tokens:   {tx_tokens[:20]}{'...' if len(tx_tokens) > 20 else ''}")
+            print(f"vLLM tokens: {vllm_tokens[:20]}{'...' if len(vllm_tokens) > 20 else ''}")
 
             if diverge_at is not None:
                 print(f"DIVERGE at token {diverge_at}: TX={tx_tokens[diverge_at]}, vLLM={vllm_tokens[diverge_at]}")
                 print(f"  TX token:   {tokenizer.decode([tx_tokens[diverge_at]])!r}")
                 print(f"  vLLM token: {tokenizer.decode([vllm_tokens[diverge_at]])!r}")
+
+                # Show context around divergence
+                start = max(0, diverge_at - 3)
+                end = min(len(tx_tokens), diverge_at + 3)
+                print(f"  TX context:   {tokenizer.decode(tx_tokens[start:end])!r}")
+                print(f"  vLLM context: {tokenizer.decode(vllm_tokens[start:end])!r}")
             else:
                 print("MATCH: All tokens identical")
 
@@ -134,3 +174,99 @@ def test_qwen3_4b_first_token_alignment():
     # Then run TX and compare
     print("\n=== Running TX ===")
     run_tx_generation(prompts, vllm_results, tokenizer, max_tokens=max_tokens)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") is not None,
+    reason="Skip in CI (requires GPU and large model)"
+)
+def test_qwen3_4b_batched_padded_alignment():
+    """Test batched generation with padding - this is where divergence likely happens."""
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side="left")
+
+    # Prompts with very different lengths to force padding
+    prompts = [
+        "Hi",  # Very short
+        "The capital of France is",  # Medium
+        "Write a Python function that takes a list of integers and returns the sum of all even numbers in the list:",  # Long
+    ]
+
+    max_tokens = 50
+
+    # Run vLLM (one at a time for reference)
+    print("\n=== Running vLLM (unbatched) ===")
+    vllm_results = run_vllm_generation(prompts, tokenizer, max_tokens=max_tokens)
+
+    for prompt in prompts:
+        print(f"\nvLLM result for {prompt[:30]!r}...")
+        print(f"  Generated: {vllm_results[prompt]['generated'][:10]}...")
+
+    # Now run TX with batched/padded inputs
+    print("\n=== Running TX (batched with padding) ===")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, attn_implementation="eager", use_safetensors=True
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        del hf_model
+        gc.collect()
+
+        base_config = PretrainedConfig.from_pretrained(MODEL_NAME)
+        config = Qwen3Config(
+            base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True
+        )
+
+        mesh = jax.make_mesh((1, 4), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        # Tokenize and pad
+        all_tokens = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
+        max_len = max(len(t) for t in all_tokens)
+
+        # Left-pad with pad_token_id
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        padded_tokens = []
+        attention_masks = []
+        for tokens in all_tokens:
+            pad_len = max_len - len(tokens)
+            padded_tokens.append([pad_token_id] * pad_len + tokens)
+            attention_masks.append([0] * pad_len + [1] * len(tokens))
+
+        input_ids = np.array(padded_tokens)
+        attention_mask = np.array(attention_masks)
+
+        print(f"\nBatch shape: {input_ids.shape}")
+        print(f"Prompt lengths: {[len(t) for t in all_tokens]}")
+        print(f"Padded to: {max_len}")
+
+        # TX batched generation
+        sampling_params = [types.SamplingParams(max_tokens=max_tokens, temperature=0.0, seed=42) for _ in prompts]
+        tx_result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
+
+        # Compare each prompt
+        for i, prompt in enumerate(prompts):
+            tx_tokens = tx_result.generated_ids[i]
+            vllm_tokens = vllm_results[prompt]["generated"]
+
+            # Find divergence
+            diverge_at = None
+            for j in range(min(len(tx_tokens), len(vllm_tokens))):
+                if tx_tokens[j] != vllm_tokens[j]:
+                    diverge_at = j
+                    break
+
+            print(f"\nPrompt: {prompt[:50]!r}...")
+            print(f"  TX first 10:   {tx_tokens[:10]}")
+            print(f"  vLLM first 10: {vllm_tokens[:10]}")
+
+            if diverge_at is not None:
+                print(f"  DIVERGE at token {diverge_at}")
+                print(f"    TX:   {tx_tokens[diverge_at]} ({tokenizer.decode([tx_tokens[diverge_at]])!r})")
+                print(f"    vLLM: {vllm_tokens[diverge_at]} ({tokenizer.decode([vllm_tokens[diverge_at]])!r})")
+            elif tx_tokens[:len(vllm_tokens)] == vllm_tokens[:len(tx_tokens)]:
+                print(f"  MATCH (first {min(len(tx_tokens), len(vllm_tokens))} tokens)")
+            else:
+                print(f"  Length mismatch: TX={len(tx_tokens)}, vLLM={len(vllm_tokens)}")
