@@ -124,10 +124,13 @@ def test_qwen3_4b_first_token_alignment():
         "Write a Python function to sort a list:",
     ]
 
+    # Generate 256 tokens to match the actual use case
+    max_tokens = 256
+
     # First run vLLM and collect results
     print("\n=== Running vLLM ===")
-    vllm_results = run_vllm_generation(prompts, tokenizer)
+    vllm_results = run_vllm_generation(prompts, tokenizer, max_tokens=max_tokens)
 
     # Then run TX and compare
     print("\n=== Running TX ===")
-    run_tx_generation(prompts, vllm_results, tokenizer)
+    run_tx_generation(prompts, vllm_results, tokenizer, max_tokens=max_tokens)
