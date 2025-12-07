@@ -22,6 +22,45 @@ from tx.utils.models import load_safetensors
 MODEL_NAME = "Qwen/Qwen3-4B"
 
 
+def run_hf_generation(prompts: list[str], tokenizer, max_tokens: int = 20) -> dict:
+    """Run HuggingFace generation as ground truth reference."""
+    import torch
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        attn_implementation="eager",
+        use_safetensors=True,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    hf_model.eval()
+
+    results = {}
+    for prompt in prompts:
+        tokens = tokenizer.encode(prompt, add_special_tokens=True)
+        input_ids = torch.tensor([tokens]).to(hf_model.device)
+
+        with torch.no_grad():
+            output = hf_model.generate(
+                input_ids,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        generated_tokens = output[0, len(tokens):].tolist()
+        results[prompt] = {"tokens": tokens, "generated": generated_tokens}
+
+    del hf_model
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except:
+        pass
+
+    return results
+
+
 def run_vllm_generation(prompts: list[str], tokenizer, max_tokens: int = 20) -> dict:
     """Run vLLM generation and return results, then clean up."""
     llm = LLM(
@@ -146,6 +185,93 @@ def run_tx_generation(prompts: list[str], vllm_results: dict, tokenizer, max_tok
                 print(f"  vLLM context: {tokenizer.decode(vllm_tokens[start:end])!r}")
             else:
                 print("MATCH: All tokens identical")
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") is not None,
+    reason="Skip in CI (requires GPU and large model)"
+)
+def test_qwen3_4b_three_way_comparison():
+    """Compare HuggingFace, vLLM, and TX to find ground truth."""
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side="left")
+
+    prompt = "Write a Python function that takes a list of integers and returns the sum of all even numbers in the list:"
+    max_tokens = 50
+
+    print(f"\nPrompt: {prompt[:60]}...")
+
+    # Run HuggingFace first (ground truth)
+    print("\n=== Running HuggingFace (ground truth) ===")
+    hf_results = run_hf_generation([prompt], tokenizer, max_tokens=max_tokens)
+    hf_tokens = hf_results[prompt]["generated"]
+    print(f"HF tokens: {hf_tokens[:15]}...")
+    print(f"HF text: {tokenizer.decode(hf_tokens[:30])!r}...")
+
+    # Run vLLM
+    print("\n=== Running vLLM ===")
+    vllm_results = run_vllm_generation([prompt], tokenizer, max_tokens=max_tokens)
+    vllm_tokens = vllm_results[prompt]["generated"]
+    print(f"vLLM tokens: {vllm_tokens[:15]}...")
+    print(f"vLLM text: {tokenizer.decode(vllm_tokens[:30])!r}...")
+
+    # Run TX
+    print("\n=== Running TX ===")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, attn_implementation="eager", use_safetensors=True
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        del hf_model
+        gc.collect()
+
+        base_config = PretrainedConfig.from_pretrained(MODEL_NAME)
+        config = Qwen3Config(
+            base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True
+        )
+
+        mesh = jax.make_mesh((1, 4), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        tokens = tokenizer.encode(prompt, add_special_tokens=True)
+        input_ids = np.array([tokens])
+        attention_mask = np.ones_like(input_ids)
+
+        sampling_params = [types.SamplingParams(max_tokens=max_tokens, temperature=0.0, seed=42)]
+        tx_result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
+        tx_tokens = tx_result.generated_ids[0]
+
+    print(f"TX tokens: {tx_tokens[:15]}...")
+    print(f"TX text: {tokenizer.decode(tx_tokens[:30])!r}...")
+
+    # Compare all three
+    print("\n=== Comparison ===")
+
+    def find_divergence(a, b):
+        for i in range(min(len(a), len(b))):
+            if a[i] != b[i]:
+                return i
+        return None
+
+    hf_vllm_div = find_divergence(hf_tokens, vllm_tokens)
+    hf_tx_div = find_divergence(hf_tokens, tx_tokens)
+    vllm_tx_div = find_divergence(vllm_tokens, tx_tokens)
+
+    print(f"HF vs vLLM diverge at: {hf_vllm_div}")
+    print(f"HF vs TX diverge at: {hf_tx_div}")
+    print(f"vLLM vs TX diverge at: {vllm_tx_div}")
+
+    if hf_vllm_div is not None:
+        print(f"\nHF vs vLLM at position {hf_vllm_div}:")
+        print(f"  HF:   {hf_tokens[hf_vllm_div]} ({tokenizer.decode([hf_tokens[hf_vllm_div]])!r})")
+        print(f"  vLLM: {vllm_tokens[hf_vllm_div]} ({tokenizer.decode([vllm_tokens[hf_vllm_div]])!r})")
+
+    if hf_tx_div is not None:
+        print(f"\nHF vs TX at position {hf_tx_div}:")
+        print(f"  HF: {hf_tokens[hf_tx_div]} ({tokenizer.decode([hf_tokens[hf_tx_div]])!r})")
+        print(f"  TX: {tx_tokens[hf_tx_div]} ({tokenizer.decode([tx_tokens[hf_tx_div]])!r})")
 
 
 @pytest.mark.skipif(
