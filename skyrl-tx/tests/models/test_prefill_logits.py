@@ -42,6 +42,11 @@ def test_prefill_logits_match():
     input_ids_torch = torch.tensor([tokens]).to(hf_model.device)
 
     with torch.no_grad():
+        # Compare embeddings
+        hf_embed = hf_model.model.embed_tokens(input_ids_torch)
+        print(f"HF embed shape: {hf_embed.shape}")
+        print(f"HF embed[0,0,:5]: {hf_embed[0, 0, :5]}")
+
         hf_output = hf_model(input_ids_torch)
         hf_logits = hf_output.logits[0, -1].float().cpu().numpy()  # Last position
 
