@@ -480,7 +480,8 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
-            logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+            # Compute logits in float32 for numerical stability (matches vLLM behavior)
+            logits = hidden_states.astype(jnp.float32) @ self.model.embed_tokens.embedding.value.T.astype(jnp.float32)
         else:
             logits = self.lm_head(hidden_states, adapter_indices=adapter_indices)
 
