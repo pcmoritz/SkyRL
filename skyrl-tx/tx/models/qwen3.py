@@ -140,23 +140,29 @@ class Qwen3Attention(nnx.Module):
         k_t = jnp.transpose(k_expanded, (0, 2, 1, 3))
         v_t = jnp.transpose(v_expanded, (0, 2, 1, 3))
 
-        # Compute attention scores in float32: [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
-        attn_scores = jnp.matmul(q_t.astype(jnp.float32), jnp.swapaxes(k_t.astype(jnp.float32), -2, -1)) * scale
+        # Compute attention scores in native dtype (matching HuggingFace)
+        # [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
+        attn_scores = jnp.matmul(q_t, jnp.swapaxes(k_t, -2, -1)) * scale
 
-        # Build mask
+        # Build causal mask for prefill (HuggingFace uses additive masking)
         T_q, T_kv = q.shape[1], k.shape[1]
-        mask = attention_mask[:, None, None, :].astype(jnp.bool_)  # [B, 1, 1, T_kv]
 
         if kv_cache is None:
-            # Prefill: combine attention mask with causal mask
-            causal_mask = jnp.tril(jnp.ones((T_q, T_kv), dtype=jnp.bool_))
-            mask = mask & causal_mask[None, None, :, :]
+            # Prefill: create causal mask with large negative values for masked positions
+            causal_mask = jnp.triu(jnp.full((T_q, T_kv), jnp.finfo(input_dtype).min), k=1)
+            attn_scores = attn_scores + causal_mask[None, None, :, :]
 
-        # Apply mask
-        attn_scores = jnp.where(mask, attn_scores, jnp.finfo(jnp.float32).min)
+        # Apply attention mask (padding mask) - 0 positions should be masked
+        # HuggingFace style: add large negative value where mask is 0
+        padding_mask = jnp.where(
+            attention_mask[:, None, None, :] == 0,
+            jnp.finfo(input_dtype).min,
+            0.0
+        )
+        attn_scores = attn_scores + padding_mask
 
         # Softmax in float32, then cast back (matches HuggingFace)
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1).astype(input_dtype)
+        attn_weights = jax.nn.softmax(attn_scores.astype(jnp.float32), axis=-1).astype(input_dtype)
 
         # Apply attention to values
         attn_output = jnp.matmul(attn_weights, v_t)  # [B, H, T_q, D]
