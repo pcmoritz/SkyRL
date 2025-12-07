@@ -130,10 +130,15 @@ class Qwen3Attention(nnx.Module):
         input_dtype = q.dtype
         scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
 
+        # Expand K, V for GQA: repeat each KV head for its group of Q heads
+        num_groups = self.num_heads // self.num_kv_heads
+        k_expanded = jnp.repeat(k, num_groups, axis=2)  # [B, T, num_heads, D]
+        v_expanded = jnp.repeat(v, num_groups, axis=2)  # [B, T, num_heads, D]
+
         # Transpose for attention: [B, T, H, D] -> [B, H, T, D]
         q_t = jnp.transpose(q, (0, 2, 1, 3))
-        k_t = jnp.transpose(k, (0, 2, 1, 3))
-        v_t = jnp.transpose(v, (0, 2, 1, 3))
+        k_t = jnp.transpose(k_expanded, (0, 2, 1, 3))
+        v_t = jnp.transpose(v_expanded, (0, 2, 1, 3))
 
         # Compute attention scores in float32: [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
         attn_scores = jnp.matmul(q_t.astype(jnp.float32), jnp.swapaxes(k_t.astype(jnp.float32), -2, -1)) * scale
