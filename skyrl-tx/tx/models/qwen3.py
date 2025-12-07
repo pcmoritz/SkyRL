@@ -125,23 +125,44 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Attention with float32 for numerical precision alignment with vLLM
+        # Manual attention implementation for numerical precision alignment with vLLM
+        # Compute attention scores in float32, then apply softmax in float32
         input_dtype = q.dtype
-        q_f32 = q.astype(jnp.float32)
-        k_f32 = k.astype(jnp.float32)
-        v_f32 = v.astype(jnp.float32)
+        scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
 
-        attn_output = jax.nn.dot_product_attention(
-            q_f32,
-            k_f32,
-            v_f32,
-            scale=1.0 / self.head_dim**0.5,
-            mask=attention_mask[:, None, None, :].astype(bool),
-            is_causal=kv_cache is None,
-        )
+        # q: [B, T_q, num_heads, head_dim], k: [B, T_kv, num_kv_heads, head_dim]
+        # Expand k,v for GQA: repeat each KV head for its group of Q heads
+        num_groups = self.num_heads // self.num_kv_heads
+        k_expanded = jnp.repeat(k, num_groups, axis=2)
+        v_expanded = jnp.repeat(v, num_groups, axis=2)
 
-        # Cast back to original dtype
-        attn_output = attn_output.astype(input_dtype)
+        # Compute attention scores: [B, num_heads, T_q, T_kv]
+        # q: [B, T_q, H, D] -> [B, H, T_q, D]
+        # k: [B, T_kv, H, D] -> [B, H, D, T_kv]
+        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
+        k_t = jnp.transpose(k_expanded, (0, 2, 3, 1)).astype(jnp.float32)
+
+        attn_scores = jnp.matmul(q_t, k_t) * scale  # [B, H, T_q, T_kv]
+
+        # Apply causal mask during prefill
+        if kv_cache is None:
+            T_q = q.shape[1]
+            causal_mask = jnp.tril(jnp.ones((T_q, T_q), dtype=jnp.bool_))
+            attn_scores = jnp.where(causal_mask[None, None, :, :], attn_scores, jnp.float32(-1e9))
+
+        # Apply attention mask (for padding)
+        attn_mask = attention_mask[:, None, None, :].astype(jnp.bool_)
+        attn_scores = jnp.where(attn_mask, attn_scores, jnp.float32(-1e9))
+
+        # Softmax in float32
+        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+
+        # Apply attention to values: [B, H, T_q, T_kv] @ [B, H, T_kv, D] -> [B, H, T_q, D]
+        v_t = jnp.transpose(v_expanded, (0, 2, 1, 3)).astype(jnp.float32)
+        attn_output = jnp.matmul(attn_weights, v_t)  # [B, H, T_q, D]
+
+        # Transpose back: [B, H, T_q, D] -> [B, T_q, H, D]
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).astype(input_dtype)
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
