@@ -27,6 +27,7 @@ def vllm_model():
         model=MODEL_NAME,
         dtype="bfloat16",
         max_model_len=1024,
+        tensor_parallel_size=4,
     )
     yield llm
 
@@ -46,7 +47,7 @@ def tx_model():
             base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True
         )
 
-        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
+        mesh = jax.make_mesh((1, 4), ("dp", "tp"))
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)
