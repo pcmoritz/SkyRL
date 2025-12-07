@@ -73,6 +73,11 @@ def test_prefill_logits_match():
         attention_mask_jax = jnp.ones_like(input_ids_jax)
         positions = jnp.arange(len(tokens))[None, :]
 
+        # Compare embeddings first
+        tx_embed = tx_model.model.embed_tokens(input_ids_jax)
+        print(f"TX embed shape: {tx_embed.shape}")
+        print(f"TX embed[0,0,:5]: {tx_embed[0, 0, :5]}")
+
         tx_output = tx_model(input_ids_jax, attention_mask=attention_mask_jax, positions=positions)
         tx_logits = np.array(tx_output.logits[0, -1].astype(jnp.float32))
 
