@@ -27,12 +27,20 @@ class RMSNorm(nnx.Module):
 
 
 def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta: int) -> jax.Array:
+    """Apply rotary position embeddings (RoPE) to inputs.
+
+    Computation is done in float32 for numerical stability, then cast back to input dtype.
+    """
+    input_dtype = inputs.dtype
+    inputs_f32 = inputs.astype(jnp.float32)
+
     fraction = 2 * jnp.arange(0, head_dim // 2, dtype=jnp.float32) / head_dim
     timescale = jnp.pow(theta, fraction)
     x = (position_ids[..., None] / timescale[None, None, :])[..., None, :]
     sin, cos = jnp.sin(x), jnp.cos(x)
-    a, b = jnp.split(inputs, 2, axis=-1)
-    return jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1).astype(inputs.dtype)
+    a, b = jnp.split(inputs_f32, 2, axis=-1)
+    result = jnp.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
+    return result.astype(input_dtype)
 
 
 class Qwen3Attention(nnx.Module):
@@ -125,8 +133,8 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Manual attention with float32 softmax to match HuggingFace's implementation:
-        # attn_weights = softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        # Attention computation in float32 for numerical stability
+        # This matches HuggingFace's approach of using float32 for softmax
         input_dtype = q.dtype
         scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
 
@@ -136,39 +144,40 @@ class Qwen3Attention(nnx.Module):
         v_expanded = jnp.repeat(v, num_groups, axis=2)  # [B, T, num_heads, D]
 
         # Transpose for attention: [B, T, H, D] -> [B, H, T, D]
-        q_t = jnp.transpose(q, (0, 2, 1, 3))
-        k_t = jnp.transpose(k_expanded, (0, 2, 1, 3))
+        # Convert to float32 for attention score computation
+        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
+        k_t = jnp.transpose(k_expanded, (0, 2, 1, 3)).astype(jnp.float32)
         v_t = jnp.transpose(v_expanded, (0, 2, 1, 3))
 
-        # Compute attention scores in native dtype (matching HuggingFace)
+        # Compute attention scores in float32 for numerical stability
         # [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
         attn_scores = jnp.matmul(q_t, jnp.swapaxes(k_t, -2, -1)) * scale
 
-        # Build causal mask for prefill (HuggingFace uses additive masking)
+        # Build causal mask for prefill (using additive masking)
         T_q, T_kv = q.shape[1], k.shape[1]
 
         if kv_cache is None:
             # Prefill: create causal mask with large negative values for masked positions
-            causal_mask = jnp.triu(jnp.full((T_q, T_kv), jnp.finfo(input_dtype).min), k=1)
+            causal_mask = jnp.triu(jnp.full((T_q, T_kv), jnp.finfo(jnp.float32).min), k=1)
             attn_scores = attn_scores + causal_mask[None, None, :, :]
 
         # Apply attention mask (padding mask) - 0 positions should be masked
-        # HuggingFace style: add large negative value where mask is 0
         padding_mask = jnp.where(
             attention_mask[:, None, None, :] == 0,
-            jnp.finfo(input_dtype).min,
+            jnp.finfo(jnp.float32).min,
             0.0
         )
         attn_scores = attn_scores + padding_mask
 
-        # Softmax in float32, then cast back (matches HuggingFace)
-        attn_weights = jax.nn.softmax(attn_scores.astype(jnp.float32), axis=-1).astype(input_dtype)
+        # Softmax in float32
+        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
-        # Apply attention to values
-        attn_output = jnp.matmul(attn_weights, v_t)  # [B, H, T_q, D]
+        # Apply attention to values (keep weights in float32 for precision)
+        v_t_f32 = v_t.astype(jnp.float32)
+        attn_output = jnp.matmul(attn_weights, v_t_f32)  # [B, H, T_q, D]
 
-        # Transpose back: [B, H, T, D] -> [B, T, H, D]
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+        # Transpose back and cast to original dtype: [B, H, T, D] -> [B, T, H, D]
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).astype(input_dtype)
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
