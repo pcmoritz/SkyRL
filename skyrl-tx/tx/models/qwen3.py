@@ -125,16 +125,16 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Attention with float32 softmax for numerical precision alignment with vLLM
-        # Cast Q, K to float32 for attention score computation, keep V in original dtype
+        # Attention with float32 for numerical precision alignment with vLLM
         input_dtype = q.dtype
         q_f32 = q.astype(jnp.float32)
         k_f32 = k.astype(jnp.float32)
+        v_f32 = v.astype(jnp.float32)
 
         attn_output = jax.nn.dot_product_attention(
             q_f32,
             k_f32,
-            v,
+            v_f32,
             scale=1.0 / self.head_dim**0.5,
             mask=attention_mask[:, None, None, :].astype(bool),
             is_causal=kv_cache is None,
