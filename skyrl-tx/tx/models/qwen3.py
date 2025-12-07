@@ -117,11 +117,14 @@ class Qwen3Attention(nnx.Module):
         B, T, _ = x.shape
 
         # Project and reshape to [B, T, num_heads, head_dim]
-        q = self.q_norm(self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim))
-        k = self.k_norm(self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim)
+        # Cast to float32 immediately after projection to prevent bfloat16 precision loss
+        q = self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim).astype(jnp.float32)
+        k = self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim).astype(jnp.float32)
+        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim).astype(jnp.float32)
 
-        # Apply RoPE
+        # Apply QK norm and RoPE in float32
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
         k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
 
@@ -134,8 +137,6 @@ class Qwen3Attention(nnx.Module):
         updated_cache = (k, v)
 
         # Attention computation in float32 for numerical stability
-        # This matches HuggingFace's approach of using float32 for softmax
-        input_dtype = q.dtype
         scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
 
         # Expand K, V for GQA: repeat each KV head for its group of Q heads
@@ -144,10 +145,10 @@ class Qwen3Attention(nnx.Module):
         v_expanded = jnp.repeat(v, num_groups, axis=2)  # [B, T, num_heads, D]
 
         # Transpose for attention: [B, T, H, D] -> [B, H, T, D]
-        # Convert to float32 for attention score computation
+        # Q needs float32, K and V are already float32
         q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
-        k_t = jnp.transpose(k_expanded, (0, 2, 1, 3)).astype(jnp.float32)
-        v_t = jnp.transpose(v_expanded, (0, 2, 1, 3))
+        k_t = jnp.transpose(k_expanded, (0, 2, 1, 3))  # Already float32
+        v_t = jnp.transpose(v_expanded, (0, 2, 1, 3))  # Already float32
 
         # Compute attention scores in float32 for numerical stability
         # [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
@@ -172,15 +173,15 @@ class Qwen3Attention(nnx.Module):
         # Softmax in float32
         attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
-        # Apply attention to values (keep weights in float32 for precision)
-        v_t_f32 = v_t.astype(jnp.float32)
-        attn_output = jnp.matmul(attn_weights, v_t_f32)  # [B, H, T_q, D]
+        # Apply attention to values (all in float32)
+        attn_output = jnp.matmul(attn_weights, v_t)  # [B, H, T_q, D]
 
-        # Transpose back and cast to original dtype: [B, H, T, D] -> [B, T, H, D]
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).astype(input_dtype)
+        # Transpose back, keep in float32: [B, H, T, D] -> [B, T, H, D]
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
+        # Cast o_proj output to float32 to prevent bfloat16 precision loss
+        return self.o_proj(output, adapter_indices=adapter_indices).astype(jnp.float32), updated_cache
 
 
 class Qwen3MLP(nnx.Module):
@@ -221,9 +222,10 @@ class Qwen3MLP(nnx.Module):
         )
 
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        gate_out = self.gate_proj(x, adapter_indices)
-        up_out = self.up_proj(x, adapter_indices)
-        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices)
+        # Cast to float32 after each projection to prevent bfloat16 precision loss
+        gate_out = self.gate_proj(x, adapter_indices).astype(jnp.float32)
+        up_out = self.up_proj(x, adapter_indices).astype(jnp.float32)
+        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices).astype(jnp.float32)
 
 
 class Qwen3Experts(nnx.Module):
@@ -403,6 +405,10 @@ class Qwen3Model(nnx.Module):
         )
 
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
+        # Keep hidden states in float32 through all layers to prevent bfloat16 rounding errors
+        # from accumulating and causing prefill vs decode divergence
+        hidden_states = hidden_states.astype(jnp.float32)
+
         all_hidden_states: list[jax.Array] = []
         updated_keys, updated_values = [], []
 
