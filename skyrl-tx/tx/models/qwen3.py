@@ -125,15 +125,39 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Attention (causal only during prefill, GQA handled natively by dot_product_attention)
-        attn_output = jax.nn.dot_product_attention(
-            q,
-            k,
-            v,
-            scale=1.0 / self.head_dim**0.5,
-            mask=attention_mask[:, None, None, :].astype(bool),
-            is_causal=kv_cache is None,
-        )
+        # Manual attention with float32 softmax to match HuggingFace's implementation:
+        # attn_weights = softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        input_dtype = q.dtype
+        scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
+
+        # Transpose for attention: [B, T, H, D] -> [B, H, T, D]
+        q_t = jnp.transpose(q, (0, 2, 1, 3))
+        k_t = jnp.transpose(k, (0, 2, 1, 3))
+        v_t = jnp.transpose(v, (0, 2, 1, 3))
+
+        # Compute attention scores in float32: [B, H, T_q, D] @ [B, H, D, T_kv] -> [B, H, T_q, T_kv]
+        attn_scores = jnp.matmul(q_t.astype(jnp.float32), jnp.swapaxes(k_t.astype(jnp.float32), -2, -1)) * scale
+
+        # Build mask
+        T_q, T_kv = q.shape[1], k.shape[1]
+        mask = attention_mask[:, None, None, :].astype(jnp.bool_)  # [B, 1, 1, T_kv]
+
+        if kv_cache is None:
+            # Prefill: combine attention mask with causal mask
+            causal_mask = jnp.tril(jnp.ones((T_q, T_kv), dtype=jnp.bool_))
+            mask = mask & causal_mask[None, None, :, :]
+
+        # Apply mask
+        attn_scores = jnp.where(mask, attn_scores, jnp.finfo(jnp.float32).min)
+
+        # Softmax in float32, then cast back (matches HuggingFace)
+        attn_weights = jax.nn.softmax(attn_scores, axis=-1).astype(input_dtype)
+
+        # Apply attention to values
+        attn_output = jnp.matmul(attn_weights, v_t)  # [B, H, T_q, D]
+
+        # Transpose back: [B, H, T, D] -> [B, T, H, D]
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
