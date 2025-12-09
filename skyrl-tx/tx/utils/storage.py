@@ -27,8 +27,7 @@ def pack_and_upload(dest: AnyPath) -> Generator[Path, None, None]:
         with dest.open("wb") as f:
             with cctx.stream_writer(f) as compressor:
                 with tarfile.open(fileobj=compressor, mode="w|") as tar:
-                    for p in tmp_path.iterdir():
-                        tar.add(p, arcname=p.name)
+                    tar.add(tmp_path, arcname=".")
 
 
 @contextmanager
