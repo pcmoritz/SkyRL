@@ -46,9 +46,9 @@ def test_save_load_lora_checkpoint(storage_type: str, monkeypatch, tmp_path: Pat
     if storage_type == "cloud":
         monkeypatch.setitem(implementation_registry, "s3", local_s3_implementation)
         client = local_s3_implementation.client_class(local_storage_dir=tmp_path)
-        output_path = CloudPath("s3://bucket/checkpoint.tar.gz", client=client)
+        output_path = CloudPath("s3://bucket/checkpoint.tar.zst", client=client)
     else:
-        output_path = tmp_path / "checkpoint.tar.gz"
+        output_path = tmp_path / "checkpoint.tar.zst"
 
     rank, alpha, adapter_index = 8, 16, 2
     config, base_config, model = create_test_model(base_model_name, rank, alpha, adapter_index)

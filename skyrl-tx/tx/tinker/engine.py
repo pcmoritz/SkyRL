@@ -778,7 +778,7 @@ class TinkerEngine:
 
         adapter_index = self.models[model_id].adapter_index
         checkpoint_dir = (
-            self.config.checkpoints_base / request_data.source_model_id / f"{request_data.checkpoint_id}.tar.gz"
+            self.config.checkpoints_base / request_data.source_model_id / f"{request_data.checkpoint_id}.tar.zst"
         )
 
         with download_and_unpack(checkpoint_dir) as temp_dir:
@@ -812,7 +812,7 @@ class TinkerEngine:
             raise ValueError(f"Model {model_id} not loaded")
 
         checkpoint_id = request_data.path
-        output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
+        output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.zst"
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
             with pack_and_upload(output_path) as temp_dir:
@@ -842,10 +842,10 @@ class TinkerEngine:
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
-        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.zst"
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            # Save the LoRA adapter weights and LoRA config as tar.gz
+            # Save the LoRA adapter weights and LoRA config as tar.zst
             save_lora_checkpoint(
                 self.model, self.config.base_model, lora_model.lora_config, lora_model.adapter_index, output_path
             )
@@ -887,7 +887,7 @@ class TinkerEngine:
                     assert adapter_index not in adapter_indices, "Cannot override already used adapter"
 
                     checkpoint_path = (
-                        self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+                        self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.zst"
                     )
                     logger.info(f"Loading LoRA sampler checkpoint from {checkpoint_path}")
                     adapter_config = self.models[model_id].lora_config

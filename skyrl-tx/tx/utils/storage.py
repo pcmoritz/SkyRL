@@ -4,48 +4,49 @@ from pathlib import Path
 import tarfile
 from tempfile import TemporaryDirectory
 from typing import Generator
+
 from cloudpathlib import AnyPath
+import zstandard as zstd
 
 
 @contextmanager
 def pack_and_upload(dest: AnyPath) -> Generator[Path, None, None]:
-    """Give the caller a temp directory that gets uploaded as a tar.gz archive on exit.
+    """Give the caller a temp directory that gets uploaded as a tar.zst archive on exit.
 
     Args:
-        dest: Destination path for the tar.gz file
+        dest: Destination path for the tar.zst file
     """
     with TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
 
         yield tmp_path
 
-        # Create tar archive of temp directory contents
-        tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
-            for p in tmp_path.iterdir():
-                tar.add(p, arcname=p.name)
-        tar_buffer.seek(0)
-
-        # Write the tar file (handles both local and cloud storage)
+        # Write the tar file with zstd compression directly to destination
         dest.parent.mkdir(parents=True, exist_ok=True)
+        cctx = zstd.ZstdCompressor(level=3, threads=-1)
         with dest.open("wb") as f:
-            f.write(tar_buffer.read())
+            with cctx.stream_writer(f) as compressor:
+                with tarfile.open(fileobj=compressor, mode="w|") as tar:
+                    for p in tmp_path.iterdir():
+                        tar.add(p, arcname=p.name)
 
 
 @contextmanager
 def download_and_unpack(source: AnyPath) -> Generator[Path, None, None]:
-    """Download and extract a tar.gz archive and give the content to the caller in a temp directory.
+    """Download and extract a tar.zst archive and give the content to the caller in a temp directory.
 
     Args:
-        source: Source path for the tar.gz file
+        source: Source path for the tar.zst file
     """
     with TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
 
         # Download and extract tar archive (handles both local and cloud storage)
+        dctx = zstd.ZstdDecompressor()
         with source.open("rb") as f:
-            with tarfile.open(fileobj=f, mode="r:gz") as tar:
-                tar.extractall(tmp_path, filter="data")
+            with dctx.stream_reader(f) as decompressor:
+                with tarfile.open(fileobj=decompressor, mode="r|") as tar:
+                    tar.extractall(tmp_path, filter="data")
 
         yield tmp_path
 

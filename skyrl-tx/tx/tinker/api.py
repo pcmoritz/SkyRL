@@ -795,7 +795,7 @@ async def validate_checkpoint(
         raise HTTPException(status_code=500, detail=f"Checkpoint creation failed: {checkpoint_db.error_message}")
 
     subdir = "sampler_weights" if checkpoint_type == types.CheckpointType.SAMPLER else ""
-    return request.app.state.engine_config.checkpoints_base / unique_id / subdir / f"{checkpoint_id}.tar.gz"
+    return request.app.state.engine_config.checkpoints_base / unique_id / subdir / f"{checkpoint_id}.tar.zst"
 
 
 @app.get("/api/v1/training_runs/{unique_id}/checkpoints/{checkpoint_id}/archive")
@@ -831,7 +831,7 @@ async def download_checkpoint_archive(
 
     file_buffer = await asyncio.to_thread(download_file, checkpoint_path)
 
-    filename = f"{unique_id}_{checkpoint_id}.tar.gz"
+    filename = f"{unique_id}_{checkpoint_id}.tar.zst"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Length": str(file_buffer.getbuffer().nbytes),
