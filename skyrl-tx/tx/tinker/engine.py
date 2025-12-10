@@ -978,6 +978,8 @@ class TinkerEngine:
 
     def process_pending_requests(self):
         """Main loop to process pending requests."""
+        sample_wait_start: float | None = None  # Track when we started waiting for more sample requests
+
         while True:
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
@@ -990,7 +992,26 @@ class TinkerEngine:
 
             # Process batches outside of session context
             self.process_batch_requests(forward_backward_requests, self.process_forward_backward_batch)
-            self.process_batch_requests(sample_requests, self.process_sample_batch)
+
+            # For sample requests, wait for min_batch_size or timeout
+            min_batch = self.config.sample_min_batch_size
+            timeout_sec = self.config.sample_batch_timeout_ms / 1000.0
+
+            if sample_requests:
+                if min_batch <= 0 or len(sample_requests) >= min_batch:
+                    # Process immediately if batching disabled or we have enough requests
+                    self.process_batch_requests(sample_requests, self.process_sample_batch)
+                    sample_wait_start = None
+                elif sample_wait_start is None:
+                    # Start waiting for more requests
+                    sample_wait_start = time.time()
+                elif time.time() - sample_wait_start >= timeout_sec:
+                    # Timeout reached, process what we have
+                    self.process_batch_requests(sample_requests, self.process_sample_batch)
+                    sample_wait_start = None
+                # else: keep waiting for more requests
+            else:
+                sample_wait_start = None
 
             # Process other request types individually (in the future we can also batch independent optim_steps)
             other_results = {}
