@@ -1000,6 +1000,9 @@ class TinkerEngine:
             if sample_requests:
                 if min_batch <= 0 or len(sample_requests) >= min_batch:
                     # Process immediately if batching disabled or we have enough requests
+                    # Limit to exactly min_batch requests if set
+                    if min_batch > 0:
+                        sample_requests = dict(list(sample_requests.items())[:min_batch])
                     self.process_batch_requests(sample_requests, self.process_sample_batch)
                     sample_wait_start = None
                 elif sample_wait_start is None:
