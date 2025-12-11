@@ -611,6 +611,8 @@ class TinkerEngine:
         fsdp_size = self.config.fsdp_size
         assert micro_bs % fsdp_size == 0, f"Micro batch size {micro_bs} must be divisible by fsdp_size {fsdp_size}"
 
+        logger.info(f"FSDP debug: mesh={self.mesh}, total_bs={total_bs}, micro_bs={micro_bs}, seq_len={max_len}")
+
         # Collect full padded arrays on device, slice after transfer
         token_losses_device = []
         logprobs_device = []
