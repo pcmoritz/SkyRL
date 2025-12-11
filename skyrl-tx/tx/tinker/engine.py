@@ -680,7 +680,8 @@ class TinkerEngine:
         all_adapter_indices = []
         request_batch_slices = []
 
-        adapter_indices_batch = self.load_sampler_weights(valid_requests)
+        with log_timing("load_sampler_weights"):
+            adapter_indices_batch = self.load_sampler_weights(valid_requests)
 
         for i, (request_id, (model_id, request_data)) in enumerate(valid_requests.items()):
             request_start = len(all_prompts)
