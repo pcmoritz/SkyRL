@@ -323,31 +323,21 @@ class TinkerEngine:
                 lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
             )
 
-            # For FSDP, shard batch dimension across fsdp axis; replicate sequence dimension
-            batch_sharded = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
-            # adapter_indices is 1D (batch,)
-            batch_sharded_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
-            scalar = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            replicated = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
             # JIT the fused function
             # Input order: accumulated_grads, lora_params, non_lora_params, input_ids, attention_mask,
             #              adapter_indices, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages
+            # Note: We use replicated sharding for input data arrays. JAX will handle any needed
+            # resharding. For FSDP, the computation is distributed via parameter sharding.
             self._forward_backward_and_accumulate = jax.jit(
                 forward_backward_and_accumulate,
                 in_shardings=(
                     accumulated_grads_shardings,
                     lora_shardings,
                     non_lora_shardings,
-                    batch_sharded,      # input_ids [B, T]
-                    batch_sharded,      # attention_mask [B, T]
-                    batch_sharded_1d,   # adapter_indices [B]
-                    batch_sharded,      # target_ids [B, T]
-                    batch_sharded,      # loss_mask [B, T]
-                    batch_sharded_1d,   # loss_fn_types [B]
-                    batch_sharded,      # sampling_logprobs [B, T]
-                    batch_sharded,      # advantages [B, T]
-                ),
-                out_shardings=(accumulated_grads_shardings, batch_sharded, batch_sharded, scalar),
+                ) + (None,) * 8,  # Let JAX handle input array shardings
+                out_shardings=(accumulated_grads_shardings, None, None, replicated),
                 donate_argnames=("accumulated_grads",),
             )
 
