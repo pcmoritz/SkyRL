@@ -153,7 +153,8 @@ class TinkerEngine:
         model_class = get_model_class(self.model_config)
 
         # Create model and load weights
-        self.mesh = jax.make_mesh((1, self.config.tensor_parallel_size), ("dp", "tp"))
+        # Mesh shape: (fsdp, tensor_parallel) - FSDP handles both data parallelism and parameter sharding
+        self.mesh = jax.make_mesh((self.config.fsdp_size, self.config.tensor_parallel_size), ("fsdp", "tp"))
         with jax.set_mesh(self.mesh):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
             load_safetensors(checkpoint_path, self.model_config, self.model)
@@ -322,14 +323,31 @@ class TinkerEngine:
                 lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
             )
 
-            replicated = jax.NamedSharding(self.mesh, jax.P(None))
-            scalar = jax.NamedSharding(self.mesh, jax.P())
+            # For FSDP, shard batch dimension across fsdp axis; replicate sequence dimension
+            batch_sharded = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
+            # adapter_indices is 1D (batch,)
+            batch_sharded_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
+            scalar = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
             # JIT the fused function
+            # Input order: accumulated_grads, lora_params, non_lora_params, input_ids, attention_mask,
+            #              adapter_indices, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages
             self._forward_backward_and_accumulate = jax.jit(
                 forward_backward_and_accumulate,
-                in_shardings=(accumulated_grads_shardings, lora_shardings, non_lora_shardings) + (replicated,) * 8,
-                out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
+                in_shardings=(
+                    accumulated_grads_shardings,
+                    lora_shardings,
+                    non_lora_shardings,
+                    batch_sharded,      # input_ids [B, T]
+                    batch_sharded,      # attention_mask [B, T]
+                    batch_sharded_1d,   # adapter_indices [B]
+                    batch_sharded,      # target_ids [B, T]
+                    batch_sharded,      # loss_mask [B, T]
+                    batch_sharded_1d,   # loss_fn_types [B]
+                    batch_sharded,      # sampling_logprobs [B, T]
+                    batch_sharded,      # advantages [B, T]
+                ),
+                out_shardings=(accumulated_grads_shardings, batch_sharded, batch_sharded, scalar),
                 donate_argnames=("accumulated_grads",),
             )
 
