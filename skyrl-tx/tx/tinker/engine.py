@@ -323,21 +323,32 @@ class TinkerEngine:
                 lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
             )
 
+            # For FSDP, shard batch dimension across fsdp axis to reduce per-device activation memory
+            batch_sharded = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
+            batch_sharded_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
             replicated = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
             # JIT the fused function
             # Input order: accumulated_grads, lora_params, non_lora_params, input_ids, attention_mask,
             #              adapter_indices, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages
-            # Note: We use replicated sharding for input data arrays. JAX will handle any needed
-            # resharding. For FSDP, the computation is distributed via parameter sharding.
+            # Inputs are sharded across FSDP axis so each device processes batch_size/fsdp_size samples,
+            # reducing activation memory proportionally.
             self._forward_backward_and_accumulate = jax.jit(
                 forward_backward_and_accumulate,
                 in_shardings=(
                     accumulated_grads_shardings,
                     lora_shardings,
                     non_lora_shardings,
-                ) + (None,) * 8,  # Let JAX handle input array shardings
-                out_shardings=(accumulated_grads_shardings, None, None, replicated),
+                    batch_sharded,      # input_ids [B, T]
+                    batch_sharded,      # attention_mask [B, T]
+                    batch_sharded_1d,   # adapter_indices [B]
+                    batch_sharded,      # target_ids [B, T]
+                    batch_sharded,      # loss_mask [B, T]
+                    batch_sharded_1d,   # loss_fn_types [B]
+                    batch_sharded,      # sampling_logprobs [B, T]
+                    batch_sharded,      # advantages [B, T]
+                ),
+                out_shardings=(accumulated_grads_shardings, batch_sharded, batch_sharded, replicated),
                 donate_argnames=("accumulated_grads",),
             )
 
@@ -596,26 +607,44 @@ class TinkerEngine:
         micro_bs = self._micro_batch_size(total_bs)
         seq_lens = [len(seq) for seq in all_input_ids]
 
+        # For FSDP, micro batch size must be divisible by fsdp_size
+        fsdp_size = self.config.fsdp_size
+        assert micro_bs % fsdp_size == 0, f"Micro batch size {micro_bs} must be divisible by fsdp_size {fsdp_size}"
+
         # Collect full padded arrays on device, slice after transfer
         token_losses_device = []
         logprobs_device = []
         seq_len = input_ids.shape[1]
 
+        # Define shardings for FSDP - shard batch dimension across fsdp axis
+        batch_sharding = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
+        batch_sharding_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
+
         with jax.set_mesh(self.mesh), self._jit_timing_context(seq_len, mode="train"):
             for mb_start in range(0, total_bs, micro_bs):
                 mb_end = min(mb_start + micro_bs, total_bs)
+                # Shard inputs across FSDP axis for data parallelism
+                mb_input_ids = jax.device_put(input_ids[mb_start:mb_end], batch_sharding)
+                mb_attention_mask = jax.device_put(attention_mask[mb_start:mb_end], batch_sharding)
+                mb_adapter_indices = jax.device_put(adapter_indices[mb_start:mb_end], batch_sharding_1d)
+                mb_target_ids = jax.device_put(target_ids[mb_start:mb_end], batch_sharding)
+                mb_loss_mask = jax.device_put(loss_mask[mb_start:mb_end], batch_sharding)
+                mb_loss_fn_types = jax.device_put(loss_fn_types[mb_start:mb_end], batch_sharding_1d)
+                mb_sampling_logprobs = jax.device_put(sampling_logprobs[mb_start:mb_end], batch_sharding)
+                mb_advantages = jax.device_put(advantages[mb_start:mb_end], batch_sharding)
+
                 self.accumulated_grads, per_token_losses, target_logprobs, _ = self._forward_backward_and_accumulate(
                     self.accumulated_grads,
                     self.lora_params,
                     self.non_lora_params,
-                    input_ids[mb_start:mb_end],
-                    attention_mask[mb_start:mb_end],
-                    adapter_indices[mb_start:mb_end],
-                    target_ids[mb_start:mb_end],
-                    loss_mask[mb_start:mb_end],
-                    loss_fn_types[mb_start:mb_end],
-                    sampling_logprobs[mb_start:mb_end],
-                    advantages[mb_start:mb_end],
+                    mb_input_ids,
+                    mb_attention_mask,
+                    mb_adapter_indices,
+                    mb_target_ids,
+                    mb_loss_mask,
+                    mb_loss_fn_types,
+                    mb_sampling_logprobs,
+                    mb_advantages,
                 )
                 token_losses_device.append(per_token_losses)
                 logprobs_device.append(target_logprobs)
