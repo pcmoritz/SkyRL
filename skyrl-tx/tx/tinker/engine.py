@@ -383,6 +383,9 @@ class TinkerEngine:
             # JIT with explicit shardings for FSDP
             # Input order: model, input_ids, attention_mask, max_length, max_new_tokens,
             #              adapter_indices, temperatures, rngs, stop_tokens, prompt_logprobs
+            # Note: temperatures, rngs, stop_tokens are created inside generate() without
+            # sharding, so we use replicated sharding for them. The model and main inputs
+            # (input_ids, attention_mask, adapter_indices) are sharded.
             self._prefill_and_decode = jax.jit(
                 GeneratorMixin._prefill_and_decode_impl,
                 static_argnames=("max_length", "max_new_tokens", "prompt_logprobs"),
@@ -394,9 +397,9 @@ class TinkerEngine:
                     # max_length - static
                     # max_new_tokens - static
                     batch_sharded_1d,  # adapter_indices [B]
-                    batch_sharded_1d,  # temperatures [B]
-                    batch_sharded,     # rngs [B, key_dim]
-                    batch_sharded,     # stop_tokens [B, max_stop]
+                    replicated,        # temperatures [B] - small, replicate
+                    replicated,        # rngs [B, key_dim] - small, replicate
+                    replicated,        # stop_tokens [B, max_stop] - small, replicate
                     # prompt_logprobs - static
                 ),
                 out_shardings=(
