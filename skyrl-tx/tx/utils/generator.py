@@ -91,7 +91,11 @@ class GeneratorMixin:
     """Adds autoregressive generation with KV caching to causal language models."""
 
     @staticmethod
-    @functools.partial(jax.jit, static_argnames=("max_length", "max_new_tokens", "prompt_logprobs"))
+    @functools.partial(
+        jax.jit,
+        static_argnames=("max_length", "max_new_tokens", "prompt_logprobs"),
+        donate_argnames=("input_ids", "attention_mask"),
+    )
     def _prefill_and_decode(
         model,
         input_ids: jax.Array,
