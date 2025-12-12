@@ -314,15 +314,24 @@ class TinkerEngine:
 
         else:
             # Retrieve the sharding of lora and non_lora params and compute the sharding of inputs and outputs
+            lora_specs = nnx.get_partition_spec(self.lora_params)
+            non_lora_specs = nnx.get_partition_spec(self.non_lora_params)
+            accumulated_grads_specs = nnx.get_partition_spec(self.accumulated_grads)
+
+            # Debug: log the partition specs
+            logger.info(f"LoRA param partition specs sample: {jax.tree.leaves(lora_specs)[:3]}")
+            logger.info(f"Non-LoRA param partition specs sample: {jax.tree.leaves(non_lora_specs)[:3]}")
+            logger.info(f"Accumulated grads partition specs sample: {jax.tree.leaves(accumulated_grads_specs)[:3]}")
+
             lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
+                lambda spec: jax.NamedSharding(self.mesh, spec), lora_specs
             )
             non_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.non_lora_params)
+                lambda spec: jax.NamedSharding(self.mesh, spec), non_lora_specs
             )
             # Get sharding for AccumulatedGradients
             accumulated_grads_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
+                lambda spec: jax.NamedSharding(self.mesh, spec), accumulated_grads_specs
             )
 
             # For FSDP, shard batch dimension across fsdp axis to reduce per-device activation memory
