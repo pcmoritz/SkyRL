@@ -62,9 +62,6 @@ class LoRAMixin:
         base_output: jax.Array,
         adapter_indices: jax.Array | None,
     ) -> jax.Array:
-        # TEMPORARY: Disable LoRA to test if ragged_dot is causing OOM
-        return base_output
-
         if self.max_lora_adapters == 0 or adapter_indices is None:
             return base_output
 
@@ -79,7 +76,19 @@ class LoRAMixin:
         x_flat = x.reshape(-1, *dims)
         adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
 
-        # Sort tokens to prepare for ragged_dot
+        lora_A = self.lora_A.value
+        lora_B = self.lora_B.value
+        lora_scaling = self.lora_scaling.value
+
+        # Ensure LoRA weights are fully replicated for ragged_dot.
+        # This avoids complex sharding interactions that can cause all-gathers.
+        lora_A = jax.lax.with_sharding_constraint(lora_A, jax.sharding.PartitionSpec())
+        lora_B = jax.lax.with_sharding_constraint(lora_B, jax.sharding.PartitionSpec())
+
+        # Sort tokens to prepare for ragged_dot.
+        # With FSDP, the batch is sharded across devices. The sorting and ragged_dot
+        # operations work on the local shard - each device processes its own subset
+        # of the batch independently, which is correct for data parallelism.
         x_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
             x_flat, adapter_indices_expanded, self.max_lora_adapters, adapter_indices=adapter_indices_expanded
         )
@@ -87,15 +96,15 @@ class LoRAMixin:
         # Apply LoRA using ragged_dot: x @ A @ B
         if isinstance(self, nnx.Embed):
             # Embedding path: A[x]
-            intermediate = self.lora_A.value[adapter_indices_sorted, x_sorted, :]
+            intermediate = lora_A[adapter_indices_sorted, x_sorted, :]
         else:
             # Linear path: x @ A
-            intermediate = jax.lax.ragged_dot(x_sorted, self.lora_A.value, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B.value, group_sizes)
+            intermediate = jax.lax.ragged_dot(x_sorted, lora_A, group_sizes)
+        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B, group_sizes)
 
         # Unsort, reshape, scale
         lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
-        lora_output = lora_output * self.lora_scaling.value[adapter_indices, None, None]
+        lora_output = lora_output * lora_scaling[adapter_indices, None, None]
         return base_output + lora_output.reshape(base_output.shape)
 
 
