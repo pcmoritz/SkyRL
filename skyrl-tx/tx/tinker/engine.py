@@ -707,6 +707,11 @@ class TinkerEngine:
                 mb_sampling_logprobs = jax.device_put(sampling_logprobs[mb_start:mb_end], batch_sharding)
                 mb_advantages = jax.device_put(advantages[mb_start:mb_end], batch_sharding)
 
+                # Debug: verify shardings before JIT call
+                if mb_start == 0:
+                    logger.info(f"Input shardings - input_ids: {mb_input_ids.sharding}, adapter_indices: {mb_adapter_indices.sharding}")
+                    logger.info(f"Input shapes - input_ids: {mb_input_ids.shape}, adapter_indices: {mb_adapter_indices.shape}")
+
                 self.accumulated_grads, per_token_losses, target_logprobs, _ = self._forward_backward_and_accumulate(
                     self.accumulated_grads,
                     self.lora_params,
