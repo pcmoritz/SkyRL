@@ -745,9 +745,18 @@ class TinkerEngine:
         max_batch_size = (
             self.config.sample_max_num_sequences if self.config.sample_max_num_sequences > 0 else total_batch_size
         )
+
+        # For FSDP, batch size must be divisible by fsdp_size
+        fsdp_size = self.config.fsdp_size
+        assert max_batch_size % fsdp_size == 0, f"Sample batch size {max_batch_size} must be divisible by fsdp_size {fsdp_size}"
+
         # Collect generated sequences and prompt logprobs across batches
         all_sequences: list[types.GeneratedSequence] = []
         all_prompt_logprobs: list[list[float]] = []
+
+        # Define shardings for FSDP - shard batch dimension across fsdp axis
+        batch_sharding = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
+        batch_sharding_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
 
         with jax.set_mesh(self.mesh):
             model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
@@ -766,12 +775,17 @@ class TinkerEngine:
                 input_ids = pad_batch(batch_prompts, max_len, np.int32, left=True)
                 attention_mask = pad_batch([[1] * len(seq) for seq in batch_prompts], max_len, np.int32, left=True)
 
+                # Shard inputs across FSDP axis for data parallelism
+                input_ids = jax.device_put(input_ids, batch_sharding)
+                attention_mask = jax.device_put(attention_mask, batch_sharding)
+                adapter_indices_sharded = jax.device_put(jnp.array(adapter_indices, dtype=jnp.int32), batch_sharding_1d)
+
                 with self._jit_timing_context(max_len, mode="sample"):
                     result = model.generate(
                         input_ids,
                         attention_mask,
                         sampling_params=sampling_params,
-                        adapter_indices=jnp.array(adapter_indices, dtype=jnp.int32),
+                        adapter_indices=adapter_indices_sharded,
                         prompt_logprobs=needs_prompt_logprobs,
                     )
                 # Only take the actual results, not the padded ones
