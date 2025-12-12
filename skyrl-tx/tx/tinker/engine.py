@@ -171,10 +171,8 @@ class TinkerEngine:
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
         )
 
-        # Create JIT-compiled functions within the mesh context so shardings are properly resolved
-        with jax.set_mesh(self.mesh):
-            self._create_loss_and_grad_fn()
-            self._create_prefill_and_decode_fn()
+        self._create_loss_and_grad_fn()
+        self._create_prefill_and_decode_fn()
 
     def _extract_checkpoint_data(self, model_id: str) -> dict:
         """Extract adapter state and optimizer state for checkpointing."""
@@ -229,7 +227,12 @@ class TinkerEngine:
         ) -> jax.Array:
             model = nnx.merge(graphdef, lora_params, non_lora_params)
             output = model(input_ids, attention_mask=attention_mask, adapter_indices=adapter_indices)
-            return output.logits
+            # Ensure logits stay sharded on batch dimension to avoid gathering full [B, T, V] tensor
+            logits = jax.lax.with_sharding_constraint(
+                output.logits,
+                jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None, None))
+            )
+            return logits
 
         if self.config.gradient_checkpointing:
             # policy=None corresponds to full activation recomputation
