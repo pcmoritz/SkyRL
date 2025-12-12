@@ -153,7 +153,10 @@ class TinkerEngine:
         model_class = get_model_class(self.model_config)
 
         # Create model and load weights
-        self.mesh = jax.make_mesh((1, self.config.tensor_parallel_size), ("dp", "tp"))
+        num_devices = jax.device_count()
+        tp_size = self.config.tensor_parallel_size
+        fsdp_size = num_devices // tp_size
+        self.mesh = jax.make_mesh((fsdp_size, tp_size), ("fsdp", "tp"))
         with jax.set_mesh(self.mesh):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
             load_safetensors(checkpoint_path, self.model_config, self.model)
@@ -318,18 +321,20 @@ class TinkerEngine:
                 lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.non_lora_params)
             )
             # Get sharding for AccumulatedGradients
-            accumulated_grads_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
+            # We want grad_sum to be sharded like parameters (lora_shardings) and counts to be replicated
+            accumulated_grads_shardings = AccumulatedGradients(
+                grad_sum=lora_shardings,
+                counts=jax.NamedSharding(self.mesh, jax.P()),
             )
 
-            replicated = jax.NamedSharding(self.mesh, jax.P(None))
             scalar = jax.NamedSharding(self.mesh, jax.P())
+            data_sharded = jax.NamedSharding(self.mesh, jax.P("fsdp"))
 
             # JIT the fused function
             self._forward_backward_and_accumulate = jax.jit(
                 forward_backward_and_accumulate,
-                in_shardings=(accumulated_grads_shardings, lora_shardings, non_lora_shardings) + (replicated,) * 8,
-                out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
+                in_shardings=(accumulated_grads_shardings, lora_shardings, non_lora_shardings) + (data_sharded,) * 8,
+                out_shardings=(accumulated_grads_shardings, data_sharded, data_sharded, scalar),
                 donate_argnames=("accumulated_grads",),
             )
 
