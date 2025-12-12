@@ -249,8 +249,12 @@ class TinkerEngine:
                 self.graphdef, lora_params, non_lora_params, input_ids, attention_mask, adapter_indices
             )  # [B, T, V]
 
-            logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
-            target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
+            # Compute target log-probs efficiently without materializing full [B, T, V] logprobs tensor.
+            # This saves significant memory by only computing log_softmax for the target tokens.
+            # Formula: log_softmax(x)[i] = x[i] - logsumexp(x)
+            log_normalizer = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)  # [B, T, 1]
+            target_logits = jnp.take_along_axis(logits, target_ids[..., None], axis=-1)  # [B, T, 1]
+            target_logprobs = (target_logits - log_normalizer).squeeze(-1)  # [B, T]
 
             def compute_loss_per_example(loss_fn_type, target_logprobs, loss_mask, sampling_logprobs, advantages):
                 return jax.lax.switch(
