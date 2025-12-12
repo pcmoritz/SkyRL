@@ -62,6 +62,9 @@ class LoRAMixin:
         base_output: jax.Array,
         adapter_indices: jax.Array | None,
     ) -> jax.Array:
+        # TEMPORARY: Disable LoRA to test if ragged_dot is causing OOM
+        return base_output
+
         if self.max_lora_adapters == 0 or adapter_indices is None:
             return base_output
 
