@@ -171,8 +171,10 @@ class TinkerEngine:
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
         )
 
-        self._create_loss_and_grad_fn()
-        self._create_prefill_and_decode_fn()
+        # Create JIT-compiled functions within the mesh context so shardings are properly resolved
+        with jax.set_mesh(self.mesh):
+            self._create_loss_and_grad_fn()
+            self._create_prefill_and_decode_fn()
 
     def _extract_checkpoint_data(self, model_id: str) -> dict:
         """Extract adapter state and optimizer state for checkpointing."""
