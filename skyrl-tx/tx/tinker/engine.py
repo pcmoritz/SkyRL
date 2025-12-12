@@ -327,10 +327,15 @@ class TinkerEngine:
             non_lora_specs = nnx.get_partition_spec(self.non_lora_params)
             accumulated_grads_specs = nnx.get_partition_spec(self.accumulated_grads)
 
-            # Debug: log the partition specs
+            # Debug: log the partition specs and actual shardings
             logger.info(f"LoRA param partition specs sample: {jax.tree.leaves(lora_specs)[:3]}")
             logger.info(f"Non-LoRA param partition specs sample: {jax.tree.leaves(non_lora_specs)[:3]}")
             logger.info(f"Accumulated grads partition specs sample: {jax.tree.leaves(accumulated_grads_specs)[:3]}")
+            # Check actual sharding on the arrays
+            lora_leaves = jax.tree.leaves(self.lora_params)
+            non_lora_leaves = jax.tree.leaves(self.non_lora_params)
+            logger.info(f"LoRA param actual shardings sample: {[l.sharding for l in lora_leaves[:3]]}")
+            logger.info(f"Non-LoRA param actual shardings sample: {[l.sharding for l in non_lora_leaves[:3]]}")
 
             lora_shardings = jax.tree.map(
                 lambda spec: jax.NamedSharding(self.mesh, spec), lora_specs
