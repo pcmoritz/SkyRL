@@ -38,6 +38,7 @@ from tx.utils.models import (
 )
 from tx.layers.lora import update_adapter_config
 from tx.utils.log import logger
+from tx.utils.generator import GeneratorMixin
 
 
 @contextmanager
@@ -171,6 +172,7 @@ class TinkerEngine:
         )
 
         self._create_loss_and_grad_fn()
+        self._create_prefill_and_decode_fn()
 
     def _extract_checkpoint_data(self, model_id: str) -> dict:
         """Extract adapter state and optimizer state for checkpointing."""
@@ -367,6 +369,43 @@ class TinkerEngine:
             self._compute_grads_and_update = compute_grads_and_update
         else:
             self._compute_grads_and_update = nnx.jit(compute_grads_and_update)
+
+    def _create_prefill_and_decode_fn(self):
+        """Create JIT-compiled prefill and decode function with explicit FSDP shardings."""
+        # For FSDP, shard batch dimension across fsdp axis
+        batch_sharded = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp", None))
+        batch_sharded_1d = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec("fsdp"))
+        replicated = jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+
+        if self.config.enforce_eager:
+            self._prefill_and_decode = GeneratorMixin._prefill_and_decode_impl
+        else:
+            # JIT with explicit shardings for FSDP
+            # Input order: model, input_ids, attention_mask, max_length, max_new_tokens,
+            #              adapter_indices, temperatures, rngs, stop_tokens, prompt_logprobs
+            self._prefill_and_decode = jax.jit(
+                GeneratorMixin._prefill_and_decode_impl,
+                static_argnames=("max_length", "max_new_tokens", "prompt_logprobs"),
+                donate_argnames=("input_ids", "attention_mask"),
+                in_shardings=(
+                    None,           # model (pytree with its own shardings)
+                    batch_sharded,  # input_ids [B, T]
+                    batch_sharded,  # attention_mask [B, T]
+                    # max_length - static
+                    # max_new_tokens - static
+                    batch_sharded_1d,  # adapter_indices [B]
+                    batch_sharded_1d,  # temperatures [B]
+                    batch_sharded,     # rngs [B, key_dim]
+                    batch_sharded,     # stop_tokens [B, max_stop]
+                    # prompt_logprobs - static
+                ),
+                out_shardings=(
+                    batch_sharded,     # new_tokens [B, T]
+                    batch_sharded,     # new_logprobs [B, T]
+                    batch_sharded_1d,  # stop_pos [B]
+                    batch_sharded,     # prompt_logprobs_array [B, T] or None
+                ),
+            )
 
     def _micro_batch_size(self, total: int) -> int:
         """Return effective micro-batch size; 0/absent => disabled (use full fused batch)."""
@@ -787,6 +826,7 @@ class TinkerEngine:
                         sampling_params=sampling_params,
                         adapter_indices=adapter_indices_sharded,
                         prompt_logprobs=needs_prompt_logprobs,
+                        prefill_and_decode_fn=self._prefill_and_decode,
                     )
                 # Only take the actual results, not the padded ones
                 batch_size = batch_end - batch_start

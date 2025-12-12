@@ -91,12 +91,7 @@ class GeneratorMixin:
     """Adds autoregressive generation with KV caching to causal language models."""
 
     @staticmethod
-    @functools.partial(
-        jax.jit,
-        static_argnames=("max_length", "max_new_tokens", "prompt_logprobs"),
-        donate_argnames=("input_ids", "attention_mask"),
-    )
-    def _prefill_and_decode(
+    def _prefill_and_decode_impl(
         model,
         input_ids: jax.Array,
         attention_mask: jax.Array,
@@ -108,7 +103,7 @@ class GeneratorMixin:
         stop_tokens: jax.Array,
         prompt_logprobs: bool = False,
     ):
-        """JIT-compiled prefill + decode loop. Fuses everything for maximum efficiency."""
+        """Prefill + decode loop implementation (not JIT-compiled directly)."""
         # Compute positions from attention mask
         positions = compute_positions(attention_mask)
 
@@ -189,12 +184,25 @@ class GeneratorMixin:
         sampling_params: list[types.SamplingParams],
         adapter_indices: jax.Array | None = None,
         prompt_logprobs: bool = False,
+        prefill_and_decode_fn=None,
     ) -> GenerateOutput:
         """Generate text autoregressively with KV caching.
+
+        Args:
+            input_ids: Input token IDs.
+            attention_mask: Attention mask.
+            sampling_params: Sampling parameters for each sequence.
+            adapter_indices: Optional adapter indices for LoRA.
+            prompt_logprobs: Whether to compute prompt log probabilities.
+            prefill_and_decode_fn: JIT-compiled prefill/decode function with explicit
+                shardings. Required for FSDP.
 
         Returns:
             GenerateOutput containing generated_ids, stop_reasons, and optionally logprobs.
         """
+        if prefill_and_decode_fn is None:
+            raise ValueError("prefill_and_decode_fn is required for generation with FSDP")
+
         batch_size, prompt_length = input_ids.shape
         assert len(sampling_params) == batch_size
         max_new_tokens = max(sampling_param.max_tokens for sampling_param in sampling_params)
@@ -216,7 +224,7 @@ class GeneratorMixin:
         # Capture prompt lengths for prompt_logprobs if requested
         prompt_lengths = attention_mask.sum(axis=1) if prompt_logprobs else None
 
-        new_tokens, new_logprobs, stop_pos, prompt_logprobs_array = self._prefill_and_decode(
+        new_tokens, new_logprobs, stop_pos, prompt_logprobs_array = prefill_and_decode_fn(
             self,
             input_ids,
             attention_mask,
