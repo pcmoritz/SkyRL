@@ -224,6 +224,7 @@ class GeneratorMixin:
         # Capture prompt lengths for prompt_logprobs if requested
         prompt_lengths = attention_mask.sum(axis=1) if prompt_logprobs else None
 
+        # Note: All arguments must be positional when using in_shardings with jax.jit
         new_tokens, new_logprobs, stop_pos, prompt_logprobs_array = prefill_and_decode_fn(
             self,
             input_ids,
@@ -234,7 +235,7 @@ class GeneratorMixin:
             temperatures,
             rngs,
             stop_tokens,
-            prompt_logprobs=prompt_logprobs,
+            prompt_logprobs,
         )
 
         max_tokens = jnp.array([sp.max_tokens for sp in sampling_params])
