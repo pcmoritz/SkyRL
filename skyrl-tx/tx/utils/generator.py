@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import tx.utils.models
 from tx.tinker import types
+from tx.layers.lora import LoRARoutingInfo, compute_lora_routing
 
 
 @jax.tree_util.register_dataclass
@@ -49,6 +50,7 @@ class DecodeState:
     last_positions: jax.Array
     logits: jax.Array
     stop_pos: jax.Array  # Position where stop token was found
+    decode_routing_info: LoRARoutingInfo  # Pre-computed routing for decode (seq_len=1)
 
 
 @dataclass
@@ -117,6 +119,12 @@ class GeneratorMixin:
         kv_cache = outputs.kv_cache.pad_to_length(max_length)
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
+        # Precompute LoRA routing for decode (seq_len=1) once to avoid repeated
+        # all-gather/all-reduce operations inside the decode loop
+        decode_routing_info = compute_lora_routing(
+            adapter_indices, seq_len=1, max_lora_adapters=model.config.max_lora_adapters
+        )
+
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
             # Sample next token
@@ -140,12 +148,13 @@ class GeneratorMixin:
             # Update attention mask: set next position to 1
             next_attention_mask = s.attention_mask.at[:, s.kv_cache.cache_position].set(1)
 
+            # Use pre-computed decode routing to avoid repeated collective ops
             outputs = model(
                 next_token,
                 attention_mask=next_attention_mask,
                 positions=s.last_positions + 1,
                 kv_cache=s.kv_cache,
-                adapter_indices=adapter_indices,
+                routing_info=s.decode_routing_info,
             )
             next_state = DecodeState(
                 kv_cache=outputs.kv_cache,
@@ -154,6 +163,7 @@ class GeneratorMixin:
                 last_positions=s.last_positions + 1,
                 logits=outputs.logits[:, -1, :],
                 stop_pos=stop_pos,
+                decode_routing_info=s.decode_routing_info,
             )
             return next_state, (next_token, sampled_logprob)
 
@@ -164,6 +174,7 @@ class GeneratorMixin:
             last_positions=positions[:, -1:],
             logits=outputs.logits[:, -1, :],
             stop_pos=jnp.full((input_ids.shape[0],), -1),
+            decode_routing_info=decode_routing_info,
         )
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(

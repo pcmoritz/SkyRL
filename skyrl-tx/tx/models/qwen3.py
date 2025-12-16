@@ -415,15 +415,17 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         attention_mask: jax.Array,
         positions: jax.Array | None = None,
         output_hidden_states: bool | None = None,
-        adapter_indices: jax.Array,
+        adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
+        routing_info: LoRARoutingInfo | None = None,
     ) -> CausalLMOutput:
         if positions is None:
             positions = compute_positions(attention_mask)
 
-        # Compute LoRA routing once for all layers (avoids 1000+ redundant argsort ops)
-        seq_len = input_ids.shape[1]
-        routing_info = compute_lora_routing(adapter_indices, seq_len, self.config.max_lora_adapters)
+        # Use provided routing_info or compute it (avoids redundant argsort in decode loop)
+        if routing_info is None:
+            seq_len = input_ids.shape[1]
+            routing_info = compute_lora_routing(adapter_indices, seq_len, self.config.max_lora_adapters)
 
         outputs = self.model(
             input_ids,
