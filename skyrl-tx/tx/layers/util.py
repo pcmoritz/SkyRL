@@ -27,6 +27,7 @@ def compute_lora_routing(
     adapter_indices: jax.Array,
     seq_len: int,
     max_lora_adapters: int,
+    replicate: bool = False,
 ) -> LoRARoutingInfo:
     """Compute routing info once for all LoRA layers in a forward pass.
 
@@ -34,10 +35,18 @@ def compute_lora_routing(
         adapter_indices: [B] adapter index per batch element
         seq_len: sequence length T
         max_lora_adapters: maximum number of adapters
+        replicate: if True, replicate routing arrays across all devices to avoid
+            indexing-related collectives (recommended for decode with small seq_len)
 
     Returns:
         LoRARoutingInfo with pre-computed sorting indices
     """
+    # Replicate adapter_indices first if requested, so all subsequent ops are replicated
+    if replicate:
+        adapter_indices = jax.lax.with_sharding_constraint(
+            adapter_indices, jax.sharding.PartitionSpec()
+        )
+
     adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
     sorted_indices = jnp.argsort(adapter_indices_expanded)
     unsort_indices = jnp.argsort(sorted_indices)

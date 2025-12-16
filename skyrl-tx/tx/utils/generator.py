@@ -120,9 +120,12 @@ class GeneratorMixin:
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
         # Precompute LoRA routing for decode (seq_len=1) once to avoid repeated
-        # all-gather/all-reduce operations inside the decode loop
+        # all-gather/all-reduce operations inside the decode loop.
+        # Use replicate=True to fully replicate routing arrays across devices,
+        # eliminating indexing-related collectives in apply_lora.
         decode_routing_info = compute_lora_routing(
-            adapter_indices, seq_len=1, max_lora_adapters=model.config.max_lora_adapters
+            adapter_indices, seq_len=1, max_lora_adapters=model.config.max_lora_adapters,
+            replicate=True,
         )
 
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
