@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import tx.utils.models
 from tx.tinker import types
-from tx.layers.lora import LoRARoutingInfo, compute_lora_routing
+from tx.layers.util import LoRARoutingInfo, compute_lora_routing
 
 
 @jax.tree_util.register_dataclass

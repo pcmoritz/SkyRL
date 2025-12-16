@@ -3,7 +3,8 @@ import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
-from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed, LoRARoutingInfo, compute_lora_routing
+from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed
+from tx.layers.util import LoRARoutingInfo, compute_lora_routing
 from tx.layers.util import Param, prepare_routing
 from tx.models.configs import Qwen3Config
 from tx.models.types import CausalLMOutput, ModelOutput
