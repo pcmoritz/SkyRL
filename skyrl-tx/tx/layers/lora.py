@@ -1,55 +1,11 @@
-from functools import partial
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P
 
 from tx.utils.models import filter_lora
 from tx.layers.util import Param, prepare_routing
 from tx.models.types import ModelForCausalLM
 from tx.tinker.types import LoraConfig
-
-
-def _apply_lora_local(
-    x_flat: jax.Array,
-    adapter_indices_expanded: jax.Array,
-    lora_A: jax.Array,
-    lora_B: jax.Array,
-    lora_scaling: jax.Array,
-    max_lora_adapters: int,
-    is_embed: bool,
-) -> jax.Array:
-    """Local LoRA computation that runs on each device's shard.
-
-    This function is called within shard_map and operates on local data only.
-    """
-    # Sort tokens to prepare for ragged_dot
-    x_sorted, group_sizes, unsort_indices, _ = prepare_routing(
-        x_flat, adapter_indices_expanded, max_lora_adapters, adapter_indices=adapter_indices_expanded
-    )
-
-    # Apply LoRA using ragged_dot: x @ A @ B
-    if is_embed:
-        # Embedding path: A[x] - x contains token indices
-        intermediate = lora_A[adapter_indices_expanded[unsort_indices], x_sorted, :]
-        intermediate = intermediate[jnp.argsort(unsort_indices)]
-        intermediate_sorted, _, _, _ = prepare_routing(
-            intermediate, adapter_indices_expanded, max_lora_adapters
-        )
-        lora_output_sorted = jax.lax.ragged_dot(intermediate_sorted, lora_B, group_sizes)
-    else:
-        # Linear path: x @ A
-        intermediate = jax.lax.ragged_dot(x_sorted, lora_A, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B, group_sizes)
-
-    # Unsort to restore original order
-    lora_output = lora_output_sorted[unsort_indices]
-
-    # Apply per-adapter scaling
-    lora_output = lora_output * lora_scaling[adapter_indices_expanded, None]
-
-    return lora_output
 
 
 class LoRAMixin:
@@ -87,21 +43,16 @@ class LoRAMixin:
         else:
             self.lora_scaling = nnx.Variable(jnp.full((max_lora_adapters,), 1.0, dtype=dtype))
             self.lora_ranks = nnx.Variable(jnp.full((max_lora_adapters,), max_lora_rank, dtype=jnp.int32))
-            # Use replicated sharding for LoRA weights to enable shard_map.
-            # LoRA weights are small (rank is typically 8-64) so replication is efficient.
-            # This allows shard_map to compile faster than with_sharding_constraint approach.
-            replicated_sharding_A = (None,) * len(shape_A)
-            replicated_sharding_B = (None,) * len(shape_B)
             self.lora_A = Param(
                 *shape_A,
                 dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.he_uniform(), replicated_sharding_A),
+                kernel_init=nnx.with_partitioning(nnx.initializers.he_uniform(), sharding_A),
                 rngs=rngs,
             )
             self.lora_B = Param(
                 *shape_B,
                 dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.zeros_init(), replicated_sharding_B),
+                kernel_init=nnx.with_partitioning(nnx.initializers.zeros_init(), sharding_B),
                 rngs=rngs,
             )
 
@@ -122,72 +73,38 @@ class LoRAMixin:
         assert len(dims) == 0 if isinstance(self, nnx.Embed) else tuple(dims) == self.lora_A.value.shape[1:-1]
         assert adapter_indices.shape[0] == batch_size
 
+        x_flat = x.reshape(-1, *dims)
+        adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
+
         lora_A = self.lora_A.value
         lora_B = self.lora_B.value
         lora_scaling = self.lora_scaling.value
-        is_embed = isinstance(self, nnx.Embed)
-        max_lora_adapters = self.max_lora_adapters
 
-        # Use shard_map for explicit SPMD computation with faster compilation
-        mesh = jax._src.mesh.get_abstract_mesh()
-        if mesh is not None and mesh.size > 1:
-            # shard_map version: explicitly define per-device computation
-            # Input sharding: batch dimension sharded across 'fsdp' axis
-            # LoRA weights: replicated (all devices have full copy)
-            @partial(
-                shard_map,
-                mesh=mesh,
-                in_specs=(
-                    P('fsdp', None, None) if not is_embed else P('fsdp', None),  # x
-                    P('fsdp'),               # adapter_indices
-                    P(),                     # lora_A: replicated
-                    P(),                     # lora_B: replicated
-                    P(),                     # lora_scaling: replicated
-                ),
-                out_specs=P('fsdp', None, None),  # output: batch sharded
-                check_rep=False,
-            )
-            def apply_lora_sharded(x_local, adapter_indices_local, lora_A, lora_B, lora_scaling):
-                local_batch_size = x_local.shape[0]
-                local_seq_len = x_local.shape[1]
+        # Ensure LoRA weights are fully replicated for ragged_dot.
+        # This avoids complex sharding interactions that can cause all-gathers.
+        lora_A = jax.lax.with_sharding_constraint(lora_A, jax.sharding.PartitionSpec())
+        lora_B = jax.lax.with_sharding_constraint(lora_B, jax.sharding.PartitionSpec())
 
-                # Flatten for processing
-                if is_embed:
-                    x_flat = x_local.reshape(-1)
-                else:
-                    x_flat = x_local.reshape(-1, x_local.shape[-1])
+        # Sort tokens to prepare for ragged_dot.
+        # With FSDP, the batch is sharded across devices. The sorting and ragged_dot
+        # operations work on the local shard - each device processes its own subset
+        # of the batch independently, which is correct for data parallelism.
+        x_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
+            x_flat, adapter_indices_expanded, self.max_lora_adapters, adapter_indices=adapter_indices_expanded
+        )
 
-                adapter_indices_expanded = jnp.repeat(adapter_indices_local, local_seq_len)
-
-                lora_output = _apply_lora_local(
-                    x_flat,
-                    adapter_indices_expanded,
-                    lora_A,
-                    lora_B,
-                    lora_scaling,
-                    max_lora_adapters,
-                    is_embed,
-                )
-
-                return lora_output.reshape(local_batch_size, local_seq_len, -1)
-
-            lora_output = apply_lora_sharded(x, adapter_indices, lora_A, lora_B, lora_scaling)
+        # Apply LoRA using ragged_dot: x @ A @ B
+        if isinstance(self, nnx.Embed):
+            # Embedding path: A[x]
+            intermediate = lora_A[adapter_indices_sorted, x_sorted, :]
         else:
-            # Non-sharded fallback for single device
-            x_flat = x.reshape(-1, *dims) if dims else x.reshape(-1)
-            adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
+            # Linear path: x @ A
+            intermediate = jax.lax.ragged_dot(x_sorted, lora_A, group_sizes)
+        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B, group_sizes)
 
-            lora_output = _apply_lora_local(
-                x_flat,
-                adapter_indices_expanded,
-                lora_A,
-                lora_B,
-                lora_scaling,
-                max_lora_adapters,
-                is_embed,
-            )
-            lora_output = lora_output.reshape(batch_size, seq_len, -1)
-
+        # Unsort, reshape, scale
+        lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
+        lora_output = lora_output * lora_scaling[adapter_indices, None, None]
         return base_output + lora_output.reshape(base_output.shape)
 
 
