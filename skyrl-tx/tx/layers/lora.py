@@ -74,16 +74,24 @@ class LoRAMixin:
         assert adapter_indices.shape[0] == batch_size
 
         x_flat = x.reshape(-1, *dims)
-        adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
 
-        # Sort tokens to prepare for ragged_dot
-        x_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
-            x_flat, adapter_indices_expanded, self.max_lora_adapters, adapter_indices=adapter_indices_expanded
-        )
+        # Sort at batch level (much cheaper than sorting batch_size * seq_len elements)
+        batch_sort_indices = jnp.argsort(adapter_indices)
+        batch_unsort_indices = jnp.argsort(batch_sort_indices)
+
+        # Expand to token level
+        seq_range = jnp.arange(seq_len)
+        token_sort_indices = (batch_sort_indices[:, None] * seq_len + seq_range).ravel()
+        token_unsort_indices = (batch_unsort_indices[:, None] * seq_len + seq_range).ravel()
+
+        # Sort tokens and compute group sizes
+        x_sorted = x_flat[token_sort_indices]
+        group_sizes = jnp.bincount(adapter_indices, length=self.max_lora_adapters) * seq_len
 
         # Apply LoRA using ragged_dot: x @ A @ B
         if isinstance(self, nnx.Embed):
             # Embedding path: A[x]
+            adapter_indices_sorted = jnp.repeat(adapter_indices[batch_sort_indices], seq_len)
             intermediate = self.lora_A.value[adapter_indices_sorted, x_sorted, :]
         else:
             # Linear path: x @ A
@@ -91,7 +99,7 @@ class LoRAMixin:
         lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B.value, group_sizes)
 
         # Unsort, reshape, scale
-        lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
+        lora_output = lora_output_sorted[token_unsort_indices].reshape(batch_size, seq_len, -1)
         lora_output = lora_output * self.lora_scaling.value[adapter_indices, None, None]
         return base_output + lora_output.reshape(base_output.shape)
 
