@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from flax import nnx
 import jax
 from jax import numpy as jnp
@@ -6,6 +7,51 @@ from tx.utils.models import filter_lora
 from tx.layers.util import Param, prepare_routing
 from tx.models.types import ModelForCausalLM
 from tx.tinker.types import LoraConfig
+
+
+@jax.tree_util.register_dataclass
+@dataclass
+class LoRARoutingInfo:
+    """Pre-computed routing information for LoRA layers.
+
+    Computing this once and reusing across all LoRA layers avoids
+    redundant argsort operations (1000+ per forward pass -> 1).
+    """
+    adapter_indices: jax.Array     # [B] original adapter indices per batch element
+    sorted_indices: jax.Array      # [B*T] indices to sort tokens by adapter
+    unsort_indices: jax.Array      # [B*T] indices to restore original order
+    group_sizes: jax.Array         # [max_adapters] number of tokens per adapter
+    adapter_indices_sorted: jax.Array  # [B*T] adapter indices in sorted order
+
+
+def compute_lora_routing(
+    adapter_indices: jax.Array,
+    seq_len: int,
+    max_lora_adapters: int,
+) -> LoRARoutingInfo:
+    """Compute routing info once for all LoRA layers in a forward pass.
+
+    Args:
+        adapter_indices: [B] adapter index per batch element
+        seq_len: sequence length T
+        max_lora_adapters: maximum number of adapters
+
+    Returns:
+        LoRARoutingInfo with pre-computed sorting indices
+    """
+    adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
+    sorted_indices = jnp.argsort(adapter_indices_expanded)
+    unsort_indices = jnp.argsort(sorted_indices)
+    group_sizes = jnp.bincount(adapter_indices_expanded, length=max_lora_adapters)
+    adapter_indices_sorted = adapter_indices_expanded[sorted_indices]
+
+    return LoRARoutingInfo(
+        adapter_indices=adapter_indices,
+        sorted_indices=sorted_indices,
+        unsort_indices=unsort_indices,
+        group_sizes=group_sizes,
+        adapter_indices_sorted=adapter_indices_sorted,
+    )
 
 
 class LoRAMixin:
@@ -60,51 +106,40 @@ class LoRAMixin:
         self,
         x: jax.Array,
         base_output: jax.Array,
-        adapter_indices: jax.Array | None,
+        routing_info: LoRARoutingInfo,
     ) -> jax.Array:
-        if self.max_lora_adapters == 0 or adapter_indices is None:
+        if self.max_lora_adapters == 0:
             return base_output
 
         if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
         (batch_size, seq_len, *dims) = x.shape
-        assert len(self.lora_A.shape) == 3
-        assert len(dims) == 0 if isinstance(self, nnx.Embed) else tuple(dims) == self.lora_A.value.shape[1:-1]
-        assert adapter_indices.shape[0] == batch_size
-
         x_flat = x.reshape(-1, *dims)
-        adapter_indices_expanded = jnp.repeat(adapter_indices, seq_len)
 
         lora_A = self.lora_A.value
         lora_B = self.lora_B.value
         lora_scaling = self.lora_scaling.value
 
         # Ensure LoRA weights are fully replicated for ragged_dot.
-        # This avoids complex sharding interactions that can cause all-gathers.
         lora_A = jax.lax.with_sharding_constraint(lora_A, jax.sharding.PartitionSpec())
         lora_B = jax.lax.with_sharding_constraint(lora_B, jax.sharding.PartitionSpec())
 
-        # Sort tokens to prepare for ragged_dot.
-        # With FSDP, the batch is sharded across devices. The sorting and ragged_dot
-        # operations work on the local shard - each device processes its own subset
-        # of the batch independently, which is correct for data parallelism.
-        x_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
-            x_flat, adapter_indices_expanded, self.max_lora_adapters, adapter_indices=adapter_indices_expanded
-        )
+        # Use pre-computed routing (avoids redundant argsort per layer)
+        x_sorted = x_flat[routing_info.sorted_indices]
 
         # Apply LoRA using ragged_dot: x @ A @ B
         if isinstance(self, nnx.Embed):
             # Embedding path: A[x]
-            intermediate = lora_A[adapter_indices_sorted, x_sorted, :]
+            intermediate = lora_A[routing_info.adapter_indices_sorted, x_sorted, :]
         else:
             # Linear path: x @ A
-            intermediate = jax.lax.ragged_dot(x_sorted, lora_A, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B, group_sizes)
+            intermediate = jax.lax.ragged_dot(x_sorted, lora_A, routing_info.group_sizes)
+        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B, routing_info.group_sizes)
 
         # Unsort, reshape, scale
-        lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
-        lora_output = lora_output * lora_scaling[adapter_indices, None, None]
+        lora_output = lora_output_sorted[routing_info.unsort_indices].reshape(batch_size, seq_len, -1)
+        lora_output = lora_output * lora_scaling[routing_info.adapter_indices, None, None]
         return base_output + lora_output.reshape(base_output.shape)
 
 
@@ -149,9 +184,9 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
+    def __call__(self, x: jax.Array, routing_info: LoRARoutingInfo) -> jax.Array:
         base_out = super().__call__(x)
-        return self.apply_lora(x, base_out, adapter_indices)
+        return self.apply_lora(x, base_out, routing_info)
 
 
 class LoRALinear(LoRAMixin, nnx.Linear):
@@ -200,9 +235,9 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
+    def __call__(self, x: jax.Array, routing_info: LoRARoutingInfo) -> jax.Array:
         base_out = super().__call__(x)
-        return self.apply_lora(x, base_out, adapter_indices)
+        return self.apply_lora(x, base_out, routing_info)
 
 
 class LoRAExpert(LoRAMixin, nnx.Module):

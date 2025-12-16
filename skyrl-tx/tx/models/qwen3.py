@@ -3,7 +3,7 @@ import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
-from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed
+from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed, LoRARoutingInfo, compute_lora_routing
 from tx.layers.util import Param, prepare_routing
 from tx.models.configs import Qwen3Config
 from tx.models.types import CausalLMOutput, ModelOutput
@@ -99,15 +99,15 @@ class Qwen3Attention(nnx.Module):
         *,
         attention_mask: jax.Array,
         positions: jax.Array,
-        adapter_indices: jax.Array | None = None,
+        routing_info: LoRARoutingInfo,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         B, T, _ = x.shape
 
         # Project and reshape to [B, T, num_heads, head_dim]
-        q = self.q_norm(self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim))
-        k = self.k_norm(self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(self.q_proj(x, routing_info).reshape(B, T, self.num_heads, self.head_dim))
+        k = self.k_norm(self.k_proj(x, routing_info).reshape(B, T, self.num_kv_heads, self.head_dim))
+        v = self.v_proj(x, routing_info).reshape(B, T, self.num_kv_heads, self.head_dim)
 
         # Apply RoPE
         q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
@@ -132,7 +132,7 @@ class Qwen3Attention(nnx.Module):
         )
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
+        return self.o_proj(output, routing_info), updated_cache
 
 
 class Qwen3MLP(nnx.Module):
@@ -172,10 +172,10 @@ class Qwen3MLP(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        gate_out = self.gate_proj(x, adapter_indices)
-        up_out = self.up_proj(x, adapter_indices)
-        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices)
+    def __call__(self, x: jax.Array, routing_info: LoRARoutingInfo) -> jax.Array:
+        gate_out = self.gate_proj(x, routing_info)
+        up_out = self.up_proj(x, routing_info)
+        return self.down_proj(nnx.silu(gate_out) * up_out, routing_info)
 
 
 class Qwen3Experts(nnx.Module):
@@ -263,14 +263,13 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
         self,
         hidden_states: jax.Array,
         *,
-        adapter_indices: jax.Array | None = None,
+        routing_info: LoRARoutingInfo,
         return_router_logits: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         (batch_size, seq_len, hidden_size) = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_size)
         # Expand adapter_indices to match flattened hidden_states
-        if adapter_indices is not None:
-            adapter_indices = jnp.repeat(adapter_indices, seq_len)
+        adapter_indices = jnp.repeat(routing_info.adapter_indices, seq_len)
         router_logits = self.gate(hidden_states)
 
         hidden_states = self.experts(hidden_states, router_logits, adapter_indices)
@@ -298,7 +297,7 @@ class Qwen3DecoderLayer(nnx.Module):
         *,
         attention_mask: jax.Array,
         positions: jax.Array,
-        adapter_indices: jax.Array | None = None,
+        routing_info: LoRARoutingInfo,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         residual = hidden_states
@@ -307,14 +306,14 @@ class Qwen3DecoderLayer(nnx.Module):
             hidden_states,
             attention_mask=attention_mask,
             positions=positions,
-            adapter_indices=adapter_indices,
+            routing_info=routing_info,
             kv_cache=kv_cache,
         )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(hidden_states, adapter_indices=adapter_indices)
+        mlp_output = self.mlp(hidden_states, routing_info=routing_info)
         hidden_states = residual + mlp_output
 
         return hidden_states, updated_cache
@@ -347,14 +346,14 @@ class Qwen3Model(nnx.Module):
         attention_mask: jax.Array,
         positions: jax.Array,
         output_hidden_states: bool | None = None,
-        adapter_indices: jax.Array | None = None,
+        routing_info: LoRARoutingInfo,
         kv_cache: KVCache | None = None,
     ) -> ModelOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
+        hidden_states = self.embed_tokens(input_ids, routing_info)
         all_hidden_states: list[jax.Array] = []
         updated_keys, updated_values = [], []
 
@@ -366,7 +365,7 @@ class Qwen3Model(nnx.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 positions=positions,
-                adapter_indices=adapter_indices,
+                routing_info=routing_info,
                 kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
             )
             updated_keys.append(k)
@@ -416,25 +415,29 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         attention_mask: jax.Array,
         positions: jax.Array | None = None,
         output_hidden_states: bool | None = None,
-        adapter_indices: jax.Array | None = None,
+        adapter_indices: jax.Array,
         kv_cache: KVCache | None = None,
     ) -> CausalLMOutput:
         if positions is None:
             positions = compute_positions(attention_mask)
+
+        # Compute LoRA routing once for all layers (avoids 1000+ redundant argsort ops)
+        seq_len = input_ids.shape[1]
+        routing_info = compute_lora_routing(adapter_indices, seq_len, self.config.max_lora_adapters)
 
         outputs = self.model(
             input_ids,
             attention_mask=attention_mask,
             positions=positions,
             output_hidden_states=output_hidden_states,
-            adapter_indices=adapter_indices,
+            routing_info=routing_info,
             kv_cache=kv_cache,
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
             logits = hidden_states @ self.model.embed_tokens.embedding.value.T
         else:
-            logits = self.lm_head(hidden_states, adapter_indices=adapter_indices)
+            logits = self.lm_head(hidden_states, routing_info)
 
         return CausalLMOutput(
             logits=logits,
