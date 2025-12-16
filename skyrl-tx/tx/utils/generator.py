@@ -134,14 +134,17 @@ class GeneratorMixin:
             split_keys = jax.vmap(jax.random.split)(s.rngs)
             rngs, sample_keys = split_keys[:, 0], split_keys[:, 1]
 
+            # Replicate logits once to avoid multiple all-gathers during sampling ops
+            logits = jax.lax.with_sharding_constraint(s.logits, jax.sharding.PartitionSpec())
+
             zero_temp_mask = temperatures == 0.0
-            scaled_logits = s.logits / jnp.where(zero_temp_mask, 1.0, temperatures)[:, None]
+            scaled_logits = logits / jnp.where(zero_temp_mask, 1.0, temperatures)[:, None]
             sampled = jax.vmap(lambda key, logit: jax.random.categorical(key, logit, axis=-1))(
                 sample_keys, scaled_logits
             )
-            greedy = jnp.argmax(s.logits, axis=-1)
+            greedy = jnp.argmax(logits, axis=-1)
             next_token = jnp.where(zero_temp_mask[:, None], greedy[:, None], sampled[:, None])
-            log_probs = jax.nn.log_softmax(s.logits, axis=-1)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
             sampled_logprob = jnp.take_along_axis(log_probs, next_token, axis=-1)
 
             # Track first stop token position (-1 means not stopped yet)
