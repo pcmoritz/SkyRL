@@ -121,9 +121,8 @@ class LoRAMixin:
         lora_B = self.lora_B.value
         lora_scaling = self.lora_scaling.value
 
-        # Ensure LoRA weights are fully replicated for ragged_dot.
-        lora_A = jax.lax.with_sharding_constraint(lora_A, jax.sharding.PartitionSpec())
-        lora_B = jax.lax.with_sharding_constraint(lora_B, jax.sharding.PartitionSpec())
+        # LoRA weights are already replicated (initialized with all-None sharding spec)
+        # so no runtime all-gather is needed here
 
         # Use pre-computed routing (avoids redundant argsort per layer)
         x_sorted = x_flat[routing_info.sorted_indices]
@@ -178,8 +177,8 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             max_lora_rank=max_lora_rank,
             shape_A=(max_lora_adapters, num_embeddings, max_lora_rank),
             shape_B=(max_lora_adapters, max_lora_rank, features),
-            sharding_A=(None, sharding[0], None),
-            sharding_B=(None, None, sharding[1]),
+            sharding_A=(None, None, None),  # Replicated for efficient ragged_dot
+            sharding_B=(None, None, None),  # Replicated for efficient ragged_dot
             dtype=param_dtype,
             rngs=rngs,
         )
@@ -229,8 +228,8 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             max_lora_rank=max_lora_rank,
             shape_A=(max_lora_adapters, in_features, max_lora_rank),
             shape_B=(max_lora_adapters, max_lora_rank, out_features),
-            sharding_A=(None, sharding[0], None),
-            sharding_B=(None, None, sharding[1]),
+            sharding_A=(None, None, None),  # Replicated for efficient ragged_dot
+            sharding_B=(None, None, None),  # Replicated for efficient ragged_dot
             dtype=param_dtype,
             rngs=rngs,
         )
@@ -268,8 +267,8 @@ class LoRAExpert(LoRAMixin, nnx.Module):
             max_lora_rank=max_lora_rank,
             shape_A=(max_lora_adapters, num_experts, in_features, max_lora_rank),
             shape_B=(max_lora_adapters, num_experts, max_lora_rank, out_features),
-            sharding_A=(None, sharding[0], sharding[1], None),
-            sharding_B=(None, sharding[0], None, sharding[2]),
+            sharding_A=(None, None, None, None),  # Replicated for efficient ragged_dot
+            sharding_B=(None, None, None, None),  # Replicated for efficient ragged_dot
             dtype=dtype,
             rngs=rngs,
         )
