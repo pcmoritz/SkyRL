@@ -58,6 +58,21 @@ class EngineConfig(BaseModel):
         description="Directory where LoRA models will be extracted for external inference engines",
     )
 
+    # Multi-node distributed training configuration
+    coordinator_address: str | None = Field(
+        default=None,
+        description="Address of the JAX distributed coordinator (host:port). Required for multi-node training.",
+        json_schema_extra={"argparse_type": str},
+    )
+    num_processes: int | None = Field(
+        default=None,
+        description="Total number of processes in the distributed cluster.",
+    )
+    process_id: int | None = Field(
+        default=None,
+        description="ID of this process (0-indexed).",
+    )
+
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):
     """Convert environment variable to expected type."""

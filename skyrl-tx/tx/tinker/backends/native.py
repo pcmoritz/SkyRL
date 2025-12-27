@@ -3,6 +3,10 @@
 This backend implements the full training and inference pipeline for models
 with LoRA adapters. It uses jax.value_and_grad for gradient computation and supports
 multiple LoRA adapters via the AccumulatedGradients dataclass.
+
+Supports multi-node distributed training via JAX distributed. When coordinator_address
+is configured, this backend will initialize JAX distributed across all nodes before
+creating the device mesh.
 """
 
 import time
@@ -38,6 +42,27 @@ from tx.utils.models import (
 )
 from tx.utils.storage import pack_and_upload, download_and_unpack
 from tx.utils.log import logger
+
+
+def initialize_distributed(config: EngineConfig) -> None:
+    """Initialize JAX distributed for multi-node training if configured."""
+    if jax.process_count() > 1:
+        logger.info(f"JAX distributed already initialized: {jax.process_index()}/{jax.process_count()}")
+        return
+
+    if config.coordinator_address is None:
+        logger.info("Running in single-node mode")
+        return
+
+    jax.distributed.initialize(
+        coordinator_address=config.coordinator_address,
+        num_processes=config.num_processes,
+        process_id=config.process_id,
+    )
+    logger.info(
+        f"JAX distributed initialized: process {jax.process_index()}/{jax.process_count()}, "
+        f"devices: {jax.local_device_count()}/{jax.device_count()}"
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -95,6 +120,9 @@ class NativeBackend(AbstractBackend):
         """Initialize Native LoRA backend."""
         self.config = config
         self.metrics = types.EngineMetrics()
+
+        # Initialize JAX distributed for multi-node training (must happen before mesh creation)
+        initialize_distributed(config)
 
         # Initialize the shared base model with LoRA config
         checkpoint_path = resolve_model_path(config.base_model)
