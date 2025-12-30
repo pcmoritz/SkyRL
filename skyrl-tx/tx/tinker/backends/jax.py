@@ -67,6 +67,7 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         default=False,
         description="Whether to use gradient checkpointing (full recomputation strategy)",
     )
+    expert_parallel_size: int = Field(default=1, description="Expert parallelism degree for MoE models")
 
 
 @jax.tree_util.register_dataclass
@@ -135,13 +136,24 @@ class JaxBackend(AbstractBackend):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             shard_attention_heads=config.shard_attention_heads,
+            expert_parallel_size=config.expert_parallel_size,
         )
+
+        # Validate expert parallelism configuration
+        if config.expert_parallel_size > 1:
+            num_experts = getattr(base_config, "num_experts", 1)
+            if num_experts % config.expert_parallel_size != 0:
+                raise ValueError(
+                    f"num_experts ({num_experts}) must be divisible by "
+                    f"expert_parallel_size ({config.expert_parallel_size})"
+                )
 
         model_class = get_model_class(self.model_config)
 
-        # Create model and load weights
+        # Create model and load weights with 3D mesh (fsdp, ep, tp)
         self.mesh = jax.make_mesh(
-            (config.fully_sharded_data_parallel_size, config.tensor_parallel_size), ("fsdp", "tp")
+            (config.fully_sharded_data_parallel_size, config.expert_parallel_size, config.tensor_parallel_size),
+            ("fsdp", "ep", "tp"),
         )
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))

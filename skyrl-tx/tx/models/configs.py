@@ -14,12 +14,14 @@ class ModelConfig(PretrainedConfig):
         max_lora_adapters: Maximum number of concurrent LoRA adapters
         max_lora_rank: Maximum rank for LoRA adapters
         shard_attention_heads: Whether to shard attention across tensor parallel devices
+        expert_parallel_size: Number of devices to shard experts across for MoE models
     """
 
     # Type hints for LoRA attributes
     max_lora_adapters: int
     max_lora_rank: int
     shard_attention_heads: bool
+    expert_parallel_size: int
 
     def __init__(
         self,
@@ -28,6 +30,7 @@ class ModelConfig(PretrainedConfig):
         max_lora_adapters: int,
         max_lora_rank: int,
         shard_attention_heads: bool,
+        expert_parallel_size: int = 1,
     ):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
@@ -36,6 +39,7 @@ class ModelConfig(PretrainedConfig):
         self.max_lora_adapters = max_lora_adapters
         self.max_lora_rank = max_lora_rank
         self.shard_attention_heads = shard_attention_heads
+        self.expert_parallel_size = expert_parallel_size
 
 
 # Model-specific aliases for clarity and backwards compatibility

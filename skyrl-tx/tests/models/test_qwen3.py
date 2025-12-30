@@ -165,6 +165,42 @@ def test_qwen3_moe_layer_lora():
             assert np.allclose(output_with_lora[sample_idx : sample_idx + 1], output_merged, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_qwen3_moe_layer_expert_parallel(ep_size: int):
+    """Test MoE layer with expert parallelism."""
+    if not jax._src.xla_bridge.backends_are_initialized():
+        jax.config.update("jax_num_cpu_devices", max(2, ep_size))
+
+    model_name = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+    base_config = PretrainedConfig.from_pretrained(model_name)
+
+    # Create config with EP
+    config = Qwen3Config(
+        base_config,
+        max_lora_adapters=0,
+        max_lora_rank=0,
+        shard_attention_heads=True,
+        expert_parallel_size=ep_size,
+    )
+
+    hf_moe_layer = hf_model.model.layers[0].mlp
+    x = torch.randn(4, 2, config.hidden_size)
+    with torch.no_grad():
+        hf_final_hidden_states, hf_router_logits = hf_moe_layer.forward(x)
+
+    # Create 3D mesh with EP axis
+    mesh = jax.make_mesh((1, ep_size, 1), ("fsdp", "ep", "tp"))
+    with jax.set_mesh(mesh):
+        moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        load_moe_base_weights(moe_layer, hf_moe_layer)
+
+    final_hidden_states, router_logits = moe_layer(x.numpy(), return_router_logits=True)
+
+    assert np.allclose(hf_router_logits, router_logits, rtol=1e-4)
+    assert np.allclose(hf_final_hidden_states, final_hidden_states, rtol=1e-2, atol=1e-2)
+
+
 def test_qwen3_lora():
     """Test multi-LoRA implementation by comparing with HuggingFace PEFT model using two different adapters."""
     base_model_name = "Qwen/Qwen3-0.6B"

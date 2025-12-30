@@ -1,7 +1,10 @@
+from functools import partial
+
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
 from tx.layers.util import prepare_routing
@@ -164,6 +167,11 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+
+        # Determine expert sharding based on expert parallelism
+        ep_size = get_abstract_mesh().shape.get("ep", 1)
+        expert_shard = "ep" if ep_size > 1 else None
+
         self.gate_proj = LoRAExpert(
             config.num_experts,
             config.hidden_size,
@@ -171,7 +179,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (expert_shard, "fsdp", "tp")),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +189,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (expert_shard, "fsdp", "tp")),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,7 +199,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (expert_shard, "tp", "fsdp")),
             rngs=rngs,
         )
 
@@ -202,6 +210,27 @@ class Qwen3Experts(nnx.Module):
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
 
+        ep_size = get_abstract_mesh().shape.get("ep", 1)
+
+        if ep_size > 1:
+            # Expert parallel path: use all-to-all to dispatch tokens to correct devices
+            return self._forward_with_ep(
+                hidden_states, selected_experts, routing_weights, adapter_indices, ep_size
+            )
+        else:
+            # Non-EP path: all experts on all devices
+            return self._forward_without_ep(
+                hidden_states, selected_experts, routing_weights, adapter_indices
+            )
+
+    def _forward_without_ep(
+        self,
+        hidden_states: jax.Array,
+        selected_experts: jax.Array,
+        routing_weights: jax.Array,
+        adapter_indices: jax.Array | None,
+    ) -> jax.Array:
+        """Standard forward pass without expert parallelism."""
         # Prepare for ragged_dot by sorting tokens based on their assigned expert
         selected_experts_flat = selected_experts.ravel()
         hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
@@ -224,6 +253,83 @@ class Qwen3Experts(nnx.Module):
         unsorted_out = down_out[unsort_indices]
         reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
         return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+
+    def _forward_with_ep(
+        self,
+        hidden_states: jax.Array,
+        selected_experts: jax.Array,
+        routing_weights: jax.Array,
+        adapter_indices: jax.Array | None,
+        ep_size: int,
+    ) -> jax.Array:
+        """Forward pass with expert parallelism using all-to-all communication.
+
+        When expert parallelism is enabled:
+        1. Tokens are dispatched to the device holding their assigned expert via all-to-all
+        2. Each device processes only its local subset of experts
+        3. Results are returned to original devices via reverse all-to-all
+        """
+        num_tokens = hidden_states.shape[0]
+        experts_per_device = self.config.num_experts // ep_size
+
+        # Flatten for routing: each token goes to num_experts_per_tok experts
+        selected_experts_flat = selected_experts.ravel()  # (num_tokens * k,)
+        routing_weights_flat = routing_weights.ravel()  # (num_tokens * k,)
+        hidden_states_expanded = jnp.repeat(
+            hidden_states, self.config.num_experts_per_tok, axis=0
+        )  # (num_tokens * k, hidden)
+
+        # Compute target device and local expert ID for each token-expert pair
+        target_device = selected_experts_flat // experts_per_device
+        local_expert_id = selected_experts_flat % experts_per_device
+
+        # Sort by target device for all-to-all
+        sort_idx = jnp.argsort(target_device)
+        unsort_idx = jnp.argsort(sort_idx)
+
+        tokens_sorted = hidden_states_expanded[sort_idx]
+        local_expert_sorted = local_expert_id[sort_idx]
+        weights_sorted = routing_weights_flat[sort_idx]
+
+        # All-to-all: dispatch tokens to devices holding their assigned experts
+        received_tokens = jax.lax.all_to_all(
+            tokens_sorted, axis_name="ep", split_axis=0, concat_axis=0, tiled=True
+        )
+        received_expert_ids = jax.lax.all_to_all(
+            local_expert_sorted, axis_name="ep", split_axis=0, concat_axis=0, tiled=True
+        )
+        received_weights = jax.lax.all_to_all(
+            weights_sorted, axis_name="ep", split_axis=0, concat_axis=0, tiled=True
+        )
+
+        # Sort received tokens by local expert for ragged_dot
+        local_sort_idx = jnp.argsort(received_expert_ids)
+        local_unsort_idx = jnp.argsort(local_sort_idx)
+
+        local_tokens_sorted = received_tokens[local_sort_idx]
+        local_group_sizes = jnp.bincount(received_expert_ids, length=experts_per_device)
+
+        # Apply local expert layers (each device only has experts_per_device experts)
+        # Note: LoRA is disabled in EP mode for now (adapter_indices_sorted=None)
+        gate_out = self.gate_proj(local_tokens_sorted, local_group_sizes, None)
+        up_out = self.up_proj(local_tokens_sorted, local_group_sizes, None)
+        local_out_sorted = self.down_proj(nnx.silu(gate_out) * up_out, local_group_sizes, None)
+
+        # Unsort and apply routing weights
+        local_out = local_out_sorted[local_unsort_idx]
+        local_out_weighted = local_out * received_weights[:, None]
+
+        # Reverse all-to-all: return outputs to original devices
+        gathered_out = jax.lax.all_to_all(
+            local_out_weighted, axis_name="ep", split_axis=0, concat_axis=0, tiled=True
+        )
+
+        # Restore original token order
+        output_expanded = gathered_out[unsort_idx]
+
+        # Reshape and sum over k experts per token
+        reshaped_out = output_expanded.reshape(num_tokens, self.config.num_experts_per_tok, self.config.hidden_size)
+        return jnp.sum(reshaped_out, axis=1)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
