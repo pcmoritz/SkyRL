@@ -16,6 +16,15 @@ from tx.models.configs import Qwen3Config
 from tx.models.qwen3 import Qwen3ForCausalLM, Qwen3MoeSparseMoeBlock
 from tx.utils.models import load_safetensors
 
+if not jax._src.xla_bridge.backends_are_initialized():  # type: ignore
+    jax.config.update("jax_num_cpu_devices", 2)
+
+
+def make_qwen_mesh(tp: int = 1, ep: int = 1):
+    if ep > 1:
+        return jax.make_mesh((1, ep, tp), ("fsdp", "ep", "tp"))
+    return jax.make_mesh((1, tp), ("fsdp", "tp"))
+
 
 @pytest.mark.parametrize("tp", [1, 2])
 def test_qwen3(tp: int):
@@ -43,7 +52,7 @@ def test_qwen3(tp: int):
 
         base_config = PretrainedConfig.from_pretrained("Qwen/Qwen3-0.6B")
         config = Qwen3Config(base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True)
-        mesh = jax.make_mesh((1, tp), ("fsdp", "tp"))
+        mesh = make_qwen_mesh(tp=tp)
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)
@@ -64,10 +73,13 @@ def load_moe_base_weights(jax_moe_layer: Qwen3MoeSparseMoeBlock, hf_moe_layer: H
         jax_moe_layer.experts.down_proj.weight[i, :, :] = expert.down_proj.weight.detach().numpy().T
 
 
-def test_qwen3_moe_layer():
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_qwen3_moe_layer(ep_size: int):
     model_name = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
     base_config = PretrainedConfig.from_pretrained(model_name)
+    if base_config.num_experts % ep_size != 0:
+        pytest.skip(f"num_experts={base_config.num_experts} not divisible by ep_size={ep_size}")
     config = Qwen3Config(base_config, max_lora_adapters=0, max_lora_rank=0, shard_attention_heads=True)
 
     hf_moe_layer = hf_model.model.layers[0].mlp
@@ -75,7 +87,7 @@ def test_qwen3_moe_layer():
     with torch.no_grad():
         hf_final_hidden_states, hf_router_logits = hf_moe_layer.forward(x)
 
-    mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
+    mesh = make_qwen_mesh(ep=ep_size)
     with jax.set_mesh(mesh):
         moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_moe_base_weights(moe_layer, hf_moe_layer)
@@ -107,17 +119,20 @@ def load_lora_weights(
     jax_module.lora_ranks.value = jax_module.lora_ranks.value.at[adapter_idx].set(rank)
 
 
-def test_qwen3_moe_layer_lora():
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_qwen3_moe_layer_lora(ep_size: int):
     """Test MoE LoRA by merging adapter into base weights and comparing outputs."""
     model_name = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
     base_config = PretrainedConfig.from_pretrained(model_name)
+    if base_config.num_experts % ep_size != 0:
+        pytest.skip(f"num_experts={base_config.num_experts} not divisible by ep_size={ep_size}")
     config = Qwen3Config(base_config, max_lora_adapters=3, max_lora_rank=4, shard_attention_heads=True)
 
     hf_moe_layer = hf_model.model.layers[0].mlp
     x = torch.randn(3, 4, config.hidden_size)
 
-    mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
+    mesh = make_qwen_mesh(ep=ep_size)
     with jax.set_mesh(mesh):
         moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_moe_base_weights(moe_layer, hf_moe_layer)
@@ -216,7 +231,7 @@ def test_qwen3_lora():
             shard_attention_heads=True,
         )
 
-        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
+        mesh = make_qwen_mesh()
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
             load_safetensors(base_tmp, config, model)

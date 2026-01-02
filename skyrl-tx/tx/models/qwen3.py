@@ -164,6 +164,16 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        mesh = get_abstract_mesh()
+        ep_shard = None
+        ep_size = 1
+        if mesh is not None:
+            ep_size = mesh.shape.get("ep", 1)
+            ep_shard = "ep" if "ep" in mesh.shape else None
+        if ep_size > 1:
+            assert (
+                config.num_experts % ep_size == 0
+            ), f"num_experts={config.num_experts} must be divisible by expert parallel size {ep_size}"
         self.gate_proj = LoRAExpert(
             config.num_experts,
             config.hidden_size,
@@ -171,7 +181,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (ep_shard, "fsdp", "tp")),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +191,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (ep_shard, "fsdp", "tp")),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,7 +201,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (ep_shard, "tp", "fsdp")),
             rngs=rngs,
         )
 

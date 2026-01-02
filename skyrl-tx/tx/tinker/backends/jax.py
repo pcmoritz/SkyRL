@@ -62,6 +62,7 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     max_lora_adapters: int = Field(default=32, description="Maximum number of LoRA adapters")
     max_lora_rank: int = Field(default=32, description="Maximum LoRA rank")
     tensor_parallel_size: int = Field(default=1, description="Tensor parallelism degree to use for the model")
+    expert_parallel_size: int = Field(default=1, description="Expert parallelism degree to use for the model")
     fully_sharded_data_parallel_size: int = Field(
         default=1, description="Fully sharded data parallelism degree for the model"
     )
@@ -142,7 +143,7 @@ class JaxBackendImpl(AbstractBackend):
 
     This backend:
     - Uses jax.value_and_grad for gradient computation
-    - Uses 2D mesh (fsdp, tp) for fully sharded data parallelism and tensor parallelism
+    - Uses 2D mesh (fsdp, tp) or 3D mesh (fsdp, ep, tp) when expert parallelism is enabled
     - Supports multiple LoRA adapters via AccumulatedGradients with counts array
     - Supports both FORWARD and FORWARD_BACKWARD request types
     """
@@ -167,9 +168,25 @@ class JaxBackendImpl(AbstractBackend):
         model_class = get_model_class(self.model_config)
 
         # Create model and load weights
-        self.mesh = jax.make_mesh(
-            (config.fully_sharded_data_parallel_size, config.tensor_parallel_size), ("fsdp", "tp")
-        )
+        if config.expert_parallel_size > 1 and not getattr(self.model_config, "num_experts", None):
+            raise ValueError("expert_parallel_size > 1 requires a base model with MoE experts")
+        if (
+            config.expert_parallel_size > 1
+            and getattr(self.model_config, "num_experts", None)
+            and self.model_config.num_experts % config.expert_parallel_size != 0
+        ):
+            raise ValueError(
+                f"expert_parallel_size={config.expert_parallel_size} must divide num_experts={self.model_config.num_experts}"
+            )
+
+        mesh_axes = ["fsdp"]
+        mesh_shape = [config.fully_sharded_data_parallel_size]
+        if config.expert_parallel_size > 1:
+            mesh_axes.append("ep")
+            mesh_shape.append(config.expert_parallel_size)
+        mesh_axes.append("tp")
+        mesh_shape.append(config.tensor_parallel_size)
+        self.mesh = jax.make_mesh(tuple(mesh_shape), tuple(mesh_axes))
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
             load_safetensors(checkpoint_path, self.model_config, self.model)
@@ -191,7 +208,9 @@ class JaxBackendImpl(AbstractBackend):
 
         logger.info(
             f"Initialized base model {base_model} with "
-            f"max_lora_adapters={config.max_lora_adapters}, max_lora_rank={config.max_lora_rank}"
+            f"max_lora_adapters={config.max_lora_adapters}, "
+            f"max_lora_rank={config.max_lora_rank}, "
+            f"expert_parallel_size={config.expert_parallel_size}"
         )
 
         self._create_loss_and_grad_fn()

@@ -54,6 +54,7 @@ def train(
         parser=json.loads,
     ),
     tp_size: int = typer.Option(1, "--tp-size", help="Tensor parallelism degree to use for the model"),
+    ep_size: int = typer.Option(1, "--ep-size", help="Expert parallelism degree to use for the model"),
     tracker_name: ExperimentTracker | None = typer.Option(
         None, "--tracker", help="Experiment tracker to report results to"
     ),
@@ -65,7 +66,7 @@ def train(
     ),
 ) -> None:
     if not jax._src.xla_bridge.backends_are_initialized():  # ty: ignore
-        jax.config.update("jax_num_cpu_devices", tp_size)
+        jax.config.update("jax_num_cpu_devices", tp_size * max(1, ep_size))
         # If you want to debug NaNs, add the following:
         # jax.config.update("jax_debug_nans", True)
 
@@ -82,7 +83,10 @@ def train(
     loader = get_loader(loader_name)
 
     model_class = get_model_class(base_config)
-    mesh = jax.make_mesh((1, tp_size), ("fsdp", "tp"))
+    if ep_size > 1:
+        mesh = jax.make_mesh((1, ep_size, tp_size), ("fsdp", "ep", "tp"))
+    else:
+        mesh = jax.make_mesh((1, tp_size), ("fsdp", "tp"))
     with jax.set_mesh(mesh):
         model = model_class(config, dtype=get_dtype(config.dtype), rngs=nnx.Rngs(0))
         optimizer = nnx.Optimizer(model, get_optimizer(optimizer_name, optimizer_args), wrt=nnx.Param)
