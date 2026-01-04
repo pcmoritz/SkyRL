@@ -296,10 +296,13 @@ class Qwen3Experts(nnx.Module):
                  out_specs=P("ep", None, None), check_rep=False)
         def ep_ragged_mlp(hidden, group_sizes, adapters, gw, uw, dw, gA, gB, gs, uA, uB, us, dA, dB, ds):
             hidden, group_sizes, adapters = hidden.squeeze(0), group_sizes.squeeze(0), adapters.squeeze(0)
-            gate = apply_lora(hidden, jax.lax.ragged_dot(hidden, gw, group_sizes), group_sizes, adapters, gA, gB, gs)
-            up = apply_lora(hidden, jax.lax.ragged_dot(hidden, uw, group_sizes), group_sizes, adapters, uA, uB, us)
+            # Pad group_sizes so ragged_dot processes all capacity tokens (padding goes to last expert)
+            padding_count = capacity - group_sizes.sum()
+            group_sizes_padded = group_sizes.at[-1].add(padding_count)
+            gate = apply_lora(hidden, jax.lax.ragged_dot(hidden, gw, group_sizes_padded), group_sizes_padded, adapters, gA, gB, gs)
+            up = apply_lora(hidden, jax.lax.ragged_dot(hidden, uw, group_sizes_padded), group_sizes_padded, adapters, uA, uB, us)
             down_in = nnx.silu(gate) * up
-            down = apply_lora(down_in, jax.lax.ragged_dot(down_in, dw, group_sizes), group_sizes, adapters, dA, dB, ds)
+            down = apply_lora(down_in, jax.lax.ragged_dot(down_in, dw, group_sizes_padded), group_sizes_padded, adapters, dA, dB, ds)
             return down[None]
 
         output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, adapter_ep, gate_w, up_w, down_w,
