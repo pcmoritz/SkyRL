@@ -270,11 +270,13 @@ class Qwen3Experts(nnx.Module):
                  in_specs=(P("ep", None, None), P("ep", None), P("ep", None, None), P("ep", None, None), P("ep", None, None)),
                  out_specs=P("ep", None, None), check_rep=False)
         def ep_ragged_mlp(hidden, group_sizes, gate_w, up_w, down_w):
-            # Local ragged_dot with local experts
+            # Squeeze: each device sees [1, capacity, hidden] -> [capacity, hidden]
+            hidden = hidden.squeeze(0)
+            group_sizes = group_sizes.squeeze(0)
             gate_out = jax.lax.ragged_dot(hidden, gate_w, group_sizes)
             up_out = jax.lax.ragged_dot(hidden, up_w, group_sizes)
             down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, down_w, group_sizes)
-            return down_out
+            return down_out[None]  # Restore batch dim for output
 
         output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, gate_w, up_w, down_w)
 
