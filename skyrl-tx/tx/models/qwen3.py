@@ -261,11 +261,8 @@ class Qwen3Experts(nnx.Module):
         hidden_ep = jnp.zeros((ep_size, capacity, hidden_states.shape[1]), dtype=hidden_states.dtype)
         hidden_ep = hidden_ep.at[sorted_target_device, position_in_device].set(sorted_hidden)
 
-        expert_ep = jnp.full((ep_size, capacity), 0, dtype=jnp.int32)
-        expert_ep = expert_ep.at[sorted_target_device, position_in_device].set(sorted_local_expert)
-
-        # Compute group_sizes per device from actual token counts (not including padding)
-        group_sizes_ep = jax.vmap(lambda e: jnp.bincount(e, length=experts_per_device))(expert_ep)
+        # Compute group_sizes from actual tokens (before padding) - count per global expert, reshape to [ep, local]
+        group_sizes_ep = jnp.bincount(selected_experts, length=self.config.num_experts).reshape(ep_size, experts_per_device)
 
         # Get weight values for shard_map
         gate_w, up_w, down_w = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
