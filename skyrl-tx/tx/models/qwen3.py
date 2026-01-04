@@ -220,6 +220,15 @@ class Qwen3Experts(nnx.Module):
             adapter_indices=adapter_indices_expanded,
         )
 
+        # For EP: hint that sorted tokens should be distributed to match expert sharding
+        # Since tokens are sorted by expert, and experts are sharded on "ep", this should
+        # cause XLA to use all-to-all instead of all-gathering the weights
+        mesh = get_abstract_mesh()
+        if mesh and "ep" in mesh.shape:
+            hidden_states_sorted = jax.lax.with_sharding_constraint(
+                hidden_states_sorted, jax.sharding.PartitionSpec("ep", None)
+            )
+
         # Apply expert layers using LoRAExpert
         gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
         up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
