@@ -245,22 +245,26 @@ class Qwen3Experts(nnx.Module):
         target_device = selected_experts // experts_per_device
         local_expert = selected_experts % experts_per_device
 
-        # Sort by target device to group tokens by destination
-        sort_idx = jnp.argsort(target_device)
+        # Sort by selected_experts = (target_device, local_expert) to group by device AND sort by expert
+        sort_idx = jnp.argsort(selected_experts)
         sorted_hidden = hidden_states[sort_idx]
         sorted_local_expert = local_expert[sort_idx]
+        sorted_target_device = target_device[sort_idx]
         sorted_adapter = adapter_indices[sort_idx] if adapter_indices is not None else None
 
-        # Pad to [ep_size, capacity, ...] for even sharding
-        def pad_and_reshape(x, fill=0):
-            padded = jnp.full((ep_size * capacity,) + x.shape[1:], fill, dtype=x.dtype)
-            return padded.at[:num_tokens].set(x).reshape((ep_size, capacity) + x.shape[1:])
+        # Count tokens per device and compute position within each device's buffer
+        tokens_per_device = jnp.bincount(target_device, length=ep_size)
+        device_start = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), tokens_per_device.cumsum()[:-1]])
+        position_in_device = jnp.arange(num_tokens) - device_start[sorted_target_device]
 
-        hidden_ep = pad_and_reshape(sorted_hidden)
-        expert_ep = pad_and_reshape(sorted_local_expert, fill=0)  # padding -> expert 0 (output discarded anyway)
-        adapter_ep = pad_and_reshape(sorted_adapter) if sorted_adapter is not None else None
+        # Scatter into [ep_size, capacity, hidden] - properly placing each device's tokens
+        hidden_ep = jnp.zeros((ep_size, capacity, hidden_states.shape[1]), dtype=hidden_states.dtype)
+        hidden_ep = hidden_ep.at[sorted_target_device, position_in_device].set(sorted_hidden)
 
-        # Compute group_sizes per device: [ep_size, experts_per_device]
+        expert_ep = jnp.full((ep_size, capacity), 0, dtype=jnp.int32)
+        expert_ep = expert_ep.at[sorted_target_device, position_in_device].set(sorted_local_expert)
+
+        # Compute group_sizes per device from actual token counts (not including padding)
         group_sizes_ep = jax.vmap(lambda e: jnp.bincount(e, length=experts_per_device))(expert_ep)
 
         # Get weight values for shard_map
@@ -280,9 +284,9 @@ class Qwen3Experts(nnx.Module):
 
         output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, gate_w, up_w, down_w)
 
-        # Unpad and restore original order
-        output_flat = output_ep.reshape(-1, self.config.hidden_size)[:num_tokens]
-        return output_flat[jnp.argsort(sort_idx)]
+        # Gather outputs from scattered positions and restore original order
+        output_sorted = output_ep[sorted_target_device, position_in_device]
+        return output_sorted[jnp.argsort(sort_idx)]
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
