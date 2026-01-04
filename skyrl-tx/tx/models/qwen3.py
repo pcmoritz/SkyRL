@@ -257,11 +257,11 @@ class Qwen3Experts(nnx.Module):
             return padded.at[:num_tokens].set(x).reshape((ep_size, capacity) + x.shape[1:])
 
         hidden_ep = pad_and_reshape(sorted_hidden)
-        expert_ep = pad_and_reshape(sorted_local_expert, fill=experts_per_device)  # padding -> dummy expert
+        expert_ep = pad_and_reshape(sorted_local_expert, fill=0)  # padding -> expert 0 (output discarded anyway)
         adapter_ep = pad_and_reshape(sorted_adapter) if sorted_adapter is not None else None
 
-        # Compute group_sizes per device: [ep_size, experts_per_device + 1]
-        group_sizes_ep = jax.vmap(lambda e: jnp.bincount(e, length=experts_per_device + 1))(expert_ep)
+        # Compute group_sizes per device: [ep_size, experts_per_device]
+        group_sizes_ep = jax.vmap(lambda e: jnp.bincount(e, length=experts_per_device))(expert_ep)
 
         # Get weight values for shard_map
         gate_w, up_w, down_w = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
