@@ -1,7 +1,10 @@
+from functools import partial
+
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import get_abstract_mesh, PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
 from tx.layers.util import prepare_routing
@@ -213,31 +216,71 @@ class Qwen3Experts(nnx.Module):
         adapter_indices_expanded = (
             jnp.repeat(adapter_indices, self.config.num_experts_per_tok) if adapter_indices is not None else None
         )
-        hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
-            hidden_states_expanded,
-            selected_experts_flat,
-            self.config.num_experts,
-            adapter_indices=adapter_indices_expanded,
-        )
-
-        # For EP: hint that sorted tokens should be distributed to match expert sharding
-        # Since tokens are sorted by expert, and experts are sharded on "ep", this should
-        # cause XLA to use all-to-all instead of all-gathering the weights
         mesh = get_abstract_mesh()
-        if mesh and "ep" in mesh.shape:
-            hidden_states_sorted = jax.lax.with_sharding_constraint(
-                hidden_states_sorted, jax.sharding.PartitionSpec("ep", None)
+        ep_size = mesh.shape.get("ep", 1) if mesh else 1
+
+        if ep_size > 1:
+            expert_out = self._forward_ep(
+                hidden_states_expanded, selected_experts_flat, adapter_indices_expanded, mesh, ep_size
             )
+        else:
+            hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
+                hidden_states_expanded, selected_experts_flat, self.config.num_experts, adapter_indices=adapter_indices_expanded
+            )
+            gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
+            up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
+            down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
+            expert_out = down_out[unsort_indices]
 
-        # Apply expert layers using LoRAExpert
-        gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
-
-        # Unsort and combine the expert outputs
-        unsorted_out = down_out[unsort_indices]
-        reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
+        reshaped_out = expert_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
         return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+
+    def _forward_ep(self, hidden_states, selected_experts, adapter_indices, mesh, ep_size):
+        """EP forward using shard_map to keep ragged_dot local per device."""
+        num_tokens = hidden_states.shape[0]
+        experts_per_device = self.config.num_experts // ep_size
+        capacity = (num_tokens + ep_size - 1) // ep_size
+
+        # Map global expert -> (target_device, local_expert)
+        target_device = selected_experts // experts_per_device
+        local_expert = selected_experts % experts_per_device
+
+        # Sort by target device to group tokens by destination
+        sort_idx = jnp.argsort(target_device)
+        sorted_hidden = hidden_states[sort_idx]
+        sorted_local_expert = local_expert[sort_idx]
+        sorted_adapter = adapter_indices[sort_idx] if adapter_indices is not None else None
+
+        # Pad to [ep_size, capacity, ...] for even sharding
+        def pad_and_reshape(x, fill=0):
+            padded = jnp.full((ep_size * capacity,) + x.shape[1:], fill, dtype=x.dtype)
+            return padded.at[:num_tokens].set(x).reshape((ep_size, capacity) + x.shape[1:])
+
+        hidden_ep = pad_and_reshape(sorted_hidden)
+        expert_ep = pad_and_reshape(sorted_local_expert, fill=experts_per_device)  # padding -> dummy expert
+        adapter_ep = pad_and_reshape(sorted_adapter) if sorted_adapter is not None else None
+
+        # Compute group_sizes per device: [ep_size, experts_per_device + 1]
+        group_sizes_ep = jax.vmap(lambda e: jnp.bincount(e, length=experts_per_device + 1))(expert_ep)
+
+        # Get weight values for shard_map
+        gate_w, up_w, down_w = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P("ep", None, None), P("ep", None), P("ep", None, None), P("ep", None, None), P("ep", None, None)),
+                 out_specs=P("ep", None, None), check_rep=False)
+        def ep_ragged_mlp(hidden, group_sizes, gate_w, up_w, down_w):
+            # Local ragged_dot with local experts
+            gate_out = jax.lax.ragged_dot(hidden, gate_w, group_sizes)
+            up_out = jax.lax.ragged_dot(hidden, up_w, group_sizes)
+            down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, down_w, group_sizes)
+            return down_out
+
+        output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, gate_w, up_w, down_w)
+
+        # Unpad and restore original order
+        output_flat = output_ep.reshape(-1, self.config.hidden_size)[:num_tokens]
+        return output_flat[jnp.argsort(sort_idx)]
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
