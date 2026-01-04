@@ -264,22 +264,46 @@ class Qwen3Experts(nnx.Module):
         # Compute group_sizes from actual tokens (before padding) - count per global expert, reshape to [ep, local]
         group_sizes_ep = jnp.bincount(selected_experts, length=self.config.num_experts).reshape(ep_size, experts_per_device)
 
-        # Get weight values for shard_map
+        # Scatter adapter indices
+        adapter_ep = jnp.zeros((ep_size, capacity), dtype=jnp.int32)
+        adapter_ep = adapter_ep.at[sorted_target_device, position_in_device].set(sorted_adapter)
+
+        # Extract all weights for shard_map
         gate_w, up_w, down_w = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
+        gate_lora = (self.gate_proj.lora_A.value, self.gate_proj.lora_B.value, self.gate_proj.lora_scaling.value)
+        up_lora = (self.up_proj.lora_A.value, self.up_proj.lora_B.value, self.up_proj.lora_scaling.value)
+        down_lora = (self.down_proj.lora_A.value, self.down_proj.lora_B.value, self.down_proj.lora_scaling.value)
+        max_lora_rank = self.gate_proj.lora_A.value.shape[-1]
+        max_adapters = self.gate_proj.lora_A.value.shape[0]
+
+        def apply_lora(x, base_out, group_sizes, adapter_indices, lora_A, lora_B, lora_scaling):
+            """Apply LoRA for local experts."""
+            expert_indices = jnp.repeat(jnp.arange(experts_per_device), group_sizes, total_repeat_length=x.shape[0])
+            flat_idx = adapter_indices * experts_per_device + expert_indices
+            num_flat = max_adapters * experts_per_device
+            lora_A_flat = lora_A.reshape(num_flat, lora_A.shape[-2], max_lora_rank)
+            lora_B_flat = lora_B.reshape(num_flat, max_lora_rank, lora_B.shape[-1])
+            x_sorted, sizes, unsort, _ = prepare_routing(x, flat_idx, num_flat)
+            lora_out = jax.lax.ragged_dot(jax.lax.ragged_dot(x_sorted, lora_A_flat, sizes), lora_B_flat, sizes)
+            return base_out + lora_out[unsort] * lora_scaling[adapter_indices, None]
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(P("ep", None, None), P("ep", None), P("ep", None, None), P("ep", None, None), P("ep", None, None)),
+                 in_specs=(P("ep", None, None), P("ep", None), P("ep", None),
+                           P("ep", None, None), P("ep", None, None), P("ep", None, None),
+                           P(None, "ep", None, None), P(None, "ep", None, None), P(None),
+                           P(None, "ep", None, None), P(None, "ep", None, None), P(None),
+                           P(None, "ep", None, None), P(None, "ep", None, None), P(None)),
                  out_specs=P("ep", None, None), check_rep=False)
-        def ep_ragged_mlp(hidden, group_sizes, gate_w, up_w, down_w):
-            # Squeeze: each device sees [1, capacity, hidden] -> [capacity, hidden]
-            hidden = hidden.squeeze(0)
-            group_sizes = group_sizes.squeeze(0)
-            gate_out = jax.lax.ragged_dot(hidden, gate_w, group_sizes)
-            up_out = jax.lax.ragged_dot(hidden, up_w, group_sizes)
-            down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, down_w, group_sizes)
-            return down_out[None]  # Restore batch dim for output
+        def ep_ragged_mlp(hidden, group_sizes, adapters, gw, uw, dw, gA, gB, gs, uA, uB, us, dA, dB, ds):
+            hidden, group_sizes, adapters = hidden.squeeze(0), group_sizes.squeeze(0), adapters.squeeze(0)
+            gate = apply_lora(hidden, jax.lax.ragged_dot(hidden, gw, group_sizes), group_sizes, adapters, gA, gB, gs)
+            up = apply_lora(hidden, jax.lax.ragged_dot(hidden, uw, group_sizes), group_sizes, adapters, uA, uB, us)
+            down_in = nnx.silu(gate) * up
+            down = apply_lora(down_in, jax.lax.ragged_dot(down_in, dw, group_sizes), group_sizes, adapters, dA, dB, ds)
+            return down[None]
 
-        output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, gate_w, up_w, down_w)
+        output_ep = ep_ragged_mlp(hidden_ep, group_sizes_ep, adapter_ep, gate_w, up_w, down_w,
+                                  *gate_lora, *up_lora, *down_lora)
 
         # Gather outputs from scattered positions and restore original order
         output_sorted = output_ep[sorted_target_device, position_in_device]
