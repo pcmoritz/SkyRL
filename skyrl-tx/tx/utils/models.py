@@ -100,6 +100,8 @@ def load_safetensors(
         tensors.update(safetensors.numpy.load_file(file))
     tensors = {k.removeprefix(prefix): v for k, v in tensors.items()}
 
+    num_experts = getattr(config, "num_experts", None) or 0
+
     model_params = nnx.to_flat_state(nnx.state(model))
     updates = []
     for path, param in model_params:
@@ -110,12 +112,15 @@ def load_safetensors(
         if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path):
             continue
         if "experts" in path:
-            tensors[key] = np.stack([tensors[get_expert_key(path, i)].T for i in range(config.num_experts)], axis=0)
+            # Load all experts - JAX handles sharding via device_put with param.sharding
+            tensors[key] = np.stack(
+                [tensors[get_expert_key(path, i)].T for i in range(num_experts)], axis=0
+            )
         else:
             tensors[key] = tensors[key] if "embed_tokens" in path else tensors[key].T
         if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
             tensors[key] = tensors[key].reshape(param.shape)
-        assert param.shape == tensors[key].shape, f"shape mismatch for {key}"
+        assert param.shape == tensors[key].shape, f"shape mismatch for {key}: expected {param.shape}, got {tensors[key].shape}"
         sharded_tensor = jax.device_put(tensors[key].astype(param.dtype), param.sharding)
         updates.append((path, sharded_tensor))
     nnx.update(model, nnx.from_flat_state(updates))

@@ -65,6 +65,9 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     fully_sharded_data_parallel_size: int = Field(
         default=1, description="Fully sharded data parallelism degree for the model"
     )
+    expert_parallel_size: int = Field(
+        default=1, description="Expert parallelism degree for MoE models. Must divide num_experts evenly."
+    )
     train_micro_batch_size: int = Field(
         default=0,
         description="Micro-batch size (measured in number of sequences) for gradient accumulation; 0 means disabled (use full batch)",
@@ -166,9 +169,17 @@ class JaxBackendImpl(AbstractBackend):
 
         model_class = get_model_class(self.model_config)
 
-        # Create model and load weights
+        # Validate expert parallelism configuration
+        if hasattr(base_config, "num_experts") and base_config.num_experts and config.expert_parallel_size > 1:
+            assert base_config.num_experts % config.expert_parallel_size == 0, (
+                f"num_experts ({base_config.num_experts}) must be divisible by "
+                f"expert_parallel_size ({config.expert_parallel_size})"
+            )
+
+        # Create model and load weights with 3D mesh (fsdp, ep, tp)
         self.mesh = jax.make_mesh(
-            (config.fully_sharded_data_parallel_size, config.tensor_parallel_size), ("fsdp", "tp")
+            (config.fully_sharded_data_parallel_size, config.expert_parallel_size, config.tensor_parallel_size),
+            ("fsdp", "ep", "tp"),
         )
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
