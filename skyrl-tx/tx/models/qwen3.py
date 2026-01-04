@@ -161,6 +161,11 @@ class Qwen3MLP(nnx.Module):
 
 
 class Qwen3Experts(nnx.Module):
+    """MoE experts with expert parallelism support.
+
+    Expert weights are sharded along the "ep" mesh axis. When ep=1 in the mesh,
+    sharding on "ep" is a no-op, so this works for both EP and non-EP cases.
+    """
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
@@ -171,7 +176,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "fsdp", "tp")),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +186,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "fsdp", "tp")),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,7 +196,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "tp", "fsdp")),
             rngs=rngs,
         )
 
