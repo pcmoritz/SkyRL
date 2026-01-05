@@ -4,7 +4,7 @@ from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
-from tx.layers.util import prepare_routing
+from tx.layers.util import expert_parallel_dispatch_combine
 from tx.layers.rotary_embedding import apply_rope
 from tx.models.configs import Qwen3Config
 from tx.layers.layernorm import RMSNorm
@@ -164,6 +164,11 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        mesh = get_abstract_mesh()
+        axis_names = getattr(mesh, "axis_names", ()) if mesh is not None else ()
+        ep_axis = "ep" if "ep" in axis_names else None
+        expert_sharding = (ep_axis, "fsdp", "tp") if ep_axis is not None else (None, "fsdp", "tp")
+        expert_sharding_out = (ep_axis, "tp", "fsdp") if ep_axis is not None else (None, "tp", "fsdp")
         self.gate_proj = LoRAExpert(
             config.num_experts,
             config.hidden_size,
@@ -171,7 +176,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), expert_sharding),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +186,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), expert_sharding),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,7 +196,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), expert_sharding_out),
             rngs=rngs,
         )
 
@@ -202,28 +207,22 @@ class Qwen3Experts(nnx.Module):
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
 
-        # Prepare for ragged_dot by sorting tokens based on their assigned expert
-        selected_experts_flat = selected_experts.ravel()
-        hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
-        adapter_indices_expanded = (
-            jnp.repeat(adapter_indices, self.config.num_experts_per_tok) if adapter_indices is not None else None
-        )
-        hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
-            hidden_states_expanded,
-            selected_experts_flat,
+        def apply_experts(tokens: jax.Array, group_sizes: jax.Array, adapter_indices_sorted: jax.Array | None):
+            gate_out = self.gate_proj(tokens, group_sizes, adapter_indices_sorted)
+            up_out = self.up_proj(tokens, group_sizes, adapter_indices_sorted)
+            down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
+            return down_out
+
+        return expert_parallel_dispatch_combine(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            apply_experts,
             self.config.num_experts,
-            adapter_indices=adapter_indices_expanded,
+            self.config.num_experts_per_tok,
+            self.config.hidden_size,
+            adapter_indices=adapter_indices,
         )
-
-        # Apply expert layers using LoRAExpert
-        gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
-
-        # Unsort and combine the expert outputs
-        unsorted_out = down_out[unsort_indices]
-        reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
-        return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
