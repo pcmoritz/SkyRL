@@ -264,9 +264,10 @@ class Qwen3Experts(nnx.Module):
         # Compute group_sizes from actual tokens (before padding) - count per global expert, reshape to [ep, local]
         group_sizes_ep = jnp.bincount(selected_experts, length=self.config.num_experts).reshape(ep_size, experts_per_device)
 
-        # Scatter adapter indices
+        # Scatter adapter indices (adapter_indices must not be None when using EP with LoRA)
         adapter_ep = jnp.zeros((ep_size, capacity), dtype=jnp.int32)
-        adapter_ep = adapter_ep.at[sorted_target_device, position_in_device].set(sorted_adapter)
+        if adapter_indices is not None:
+            adapter_ep = adapter_ep.at[sorted_target_device, position_in_device].set(sorted_adapter)
 
         # Extract all weights for shard_map
         gate_w, up_w, down_w = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
@@ -276,9 +277,9 @@ class Qwen3Experts(nnx.Module):
         max_lora_rank = self.gate_proj.lora_A.value.shape[-1]
         max_adapters = self.gate_proj.lora_A.value.shape[0]
 
-        def apply_lora(x, base_out, group_sizes, adapter_indices, lora_A, lora_B, lora_scaling):
+        def apply_lora(x, base_out, group_sizes_padded, adapter_indices, lora_A, lora_B, lora_scaling):
             """Apply LoRA for local experts."""
-            expert_indices = jnp.repeat(jnp.arange(experts_per_device), group_sizes, total_repeat_length=x.shape[0])
+            expert_indices = jnp.repeat(jnp.arange(experts_per_device), group_sizes_padded, total_repeat_length=capacity)
             flat_idx = adapter_indices * experts_per_device + expert_indices
             num_flat = max_adapters * experts_per_device
             lora_A_flat = lora_A.reshape(num_flat, lora_A.shape[-2], max_lora_rank)
