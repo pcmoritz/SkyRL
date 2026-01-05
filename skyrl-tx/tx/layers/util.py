@@ -132,6 +132,7 @@ def expert_parallel_dispatch_combine(
                 jnp.zeros_like(shard_selected_experts),
             )
 
+            const_start = jax.lax.stop_gradient(shard_start)
             local_output = _local_expert_computation(
                 shard_hidden_states,
                 local_selected,
@@ -141,7 +142,7 @@ def expert_parallel_dispatch_combine(
                 num_experts_per_tok,
                 hidden_size,
                 adapter_indices=shard_adapter_indices if has_adapter else None,
-                expert_kwargs={"expert_start": shard_start, "num_experts_chunk": experts_per_rank},
+                expert_kwargs={"expert_start": const_start, "num_experts_chunk": experts_per_rank},
             )
             return jax.lax.psum(local_output, axis_name="ep")
 
