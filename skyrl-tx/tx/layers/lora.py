@@ -238,7 +238,7 @@ class LoRAExpert(LoRAMixin, nnx.Module):
     ) -> jax.Array:
         if expert_start is not None:
             assert num_experts_chunk is not None, "Must provide num_experts_chunk with expert_start"
-            weight = self.weight.value[expert_start : expert_start + num_experts_chunk, :, :]
+            weight = jax.lax.dynamic_slice_in_dim(self.weight.value, expert_start, num_experts_chunk, axis=0)
         else:
             num_experts_chunk = self.num_experts
             weight = self.weight.value
@@ -261,11 +261,9 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         num_flattened_groups = self.max_lora_adapters * num_experts_chunk
 
         def _slice_lora(param):
-            return (
-                param[:, expert_start : expert_start + num_experts_chunk, ...]
-                if expert_start is not None
-                else param
-            )
+            if expert_start is None:
+                return param
+            return jax.lax.dynamic_slice_in_dim(param, expert_start, num_experts_chunk, axis=1)
 
         # Reshape lora_A and lora_B to merge (max_lora_adapters, num_experts) dimensions
         lora_A = _slice_lora(self.lora_A.value).reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
