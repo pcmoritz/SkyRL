@@ -1,10 +1,12 @@
+from functools import partial
+
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
-from tx.layers.util import prepare_routing
+from tx.layers.util import _local_expert_computation
 from tx.layers.rotary_embedding import apply_rope
 from tx.models.configs import Qwen3Config
 from tx.layers.layernorm import RMSNorm
@@ -164,6 +166,10 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        # Expert weights are sharded: ("ep", "fsdp", "tp")
+        # - ep: experts distributed across expert parallel devices
+        # - fsdp: input dimension sharded for FSDP
+        # - tp: output dimension sharded for tensor parallelism
         self.gate_proj = LoRAExpert(
             config.num_experts,
             config.hidden_size,
@@ -171,7 +177,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "fsdp", "tp")),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +187,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "fsdp", "tp")),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,9 +197,20 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("ep", "tp", "fsdp")),
             rngs=rngs,
         )
+
+    def _expert_fn(
+        self,
+        hidden_states_sorted: jax.Array,
+        group_sizes: jax.Array,
+        adapter_indices_sorted: jax.Array | None,
+    ) -> jax.Array:
+        """Apply the expert MLP layers to sorted tokens."""
+        gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
+        up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
+        return self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
 
     def __call__(
         self, hidden_states: jax.Array, router_logits: jax.Array, adapter_indices: jax.Array | None = None
@@ -202,28 +219,102 @@ class Qwen3Experts(nnx.Module):
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
 
-        # Prepare for ragged_dot by sorting tokens based on their assigned expert
-        selected_experts_flat = selected_experts.ravel()
-        hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
-        adapter_indices_expanded = (
-            jnp.repeat(adapter_indices, self.config.num_experts_per_tok) if adapter_indices is not None else None
-        )
-        hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
-            hidden_states_expanded,
-            selected_experts_flat,
-            self.config.num_experts,
-            adapter_indices=adapter_indices_expanded,
-        )
+        mesh = jax.get_mesh()
+        ep_size = mesh.shape.get("ep", 1)
 
-        # Apply expert layers using LoRAExpert
-        gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
+        # For EP=1, use local computation (no cross-device communication needed)
+        if ep_size == 1:
+            return _local_expert_computation(
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                self._expert_fn,
+                self.config.num_experts,
+                self.config.num_experts_per_tok,
+                adapter_indices,
+            )
 
-        # Unsort and combine the expert outputs
-        unsorted_out = down_out[unsort_indices]
-        reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
-        return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+        # For EP>1, use shard_map with explicit weight passing
+        num_experts = self.config.num_experts
+        num_experts_per_tok = self.config.num_experts_per_tok
+        hidden_size = self.config.hidden_size
+        experts_per_rank = num_experts // ep_size
+
+        # Extract weight values for shard_map
+        gate_weight = self.gate_proj.weight.value
+        up_weight = self.up_proj.weight.value
+        down_weight = self.down_proj.weight.value
+
+        # Define partition specs for weights: ("ep", "fsdp", "tp") -> local shape after sharding
+        weight_spec = P("ep", "fsdp", "tp")
+        down_weight_spec = P("ep", "tp", "fsdp")
+
+        # NOTE: EP>1 path currently only supports base model inference (no LoRA).
+        # For LoRA support with EP>1, the LoRA weights would need to be passed through
+        # the shard_map as well.
+        @partial(
+            jax.shard_map,
+            mesh=mesh,
+            in_specs=(P(), P(), P(), weight_spec, weight_spec, down_weight_spec),
+            out_specs=P(),
+            check_rep=False,
+        )
+        def _ep_expert_fn(hidden_states, selected_experts, routing_weights,
+                         gate_w, up_w, down_w):
+            num_tokens = hidden_states.shape[0]
+            ep_idx = jax.lax.axis_index("ep")
+
+            # Expand for top-k experts
+            selected_experts_flat = selected_experts.ravel()
+            hidden_states_expanded = jnp.repeat(hidden_states, num_experts_per_tok, axis=0)
+            routing_weights_flat = routing_weights.ravel()
+
+            # Determine which tokens belong to this EP rank
+            local_expert_start = ep_idx * experts_per_rank
+            local_expert_end = local_expert_start + experts_per_rank
+            is_local = (selected_experts_flat >= local_expert_start) & (selected_experts_flat < local_expert_end)
+
+            # Map global expert indices to local indices
+            local_expert_indices = jnp.where(is_local, selected_experts_flat - local_expert_start, 0)
+
+            # Sort tokens by local expert assignment
+            sort_key = jnp.where(is_local, local_expert_indices, experts_per_rank + 1)
+            sort_indices = jnp.argsort(sort_key)
+            unsort_indices = jnp.argsort(sort_indices)
+
+            # Sort everything
+            hidden_sorted = hidden_states_expanded[sort_indices]
+            local_experts_sorted = local_expert_indices[sort_indices]
+            weights_sorted = routing_weights_flat[sort_indices]
+            is_local_sorted = is_local[sort_indices]
+
+            # Compute group sizes for local experts
+            masked_indices = jnp.where(is_local_sorted, local_experts_sorted, experts_per_rank)
+            group_sizes = jnp.bincount(masked_indices, length=experts_per_rank + 1)[:experts_per_rank]
+
+            # Apply expert computation using ragged_dot with local weights
+            gate_out = jax.lax.ragged_dot(hidden_sorted, gate_w, group_sizes)
+            up_out = jax.lax.ragged_dot(hidden_sorted, up_w, group_sizes)
+            expert_output_sorted = jax.lax.ragged_dot(
+                nnx.silu(gate_out) * up_out, down_w, group_sizes
+            )
+
+            # Zero out non-local outputs and apply routing weights
+            expert_output_sorted = jnp.where(is_local_sorted[:, None], expert_output_sorted, 0.0)
+            expert_output_sorted = expert_output_sorted * weights_sorted[:, None]
+
+            # Unsort, reshape and sum over top-k
+            expert_output = expert_output_sorted[unsort_indices]
+            expert_output = expert_output.reshape(num_tokens, num_experts_per_tok, hidden_size)
+            local_output = jnp.sum(expert_output, axis=1)
+
+            # All-reduce across EP devices
+            return jax.lax.psum(local_output, "ep")
+
+        return _ep_expert_fn(
+            hidden_states, selected_experts, routing_weights,
+            gate_weight, up_weight, down_weight
+        )
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
