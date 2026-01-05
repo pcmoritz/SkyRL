@@ -4,7 +4,7 @@ from typing import Callable
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec as P
+from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
@@ -118,7 +118,7 @@ def expert_parallel_dispatch_combine(
     Returns:
         Combined expert outputs [num_tokens, hidden_size]
     """
-    mesh = jax.get_mesh()
+    mesh = get_abstract_mesh()
     ep_size = mesh.shape.get("ep", 1)
 
     # Fall back to local computation if EP=1

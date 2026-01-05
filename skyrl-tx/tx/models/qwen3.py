@@ -219,7 +219,7 @@ class Qwen3Experts(nnx.Module):
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
 
-        mesh = jax.get_mesh()
+        mesh = get_abstract_mesh()
         ep_size = mesh.shape.get("ep", 1)
 
         # For EP=1, use local computation (no cross-device communication needed)
