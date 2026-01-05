@@ -288,6 +288,10 @@ class Qwen3Experts(nnx.Module):
             # Merge state back into modules
             gate_proj, up_proj, down_proj = nnx.merge(graphdef, local_state)
 
+            # Flatten inputs (shard_map keeps trailing dims)
+            l_expert = l_expert.ravel()
+            adapters = adapters.ravel() if adapters is not None else None
+
             # Local routing: sort by local_expert for ragged_dot
             local_sort = jnp.argsort(l_expert)
             x_sorted = x[local_sort]
