@@ -271,6 +271,7 @@ class Qwen3Experts(nnx.Module):
                            W, L, L, S, W, L, L, S, W, L, L, S),
                  out_specs=P("ep", None, None), check_rep=False)
         def ep_step(x, l_exp, adp, gw, gA, gB, gs, uw, uA, uB, us, dw, dA, dB, ds):
+            x = x.reshape(-1, x.shape[-1])  # [1, capacity, H] -> [capacity, H]
             l_exp, adp = l_exp.ravel(), adp.ravel()
             sort = jnp.argsort(l_exp)
             x_s, adp_s = x[sort], adp[sort]
@@ -289,7 +290,7 @@ class Qwen3Experts(nnx.Module):
             g = expert_lora(x_s, gw, gA, gB, gs)
             u = expert_lora(x_s, uw, uA, uB, us)
             out = expert_lora(nnx.silu(g) * u, dw, dA, dB, ds)
-            return out[jnp.argsort(sort)]
+            return out[jnp.argsort(sort)][None, ...]  # Add back ep dim for out_specs
 
         # 4. Gather Results
         out_ep = ep_step(x_ep, expert_ep % experts_per_device, adapt_ep, *weights)
