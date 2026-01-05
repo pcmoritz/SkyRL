@@ -144,7 +144,7 @@ def expert_parallel_dispatch_combine(
 
         return _shard_body
 
-    axis_names = ("ep",)
+    axis_names = {"ep"}
     hidden_out_spec = _replicated_spec_like(hidden_states)
 
     def _build_specs(has_adapter: bool):
