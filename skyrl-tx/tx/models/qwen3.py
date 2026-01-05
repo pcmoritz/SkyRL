@@ -266,21 +266,27 @@ class Qwen3Experts(nnx.Module):
         adapters_sharded = pad_and_permute(adapter_indices[:, None]).squeeze(-1) if adapter_indices is not None else None
         local_expert_sharded = pad_and_permute(local_expert[:, None]).squeeze(-1)
 
-        # Extract weights manually - weight has ep on axis 0, lora has ep on axis 1
-        gw, uw, dw = self.gate_proj.weight.value, self.up_proj.weight.value, self.down_proj.weight.value
-        gA, gB, gs = self.gate_proj.lora_A.value, self.gate_proj.lora_B.value, self.gate_proj.lora_scaling.value
-        uA, uB, us = self.up_proj.lora_A.value, self.up_proj.lora_B.value, self.up_proj.lora_scaling.value
-        dA, dB, ds = self.down_proj.lora_A.value, self.down_proj.lora_B.value, self.down_proj.lora_scaling.value
+        # Extract module state - nnx.split handles sharding automatically
+        expert_modules = (self.gate_proj, self.up_proj, self.down_proj)
+        graphdef, state = nnx.split(expert_modules)
 
-        W = P("ep", None, None)  # weight: (experts, in, out)
-        L = P(None, "ep", None, None)  # lora: (adapters, experts, ...)
-        S = P(None)  # scaling: (adapters,)
+        # Create matching in_specs for state pytree based on each leaf's sharding
+        def get_ep_spec(x):
+            val = x.value if hasattr(x, 'value') else x
+            if hasattr(val, 'sharding') and val.sharding is not None:
+                spec = val.sharding.spec
+                return P(*tuple("ep" if s == "ep" else None for s in spec))
+            return P(*([None] * val.ndim))
+
+        state_specs = jax.tree.map(get_ep_spec, state)
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(P("ep", None, None), P("ep", None), P("ep", None),
-                           W, W, W, L, L, S, L, L, S, L, L, S),
+                 in_specs=(state_specs, P("ep", None, None), P("ep", None), P("ep", None)),
                  out_specs=P("ep", None, None), check_rep=False)
-        def ep_step(x, l_expert, adapters, gw, uw, dw, gA, gB, gs, uA, uB, us, dA, dB, ds):
+        def ep_step(local_state, x, l_expert, adapters):
+            # Merge state back into modules
+            gate_proj, up_proj, down_proj = nnx.merge(graphdef, local_state)
+
             # Flatten inputs (shard_map keeps trailing dims)
             l_expert = l_expert.ravel()
             adapters = adapters.ravel() if adapters is not None else None
@@ -291,27 +297,16 @@ class Qwen3Experts(nnx.Module):
             adapter_sorted = adapters[local_sort] if adapters is not None else None
             group_sizes = jnp.bincount(l_expert, minlength=experts_per_device, length=experts_per_device)
 
-            # MLP with inline LoRA
-            def apply_expert(x, w, lA, lB, ls, adapters):
-                base = jax.lax.ragged_dot(x, w, group_sizes)
-                # LoRA
-                exp_idx = jnp.repeat(jnp.arange(experts_per_device), group_sizes, total_repeat_length=x.shape[0])
-                flat_idx = adapters * experts_per_device + exp_idx
-                num_groups = lA.shape[0] * experts_per_device
-                lA_flat = lA.reshape(num_groups, lA.shape[-2], lA.shape[-1])
-                lB_flat = lB.reshape(num_groups, lB.shape[-2], lB.shape[-1])
-                x_s, sizes, unsort, _ = prepare_routing(x, flat_idx, num_groups)
-                lora = jax.lax.ragged_dot(jax.lax.ragged_dot(x_s, lA_flat, sizes), lB_flat, sizes)
-                return base + lora[unsort] * ls[adapters, None]
+            # Compute MLP with LoRA (LoRAExpert handles ragged_dot internally)
+            g_out = gate_proj(x_sorted, group_sizes, adapter_sorted)
+            u_out = up_proj(x_sorted, group_sizes, adapter_sorted)
+            d_out = down_proj(nnx.silu(g_out) * u_out, group_sizes, adapter_sorted)
 
-            g = apply_expert(x_sorted, gw, gA, gB, gs, adapter_sorted)
-            u = apply_expert(x_sorted, uw, uA, uB, us, adapter_sorted)
-            d = apply_expert(nnx.silu(g) * u, dw, dA, dB, ds, adapter_sorted)
-            return d[jnp.argsort(local_sort)]
+            # Unsort back to device-local order
+            return d_out[jnp.argsort(local_sort)]
 
         # Run EP computation
-        output_sharded = ep_step(x_sharded, local_expert_sharded, adapters_sharded,
-                                 gw, uw, dw, gA, gB, gs, uA, uB, us, dA, dB, ds)
+        output_sharded = ep_step(state, x_sharded, local_expert_sharded, adapters_sharded)
 
         # Restore global order
         output_flat = output_sharded.reshape(-1, H)
