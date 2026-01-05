@@ -270,9 +270,8 @@ class Qwen3Experts(nnx.Module):
         expert_modules = (self.gate_proj, self.up_proj, self.down_proj)
         graphdef, state = nnx.split(expert_modules)
 
-        # Extract raw values and create specs (shard_map needs raw arrays, not VariableState)
-        flat_state, state_treedef = jax.tree.flatten(state)
-        values = [s.value for s in flat_state]
+        # Extract raw values using tree_map (works with tracers)
+        values = jax.tree.map(lambda s: s.value, state)
 
         def get_ep_spec(arr):
             if hasattr(arr, 'sharding') and arr.sharding is not None:
@@ -280,15 +279,14 @@ class Qwen3Experts(nnx.Module):
                 return P(*tuple("ep" if s == "ep" else None for s in spec))
             return P(*([None] * arr.ndim))
 
-        value_specs = [get_ep_spec(v) for v in values]
+        value_specs = jax.tree.map(get_ep_spec, values)
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(value_specs, P("ep", None, None), P("ep", None), P("ep", None)),
                  out_specs=P("ep", None, None), check_rep=False)
         def ep_step(local_values, x, l_expert, adapters):
             # Reconstruct state with sliced values
-            local_flat_state = [nnx.VariableState(type=s.type, value=v) for s, v in zip(flat_state, local_values)]
-            local_state = jax.tree.unflatten(state_treedef, local_flat_state)
+            local_state = jax.tree.map(lambda s, v: s.replace(value=v), state, local_values)
             gate_proj, up_proj, down_proj = nnx.merge(graphdef, local_state)
 
             # Flatten inputs (shard_map keeps trailing dims)
