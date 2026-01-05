@@ -270,6 +270,7 @@ class Qwen3Experts(nnx.Module):
                            W, L, L, S, W, L, L, S, W, L, L, S),
                  out_specs=P("ep", None, None), check_rep=False)
         def ep_step(x, l_exp, adp, gw, gA, gB, gs, uw, uA, uB, us, dw, dA, dB, ds):
+            l_exp, adp = l_exp.ravel(), adp.ravel()
             sort = jnp.argsort(l_exp)
             x_s, adp_s = x[sort], adp[sort]
             groups = jnp.bincount(l_exp, minlength=experts_per_device, length=experts_per_device)
