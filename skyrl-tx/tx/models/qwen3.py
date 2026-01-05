@@ -235,88 +235,63 @@ class Qwen3Experts(nnx.Module):
         reshaped_out = expert_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
         return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
 
-    def _forward_ep(self, hidden_states, selected_experts, adapter_indices, mesh, ep_size):
-        """EP forward using shard_map with nnx.split/merge for clean state handling."""
-        num_tokens, H = hidden_states.shape
+    def _forward_ep(self, x, experts, adapters, mesh, ep_size):
+        """Concise Expert Parallelism using 1D scatter/gather."""
+        N, H = x.shape
         experts_per_device = self.config.num_experts // ep_size
+        capacity = int(N * 2.0 // ep_size)  # 2.0x capacity factor
 
-        # Map global expert -> (target_device, local_expert)
-        target_device = selected_experts // experts_per_device
-        local_expert = selected_experts % experts_per_device
+        # 1. Calculate Routing Indices (Global -> Device/Slot)
+        target_dev = experts // experts_per_device
+        # Scan to find slot index within each device
+        dev_one_hot = jax.nn.one_hot(target_dev, ep_size)
+        slot_idx = jnp.cumsum(dev_one_hot, axis=0).argmax(axis=1)
 
-        # Sort to group tokens by target device
-        sort_idx = jnp.argsort(target_device)
+        # Global 1D index for scatter: device_offset + slot_index
+        scatter_idx = target_dev * capacity + slot_idx
+        valid_mask = slot_idx < capacity
+        safe_idx = jnp.where(valid_mask, scatter_idx, 0)
 
-        # Pad num_tokens to be divisible by ep_size for shard_map
-        pad_size = (ep_size - (num_tokens % ep_size)) % ep_size
-        padded_size = num_tokens + pad_size
+        # 2. Scatter to Global Buffer
+        x_ep = jnp.zeros((ep_size * capacity, H), dtype=x.dtype).at[safe_idx].set(x, mode='drop')
+        x_ep = x_ep.reshape(ep_size, capacity, H)
 
-        # Extend sort_idx to cover padded elements (padding goes to last device)
-        if pad_size > 0:
-            sort_idx = jnp.concatenate([sort_idx, jnp.arange(num_tokens, padded_size)])
+        expert_ep = jnp.zeros((ep_size * capacity,), dtype=jnp.int32).at[safe_idx].set(experts, mode='drop')
+        expert_ep = expert_ep.reshape(ep_size, capacity)
 
-        def pad_and_permute(x, default=0):
-            if pad_size > 0:
-                x = jnp.pad(x, ((0, pad_size), (0, 0)), constant_values=default)
-            return x[sort_idx].reshape(ep_size, -1, x.shape[-1])
+        adapt_ep = jnp.zeros((ep_size * capacity,), dtype=jnp.int32)
+        if adapters is not None:
+            adapt_ep = adapt_ep.at[safe_idx].set(adapters, mode='drop')
+        adapt_ep = adapt_ep.reshape(ep_size, capacity)
 
-        # Prepare inputs for shard_map
-        x_sharded = pad_and_permute(hidden_states[:, None] if hidden_states.ndim == 1 else hidden_states)
-        x_sharded = x_sharded.squeeze(-1) if hidden_states.ndim == 1 else x_sharded
-        adapters_sharded = pad_and_permute(adapter_indices[:, None]).squeeze(-1) if adapter_indices is not None else None
-        local_expert_sharded = pad_and_permute(local_expert[:, None]).squeeze(-1)
-
-        # Extract module state
-        expert_modules = (self.gate_proj, self.up_proj, self.down_proj)
-        graphdef, state = nnx.split(expert_modules)
-
-        # Extract raw values using tree_map (works with tracers)
+        # 3. Sharded Computation
+        graphdef, state = nnx.split((self.gate_proj, self.up_proj, self.down_proj))
         values = jax.tree.map(lambda s: s.value, state)
 
-        def get_ep_spec(arr):
-            if hasattr(arr, 'sharding') and arr.sharding is not None:
-                spec = arr.sharding.spec
-                return P(*tuple("ep" if s == "ep" else None for s in spec))
-            return P(*([None] * arr.ndim))
-
-        value_specs = jax.tree.map(get_ep_spec, values)
+        # Get partition specs from values' sharding
+        in_specs = jax.tree.map(
+            lambda v: P(*tuple("ep" if s == "ep" else None for s in v.sharding.spec)), values
+        )
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(value_specs, P("ep", None, None), P("ep", None), P("ep", None)),
+                 in_specs=(in_specs, P("ep", None, None), P("ep", None), P("ep", None)),
                  out_specs=P("ep", None, None), check_rep=False)
-        def ep_step(local_values, x, l_expert, adapters):
-            # Reconstruct state with sliced values
-            local_state = jax.tree.map(lambda s, v: s.replace(value=v), state, local_values)
-            gate_proj, up_proj, down_proj = nnx.merge(graphdef, local_state)
+        def ep_step(vals, x, l_exp, adp):
+            local_state = jax.tree.map(lambda s, v: s.replace(value=v), state, vals)
+            gate, up, down = nnx.merge(graphdef, local_state)
 
-            # Flatten inputs (shard_map keeps trailing dims)
-            l_expert = l_expert.ravel()
-            adapters = adapters.ravel() if adapters is not None else None
+            # Sort locally for ragged_dot
+            sort = jnp.argsort(l_exp)
+            groups = jnp.bincount(l_exp, minlength=experts_per_device, length=experts_per_device)
+            g = gate(x[sort], groups, adp[sort])
+            u = up(x[sort], groups, adp[sort])
+            out = down(nnx.silu(g) * u, groups, adp[sort])
+            return out[jnp.argsort(sort)]
 
-            # Local routing: sort by local_expert for ragged_dot
-            local_sort = jnp.argsort(l_expert)
-            x_sorted = x[local_sort]
-            adapter_sorted = adapters[local_sort] if adapters is not None else None
-            group_sizes = jnp.bincount(l_expert, minlength=experts_per_device, length=experts_per_device)
-
-            # Compute MLP with LoRA (LoRAExpert handles ragged_dot internally)
-            g_out = gate_proj(x_sorted, group_sizes, adapter_sorted)
-            u_out = up_proj(x_sorted, group_sizes, adapter_sorted)
-            d_out = down_proj(nnx.silu(g_out) * u_out, group_sizes, adapter_sorted)
-
-            # Unsort back to device-local order
-            return d_out[jnp.argsort(local_sort)]
-
-        # Run EP computation
-        output_sharded = ep_step(values, x_sharded, local_expert_sharded, adapters_sharded)
-
-        # Restore global order
-        output_flat = output_sharded.reshape(-1, H)
-        if pad_size > 0:
-            output_flat = output_flat[:-pad_size]
-
-        # Inverse permutation to restore original token order
-        return output_flat[jnp.argsort(sort_idx[:num_tokens])]
+        # 4. Gather Results
+        out_ep = ep_step(values, x_ep, expert_ep % experts_per_device, adapt_ep)
+        out_flat = out_ep.reshape(-1, H)[safe_idx] * valid_mask[:, None]
+        return jnp.zeros((N, H), dtype=out_ep.dtype).at[jnp.arange(N)].set(out_flat)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
