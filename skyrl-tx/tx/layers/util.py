@@ -59,6 +59,7 @@ def _local_expert_computation(
     num_experts_per_tok: int,
     hidden_size: int,
     adapter_indices: jax.Array | None = None,
+    expert_kwargs: dict[str, object] | None = None,
 ) -> jax.Array:
     """Run expert computation locally without expert-parallel sharding."""
     selected_experts_flat = selected_experts.reshape(-1)
@@ -73,7 +74,8 @@ def _local_expert_computation(
         adapter_indices=adapter_indices_expanded,
     )
 
-    expert_out = expert_fn(hidden_states_sorted, group_sizes, adapter_indices_sorted)
+    expert_kwargs = expert_kwargs or {}
+    expert_out = expert_fn(hidden_states_sorted, group_sizes, adapter_indices_sorted, **expert_kwargs)
     unsorted_out = expert_out[unsort_indices]
     reshaped_out = unsorted_out.reshape(-1, num_experts_per_tok, hidden_size)
     return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
@@ -139,6 +141,7 @@ def expert_parallel_dispatch_combine(
                 num_experts_per_tok,
                 hidden_size,
                 adapter_indices=shard_adapter_indices if has_adapter else None,
+                expert_kwargs={"expert_start": shard_start, "num_experts_chunk": experts_per_rank},
             )
             return jax.lax.psum(local_output, axis_name="ep")
 

@@ -207,10 +207,35 @@ class Qwen3Experts(nnx.Module):
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
 
-        def apply_experts(tokens: jax.Array, group_sizes: jax.Array, adapter_indices_sorted: jax.Array | None):
-            gate_out = self.gate_proj(tokens, group_sizes, adapter_indices_sorted)
-            up_out = self.up_proj(tokens, group_sizes, adapter_indices_sorted)
-            down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
+        def apply_experts(
+            tokens: jax.Array,
+            group_sizes: jax.Array,
+            adapter_indices_sorted: jax.Array | None,
+            *,
+            expert_start: int | None = None,
+            num_experts_chunk: int | None = None,
+        ):
+            gate_out = self.gate_proj(
+                tokens,
+                group_sizes,
+                adapter_indices_sorted,
+                expert_start=expert_start,
+                num_experts_chunk=num_experts_chunk,
+            )
+            up_out = self.up_proj(
+                tokens,
+                group_sizes,
+                adapter_indices_sorted,
+                expert_start=expert_start,
+                num_experts_chunk=num_experts_chunk,
+            )
+            down_out = self.down_proj(
+                nnx.silu(gate_out) * up_out,
+                group_sizes,
+                adapter_indices_sorted,
+                expert_start=expert_start,
+                num_experts_chunk=num_experts_chunk,
+            )
             return down_out
 
         return expert_parallel_dispatch_combine(
