@@ -270,9 +270,20 @@ class Qwen3Experts(nnx.Module):
         expert_modules = (self.gate_proj, self.up_proj, self.down_proj)
         graphdef, state = nnx.split(expert_modules)
 
+        # Create matching in_specs for state pytree based on each leaf's sharding
+        def get_ep_spec(x):
+            if hasattr(x, 'sharding') and x.sharding is not None:
+                spec = x.sharding.spec
+                # Replace non-ep axes with None, keep "ep" where it appears
+                return P(*tuple("ep" if s == "ep" else None for s in spec))
+            return P(*([None] * x.ndim))
+
+        state_specs = jax.tree.map(get_ep_spec, state)
+        tokens_per_device = padded_size // ep_size
+
         @partial(shard_map, mesh=mesh,
-                 in_specs=(P("ep", ...), P("ep", ...), P("ep", ...), P("ep", ...)),
-                 out_specs=P("ep", ...), check_rep=False)
+                 in_specs=(state_specs, P("ep", None, None), P("ep", None), P("ep", None)),
+                 out_specs=P("ep", None, None), check_rep=False)
         def ep_step(local_state, x, l_expert, adapters):
             # Merge state back into modules
             gate_proj, up_proj, down_proj = nnx.merge(graphdef, local_state)
