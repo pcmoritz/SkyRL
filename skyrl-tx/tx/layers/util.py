@@ -1,7 +1,7 @@
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import get_abstract_mesh, PartitionSpec
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
@@ -30,6 +30,24 @@ def prepare_routing(
     group_sizes = jnp.bincount(indices, length=num_groups)
     unsort_indices = jnp.argsort(sort_indices)
     return sorted_tokens, group_sizes, unsort_indices, sorted_adapter_indices
+
+
+def _replicated_spec_like(array: jax.Array) -> PartitionSpec:
+    """Return a PartitionSpec that mirrors an array's sharding but omits 'ep'."""
+    sharding = getattr(array, "sharding", None)
+    if sharding is not None and hasattr(sharding, "spec"):
+        partitions: list = []
+        for part in sharding.spec:
+            if part is None:
+                partitions.append(None)
+            elif isinstance(part, tuple):
+                filtered = tuple(axis for axis in part if axis != "ep")
+                partitions.append(filtered or None)
+            else:
+                partitions.append(None if part == "ep" else part)
+        return PartitionSpec(*partitions)
+    ndim = array.ndim if hasattr(array, "ndim") else len(array.shape)
+    return PartitionSpec(*((None,) * ndim))
 
 
 def _local_expert_computation(
@@ -127,15 +145,33 @@ def expert_parallel_dispatch_combine(
         return _shard_body
 
     axis_names = ("ep",)
+    hidden_out_spec = _replicated_spec_like(hidden_states)
+
+    def _build_specs(has_adapter: bool):
+        common_specs = (
+            _replicated_spec_like(hidden_states),
+            _replicated_spec_like(selected_experts),
+            _replicated_spec_like(routing_weights),
+        )
+        if not has_adapter:
+            return common_specs, hidden_out_spec
+        return common_specs + (_replicated_spec_like(adapter_indices),), hidden_out_spec
+
     if adapter_indices is None:
+        in_specs, out_spec = _build_specs(has_adapter=False)
         sharded_fn = jax.shard_map(
             _make_shard_body(has_adapter=False),
+            in_specs=in_specs,
+            out_specs=out_spec,
             axis_names=axis_names,
         )
         return sharded_fn(hidden_states, selected_experts, routing_weights)
 
+    in_specs, out_spec = _build_specs(has_adapter=True)
     sharded_fn = jax.shard_map(
         _make_shard_body(has_adapter=True),
+        in_specs=in_specs,
+        out_specs=out_spec,
         axis_names=axis_names,
     )
     return sharded_fn(hidden_states, selected_experts, routing_weights, adapter_indices)
