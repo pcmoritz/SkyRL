@@ -236,60 +236,61 @@ class Qwen3Experts(nnx.Module):
         return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
 
     def _forward_ep(self, x, experts, adapters, mesh, ep_size):
-        """Concise Expert Parallelism using 1D scatter/gather."""
+        """Expert Parallelism using 1D scatter/gather with manual weight extraction."""
         N, H = x.shape
         experts_per_device = self.config.num_experts // ep_size
         capacity = int(N * 2.0 // ep_size)  # 2.0x capacity factor
 
         # 1. Calculate Routing Indices (Global -> Device/Slot)
         target_dev = experts // experts_per_device
-        # Scan to find slot index within each device
         dev_one_hot = jax.nn.one_hot(target_dev, ep_size)
         slot_idx = jnp.cumsum(dev_one_hot, axis=0).argmax(axis=1)
 
-        # Global 1D index for scatter: device_offset + slot_index
         scatter_idx = target_dev * capacity + slot_idx
         valid_mask = slot_idx < capacity
         safe_idx = jnp.where(valid_mask, scatter_idx, 0)
 
         # 2. Scatter to Global Buffer
-        x_ep = jnp.zeros((ep_size * capacity, H), dtype=x.dtype).at[safe_idx].set(x, mode='drop')
-        x_ep = x_ep.reshape(ep_size, capacity, H)
-
-        expert_ep = jnp.zeros((ep_size * capacity,), dtype=jnp.int32).at[safe_idx].set(experts, mode='drop')
-        expert_ep = expert_ep.reshape(ep_size, capacity)
-
+        x_ep = jnp.zeros((ep_size * capacity, H), dtype=x.dtype).at[safe_idx].set(x, mode='drop').reshape(ep_size, capacity, H)
+        expert_ep = jnp.zeros((ep_size * capacity,), dtype=jnp.int32).at[safe_idx].set(experts, mode='drop').reshape(ep_size, capacity)
         adapt_ep = jnp.zeros((ep_size * capacity,), dtype=jnp.int32)
         if adapters is not None:
             adapt_ep = adapt_ep.at[safe_idx].set(adapters, mode='drop')
         adapt_ep = adapt_ep.reshape(ep_size, capacity)
 
-        # 3. Sharded Computation
-        graphdef, state = nnx.split((self.gate_proj, self.up_proj, self.down_proj))
-        values = jax.tree.map(lambda s: s.value, state)
+        # 3. Extract weights directly (works with JAX tracing)
+        def get_weights(proj):
+            return (proj.weight.value, proj.lora_A.value, proj.lora_B.value, proj.lora_scaling.value)
+        weights = (*get_weights(self.gate_proj), *get_weights(self.up_proj), *get_weights(self.down_proj))
 
-        # Get partition specs from values' sharding
-        in_specs = jax.tree.map(
-            lambda v: P(*tuple("ep" if s == "ep" else None for s in v.sharding.spec)), values
-        )
+        W, L, S = P("ep", None, None), P(None, "ep", None, None), P(None)
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(in_specs, P("ep", None, None), P("ep", None), P("ep", None)),
+                 in_specs=(P("ep", None, None), P("ep", None), P("ep", None),
+                           W, L, L, S, W, L, L, S, W, L, L, S),
                  out_specs=P("ep", None, None), check_rep=False)
-        def ep_step(vals, x, l_exp, adp):
-            local_state = jax.tree.map(lambda s, v: s.replace(value=v), state, vals)
-            gate, up, down = nnx.merge(graphdef, local_state)
-
-            # Sort locally for ragged_dot
+        def ep_step(x, l_exp, adp, gw, gA, gB, gs, uw, uA, uB, us, dw, dA, dB, ds):
             sort = jnp.argsort(l_exp)
+            x_s, adp_s = x[sort], adp[sort]
             groups = jnp.bincount(l_exp, minlength=experts_per_device, length=experts_per_device)
-            g = gate(x[sort], groups, adp[sort])
-            u = up(x[sort], groups, adp[sort])
-            out = down(nnx.silu(g) * u, groups, adp[sort])
+
+            def expert_lora(x, w, lA, lB, ls):
+                base = jax.lax.ragged_dot(x, w, groups)
+                exp_idx = jnp.repeat(jnp.arange(experts_per_device), groups, total_repeat_length=x.shape[0])
+                flat_idx = adp_s * experts_per_device + exp_idx
+                num_groups = lA.shape[0] * experts_per_device
+                xs, sizes, unsort, _ = prepare_routing(x, flat_idx, num_groups)
+                lora = jax.lax.ragged_dot(jax.lax.ragged_dot(xs, lA.reshape(num_groups, -1, lA.shape[-1]), sizes),
+                                          lB.reshape(num_groups, lB.shape[-2], -1), sizes)
+                return base + lora[unsort] * ls[adp_s, None]
+
+            g = expert_lora(x_s, gw, gA, gB, gs)
+            u = expert_lora(x_s, uw, uA, uB, us)
+            out = expert_lora(nnx.silu(g) * u, dw, dA, dB, ds)
             return out[jnp.argsort(sort)]
 
         # 4. Gather Results
-        out_ep = ep_step(values, x_ep, expert_ep % experts_per_device, adapt_ep)
+        out_ep = ep_step(x_ep, expert_ep % experts_per_device, adapt_ep, *weights)
         out_flat = out_ep.reshape(-1, H)[safe_idx] * valid_mask[:, None]
         return jnp.zeros((N, H), dtype=out_ep.dtype).at[jnp.arange(N)].set(out_flat)
 
