@@ -62,6 +62,7 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     max_lora_adapters: int = Field(default=32, description="Maximum number of LoRA adapters")
     max_lora_rank: int = Field(default=32, description="Maximum LoRA rank")
     tensor_parallel_size: int = Field(default=1, description="Tensor parallelism degree to use for the model")
+    expert_parallel_size: int = Field(default=1, description="Expert parallelism degree to use for the model")
     fully_sharded_data_parallel_size: int = Field(
         default=1, description="Fully sharded data parallelism degree for the model"
     )
@@ -142,7 +143,7 @@ class JaxBackendImpl(AbstractBackend):
 
     This backend:
     - Uses jax.value_and_grad for gradient computation
-    - Uses 2D mesh (fsdp, tp) for fully sharded data parallelism and tensor parallelism
+    - Uses 3D mesh (fsdp, ep, tp) for fully sharded data parallelism, expert parallelism, and tensor parallelism
     - Supports multiple LoRA adapters via AccumulatedGradients with counts array
     - Supports both FORWARD and FORWARD_BACKWARD request types
     """
@@ -168,7 +169,12 @@ class JaxBackendImpl(AbstractBackend):
 
         # Create model and load weights
         self.mesh = jax.make_mesh(
-            (config.fully_sharded_data_parallel_size, config.tensor_parallel_size), ("fsdp", "tp")
+            (
+                config.fully_sharded_data_parallel_size,
+                config.expert_parallel_size,
+                config.tensor_parallel_size,
+            ),
+            ("fsdp", "ep", "tp"),
         )
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
