@@ -344,11 +344,14 @@ class Qwen3Experts(nnx.Module):
                 adapters_recv = None
 
             total_recv = jnp.sum(recv_sizes, dtype=jnp.int32)
-            tokens_local = tokens_recv[:total_recv]
-            expert_local = expert_recv[:total_recv]
-            dispatch_local = dispatch_recv[:total_recv]
-            origin_local = origin_recv[:total_recv]
-            adapters_local = adapters_recv[:total_recv] if adapters_recv is not None else None
+            # Don't slice - use full buffers. Mark invalid entries with origin=ep_size
+            # so they sort to the end and aren't counted in bincount(length=ep_size)
+            valid_recv_mask = jnp.arange(capacity) < total_recv
+            tokens_local = tokens_recv
+            expert_local = expert_recv
+            dispatch_local = dispatch_recv
+            origin_local = jnp.where(valid_recv_mask, origin_recv, ep_size)
+            adapters_local = adapters_recv
 
             routed_tokens, group_sizes, unsort_idx, adapters_grouped = prepare_routing(
                 tokens_local,
@@ -390,11 +393,10 @@ class Qwen3Experts(nnx.Module):
                 recv_sizes_back,
                 axis_name="ep",
             )
-            total_return = jnp.sum(recv_sizes_back, dtype=jnp.int32)
-            outputs_returned = outputs_returned[:total_return]
-            indices_returned = indices_returned[:total_return]
+            # Don't slice - reverse so valid entries (at the beginning) scatter last
+            # and overwrite any invalid entries that scattered to the same position
             scatter_buffer = jnp.zeros((total_pairs, hidden_size), dtype=expert_outputs.dtype)
-            scatter_buffer = scatter_buffer.at[indices_returned].set(outputs_returned)
+            scatter_buffer = scatter_buffer.at[indices_returned[::-1]].set(outputs_returned[::-1])
             reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
             return jnp.sum(reshaped * weights[..., None], axis=1)
 
