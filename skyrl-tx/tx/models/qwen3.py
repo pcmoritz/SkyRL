@@ -1,7 +1,7 @@
 from flax import nnx
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
 from tx.layers.util import prepare_routing
@@ -401,6 +401,8 @@ class Qwen3Experts(nnx.Module):
         sharded_fn = jax.shard_map(
             expert_parallel_fn,
             mesh=get_abstract_mesh(),
+            in_specs=(P(), P(), P(), P()),
+            out_specs=P(),
             axis_names=("ep",),
         )
         return sharded_fn(hidden_states, routing_weights, selected_experts, adapter_arg)
