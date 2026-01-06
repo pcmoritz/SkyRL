@@ -362,7 +362,8 @@ class Qwen3Experts(nnx.Module):
             print(
                 f"[TRACE] group_sizes shape: {group_sizes.shape}, "
                 f"gate_proj weight shape: {self.gate_proj.weight.value.shape}, "
-                f"experts_per_axis: {experts_per_axis}"
+                f"experts_per_axis: {experts_per_axis}, "
+                f"weight sharding: {getattr(self.gate_proj.weight.value, 'sharding', 'N/A')}"
             )
             gate_out = self.gate_proj(routed_tokens, group_sizes, adapters_grouped)
             up_out = self.up_proj(routed_tokens, group_sizes, adapters_grouped)
