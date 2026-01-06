@@ -408,7 +408,10 @@ class Qwen3Experts(nnx.Module):
 
         # Debug: check sharding OUTSIDE shard_map
         print(f"[OUTSIDE SHARD_MAP] gate_proj weight shape: {self.gate_proj.weight.value.shape}")
+        print(f"[OUTSIDE SHARD_MAP] gate_proj weight type: {type(self.gate_proj.weight.value)}")
         print(f"[OUTSIDE SHARD_MAP] gate_proj weight sharding: {getattr(self.gate_proj.weight.value, 'sharding', 'N/A')}")
+        print(f"[OUTSIDE SHARD_MAP] gate_proj.weight type: {type(self.gate_proj.weight)}")
+        print(f"[OUTSIDE SHARD_MAP] gate_proj.weight sharding attr: {getattr(self.gate_proj.weight, 'sharding', 'N/A')}")
         print(f"[OUTSIDE SHARD_MAP] mesh: {get_abstract_mesh()}")
 
         sharded_fn = jax.shard_map(
