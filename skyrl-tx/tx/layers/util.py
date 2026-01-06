@@ -53,8 +53,10 @@ def _local_expert_computation(
     hidden_size: int,
     adapter_indices: jax.Array | None = None,
     expert_kwargs: dict | None = None,
+    expert_slice: tuple[int, int] | None = None,  # (start, count) for EP slicing
 ) -> jax.Array:
-    """Run expert computation locally without expert-parallel sharding."""
+    """Run expert computation locally, optionally slicing to a subset of experts."""
+    n_exp = hidden_states.shape[0] * num_experts_per_tok
     hidden_states_expanded = jnp.repeat(hidden_states, num_experts_per_tok, axis=0)
     adapter_indices_expanded = jnp.repeat(adapter_indices, num_experts_per_tok) if adapter_indices is not None else None
     hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
@@ -64,7 +66,24 @@ def _local_expert_computation(
         adapter_indices=adapter_indices_expanded,
     )
 
+    if expert_slice is not None:
+        start, count = expert_slice
+        # Compute token offset for this expert slice
+        offsets = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes.astype(jnp.int32))])
+        tok_start = offsets[start]
+        # Slice tokens and group_sizes
+        hidden_states_sorted = jax.lax.dynamic_slice_in_dim(hidden_states_sorted, tok_start, n_exp, 0)
+        if adapter_indices_sorted is not None:
+            adapter_indices_sorted = jax.lax.dynamic_slice_in_dim(adapter_indices_sorted, tok_start, n_exp, 0)
+        group_sizes = jax.lax.dynamic_slice(group_sizes, (start,), (count,))
+
     expert_out = expert_fn(hidden_states_sorted, group_sizes, adapter_indices_sorted, **(expert_kwargs or {}))
+
+    if expert_slice is not None:
+        # Scatter back to full size
+        full_out = jnp.zeros((n_exp, hidden_size), dtype=expert_out.dtype)
+        expert_out = jax.lax.dynamic_update_slice_in_dim(full_out, expert_out, tok_start, 0)
+
     reshaped_out = expert_out[unsort_indices].reshape(-1, num_experts_per_tok, hidden_size)
     return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
 
@@ -79,7 +98,7 @@ def expert_parallel_dispatch_combine(
     hidden_size: int,
     adapter_indices: jax.Array | None = None,
 ) -> jax.Array:
-    """Dispatch tokens to experts and combine outputs using group_offset."""
+    """Dispatch tokens to experts and combine outputs, slicing to local experts."""
     mesh = get_abstract_mesh()
     ep_size = mesh.shape.get("ep", 1) if mesh is not None else 1
 
@@ -95,16 +114,12 @@ def expert_parallel_dispatch_combine(
     def _shard_body(shard_h, shard_s, shard_r, shard_a):
         axis_idx = jax.lax.axis_index("ep")
         shard_start = axis_idx * experts_per_rank
-        group_offset = jnp.array([shard_start], dtype=jnp.int32)
 
         local_out = _local_expert_computation(
             shard_h, shard_s, shard_r, expert_fn,
             num_experts, num_experts_per_tok, hidden_size, shard_a,
-            expert_kwargs={
-                "expert_start": jax.lax.stop_gradient(shard_start),
-                "num_experts_chunk": experts_per_rank,
-                "group_offset": group_offset,
-            },
+            expert_kwargs={"expert_start": jax.lax.stop_gradient(shard_start), "num_experts_chunk": experts_per_rank},
+            expert_slice=(shard_start, experts_per_rank),
         )
         return jax.lax.psum(local_out, axis_name="ep")
 
