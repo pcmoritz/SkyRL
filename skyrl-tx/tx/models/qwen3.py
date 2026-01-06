@@ -164,6 +164,10 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        mesh = get_abstract_mesh()
+        ep_axis = "ep" if "ep" in mesh.axis_names else None
+        fwd_spec = (ep_axis, "fsdp", "tp") if ep_axis is not None else (None, "fsdp", "tp")
+        bwd_spec = (ep_axis, "tp", "fsdp") if ep_axis is not None else (None, "tp", "fsdp")
         self.gate_proj = LoRAExpert(
             config.num_experts,
             config.hidden_size,
@@ -171,7 +175,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), fwd_spec),
             rngs=rngs,
         )
         self.up_proj = LoRAExpert(
@@ -181,7 +185,7 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "fsdp", "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), fwd_spec),
             rngs=rngs,
         )
         self.down_proj = LoRAExpert(
@@ -191,18 +195,28 @@ class Qwen3Experts(nnx.Module):
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", "fsdp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), bwd_spec),
             rngs=rngs,
         )
 
     def __call__(
         self, hidden_states: jax.Array, router_logits: jax.Array, adapter_indices: jax.Array | None = None
     ) -> jax.Array:
-        # Get top-k experts for each token and compute routing weights
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
+        mesh = get_abstract_mesh()
+        ep_size = mesh.shape.get("ep", 1)
+        if ep_size == 1:
+            return self._run_single_host(hidden_states, routing_weights, selected_experts, adapter_indices)
+        return self._run_expert_parallel(hidden_states, routing_weights, selected_experts, adapter_indices, ep_size)
 
-        # Prepare for ragged_dot by sorting tokens based on their assigned expert
+    def _run_single_host(
+        self,
+        hidden_states: jax.Array,
+        routing_weights: jax.Array,
+        selected_experts: jax.Array,
+        adapter_indices: jax.Array | None,
+    ) -> jax.Array:
         selected_experts_flat = selected_experts.ravel()
         hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
         adapter_indices_expanded = (
@@ -214,16 +228,182 @@ class Qwen3Experts(nnx.Module):
             self.config.num_experts,
             adapter_indices=adapter_indices_expanded,
         )
-
-        # Apply expert layers using LoRAExpert
         gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
         up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
         down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
-
-        # Unsort and combine the expert outputs
         unsorted_out = down_out[unsort_indices]
         reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
         return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+
+    def _run_expert_parallel(
+        self,
+        hidden_states: jax.Array,
+        routing_weights: jax.Array,
+        selected_experts: jax.Array,
+        adapter_indices: jax.Array | None,
+        ep_size: int,
+    ) -> jax.Array:
+        experts_per_axis = self.config.num_experts // ep_size
+        if self.config.num_experts % ep_size != 0:
+            raise ValueError("Number of experts must be divisible by ep axis size")
+        total_pairs = hidden_states.shape[0] * self.config.num_experts_per_tok
+        capacity = getattr(self.config, "expert_capacity", None)
+        if capacity is None:
+            capacity = total_pairs
+        use_adapters = adapter_indices is not None
+        adapter_arg = adapter_indices if adapter_indices is not None else jnp.zeros((hidden_states.shape[0],), jnp.int32)
+
+        def segment_starts(lengths: jax.Array) -> jax.Array:
+            zeros = jnp.zeros((1,), dtype=jnp.int32)
+            if lengths.size == 0:
+                return zeros
+            return jnp.concatenate([zeros, jnp.cumsum(lengths[:-1], dtype=jnp.int32)])
+
+        def expert_parallel_fn(
+            tokens: jax.Array,
+            weights: jax.Array,
+            experts: jax.Array,
+            adapters: jax.Array,
+        ) -> jax.Array:
+            num_tokens = tokens.shape[0]
+            hidden_size = tokens.shape[-1]
+            expanded_tokens = jnp.repeat(tokens, self.config.num_experts_per_tok, axis=0)
+            expanded_experts = experts.reshape(-1)
+            expanded_indices = jnp.arange(expanded_tokens.shape[0], dtype=jnp.int32)
+            adapter_flat = jnp.repeat(adapters, self.config.num_experts_per_tok, axis=0) if use_adapters else None
+            target_ep = expanded_experts // experts_per_axis
+            local_expert = expanded_experts % experts_per_axis
+            sort_perm = jnp.argsort(target_ep, kind="stable")
+            target_ep_sorted = target_ep[sort_perm]
+            tokens_sorted = expanded_tokens[sort_perm]
+            local_expert_sorted = local_expert[sort_perm]
+            dispatch_sorted = expanded_indices[sort_perm]
+            origin_sorted = jnp.full_like(target_ep_sorted, jax.lax.axis_index("ep"), dtype=jnp.int32)
+            if use_adapters and adapter_flat is not None:
+                adapters_sorted = adapter_flat[sort_perm]
+            else:
+                adapters_sorted = None
+
+            send_sizes = jnp.bincount(target_ep_sorted, length=ep_size).astype(jnp.int32)
+            input_offsets = segment_starts(send_sizes)
+            recv_sizes = jax.lax.all_to_all(send_sizes, "ep", 0, 0, tiled=True)
+            recv_offsets = segment_starts(recv_sizes)
+            output_offsets = jax.lax.all_to_all(recv_offsets, "ep", 0, 0, tiled=True)
+            token_buffer = jnp.zeros((capacity, hidden_size), dtype=tokens.dtype)
+            expert_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
+            dispatch_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
+            origin_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
+            tokens_recv = jax.lax.ragged_all_to_all(
+                tokens_sorted,
+                token_buffer,
+                input_offsets,
+                send_sizes,
+                output_offsets,
+                recv_sizes,
+                axis_name="ep",
+            )
+            expert_recv = jax.lax.ragged_all_to_all(
+                local_expert_sorted,
+                expert_buffer,
+                input_offsets,
+                send_sizes,
+                output_offsets,
+                recv_sizes,
+                axis_name="ep",
+            )
+            dispatch_recv = jax.lax.ragged_all_to_all(
+                dispatch_sorted,
+                dispatch_buffer,
+                input_offsets,
+                send_sizes,
+                output_offsets,
+                recv_sizes,
+                axis_name="ep",
+            )
+            origin_recv = jax.lax.ragged_all_to_all(
+                origin_sorted,
+                origin_buffer,
+                input_offsets,
+                send_sizes,
+                output_offsets,
+                recv_sizes,
+                axis_name="ep",
+            )
+            if use_adapters and adapters_sorted is not None:
+                adapter_buffer = jnp.zeros((capacity,), dtype=adapters.dtype)
+                adapters_recv = jax.lax.ragged_all_to_all(
+                    adapters_sorted,
+                    adapter_buffer,
+                    input_offsets,
+                    send_sizes,
+                    output_offsets,
+                    recv_sizes,
+                    axis_name="ep",
+                )
+            else:
+                adapters_recv = None
+
+            total_recv = jnp.sum(recv_sizes, dtype=jnp.int32)
+            tokens_local = tokens_recv[:total_recv]
+            expert_local = expert_recv[:total_recv]
+            dispatch_local = dispatch_recv[:total_recv]
+            origin_local = origin_recv[:total_recv]
+            adapters_local = adapters_recv[:total_recv] if adapters_recv is not None else None
+
+            routed_tokens, group_sizes, unsort_idx, adapters_grouped = prepare_routing(
+                tokens_local,
+                expert_local,
+                experts_per_axis,
+                adapter_indices=adapters_local,
+            )
+            gate_out = self.gate_proj(routed_tokens, group_sizes, adapters_grouped)
+            up_out = self.up_proj(routed_tokens, group_sizes, adapters_grouped)
+            down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapters_grouped)
+            expert_outputs = down_out[unsort_idx]
+
+            back_perm = jnp.argsort(origin_local, kind="stable")
+            origin_sorted_back = origin_local[back_perm]
+            outputs_sorted_back = expert_outputs[back_perm]
+            dispatch_sorted_back = dispatch_local[back_perm]
+            send_sizes_back = jnp.bincount(origin_sorted_back, length=ep_size).astype(jnp.int32)
+            input_offsets_back = segment_starts(send_sizes_back)
+            recv_sizes_back = jax.lax.all_to_all(send_sizes_back, "ep", 0, 0, tiled=True)
+            recv_offsets_back = segment_starts(recv_sizes_back)
+            output_offsets_back = jax.lax.all_to_all(recv_offsets_back, "ep", 0, 0, tiled=True)
+            output_buffer = jnp.zeros((total_pairs, hidden_size), dtype=expert_outputs.dtype)
+            index_buffer = jnp.zeros((total_pairs,), dtype=jnp.int32)
+            outputs_returned = jax.lax.ragged_all_to_all(
+                outputs_sorted_back,
+                output_buffer,
+                input_offsets_back,
+                send_sizes_back,
+                output_offsets_back,
+                recv_sizes_back,
+                axis_name="ep",
+            )
+            indices_returned = jax.lax.ragged_all_to_all(
+                dispatch_sorted_back,
+                index_buffer,
+                input_offsets_back,
+                send_sizes_back,
+                output_offsets_back,
+                recv_sizes_back,
+                axis_name="ep",
+            )
+            total_return = jnp.sum(recv_sizes_back, dtype=jnp.int32)
+            outputs_returned = outputs_returned[:total_return]
+            indices_returned = indices_returned[:total_return]
+            scatter_buffer = jnp.zeros((total_pairs, hidden_size), dtype=expert_outputs.dtype)
+            scatter_buffer = scatter_buffer.at[indices_returned].set(outputs_returned)
+            reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
+            return jnp.sum(reshaped * weights[..., None], axis=1)
+
+        sharded_fn = jax.shard_map(
+            expert_parallel_fn,
+            mesh=get_abstract_mesh(),
+            axis_names=("ep",),
+        )
+        return sharded_fn(hidden_states, routing_weights, selected_experts, adapter_arg)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):

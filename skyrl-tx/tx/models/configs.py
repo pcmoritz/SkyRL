@@ -28,6 +28,7 @@ class ModelConfig(PretrainedConfig):
         max_lora_adapters: int,
         max_lora_rank: int,
         shard_attention_heads: bool,
+        expert_capacity: int | None = None,
     ):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
@@ -36,6 +37,7 @@ class ModelConfig(PretrainedConfig):
         self.max_lora_adapters = max_lora_adapters
         self.max_lora_rank = max_lora_rank
         self.shard_attention_heads = shard_attention_heads
+        self.expert_capacity = expert_capacity
 
 
 # Model-specific aliases for clarity and backwards compatibility
