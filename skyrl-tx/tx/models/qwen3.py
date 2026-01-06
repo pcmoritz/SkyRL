@@ -406,6 +406,11 @@ class Qwen3Experts(nnx.Module):
             reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
             return jnp.sum(reshaped * weights[..., None], axis=1)
 
+        # Debug: check sharding OUTSIDE shard_map
+        print(f"[OUTSIDE SHARD_MAP] gate_proj weight shape: {self.gate_proj.weight.value.shape}")
+        print(f"[OUTSIDE SHARD_MAP] gate_proj weight sharding: {getattr(self.gate_proj.weight.value, 'sharding', 'N/A')}")
+        print(f"[OUTSIDE SHARD_MAP] mesh: {get_abstract_mesh()}")
+
         sharded_fn = jax.shard_map(
             expert_parallel_fn,
             mesh=get_abstract_mesh(),
