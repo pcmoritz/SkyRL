@@ -273,7 +273,7 @@ class Qwen3Experts(nnx.Module):
             adapter_flat = jnp.repeat(adapters, self.config.num_experts_per_tok, axis=0) if use_adapters else None
             target_ep = expanded_experts // experts_per_axis
             local_expert = expanded_experts % experts_per_axis
-            sort_perm = jnp.argsort(target_ep, kind="stable")
+            sort_perm = jnp.argsort(target_ep, stable=True)
             target_ep_sorted = target_ep[sort_perm]
             tokens_sorted = expanded_tokens[sort_perm]
             local_expert_sorted = local_expert[sort_perm]
@@ -361,7 +361,7 @@ class Qwen3Experts(nnx.Module):
             down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapters_grouped)
             expert_outputs = down_out[unsort_idx]
 
-            back_perm = jnp.argsort(origin_local, kind="stable")
+            back_perm = jnp.argsort(origin_local, stable=True)
             origin_sorted_back = origin_local[back_perm]
             outputs_sorted_back = expert_outputs[back_perm]
             dispatch_sorted_back = dispatch_local[back_perm]
@@ -403,7 +403,7 @@ class Qwen3Experts(nnx.Module):
             mesh=get_abstract_mesh(),
             in_specs=(P(), P(), P(), P()),
             out_specs=P(),
-            axis_names=("ep",),
+            axis_names={"ep",},
         )
         return sharded_fn(hidden_states, routing_weights, selected_experts, adapter_arg)
 
