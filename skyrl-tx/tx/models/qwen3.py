@@ -252,19 +252,24 @@ class Qwen3Experts(nnx.Module):
             capacity = total_pairs
         adapter_arg = adapter_indices if adapter_indices is not None else jnp.zeros((hidden_states.shape[0],), jnp.int32)
 
-        # Extract weights to pass explicitly to shard_map
-        gate_w = self.gate_proj.weight.value
-        up_w = self.up_proj.weight.value
-        down_w = self.down_proj.weight.value
-        gate_lora_A = self.gate_proj.lora_A.value
-        gate_lora_B = self.gate_proj.lora_B.value
-        gate_lora_scaling = self.gate_proj.lora_scaling.value
-        up_lora_A = self.up_proj.lora_A.value
-        up_lora_B = self.up_proj.lora_B.value
-        up_lora_scaling = self.up_proj.lora_scaling.value
-        down_lora_A = self.down_proj.lora_A.value
-        down_lora_B = self.down_proj.lora_B.value
-        down_lora_scaling = self.down_proj.lora_scaling.value
+        # Extract weights and constrain sharding to match in_specs exactly
+        # The weights are created with sharding (ep, fsdp, tp) but shard_map needs (ep, None, None)
+        weight_sharding = jax.sharding.NamedSharding(get_abstract_mesh(), P("ep", None, None))
+        lora_weight_sharding = jax.sharding.NamedSharding(get_abstract_mesh(), P(None, "ep", None, None))
+        lora_scaling_sharding = jax.sharding.NamedSharding(get_abstract_mesh(), P(None))
+
+        gate_w = jax.lax.with_sharding_constraint(self.gate_proj.weight.value, weight_sharding)
+        up_w = jax.lax.with_sharding_constraint(self.up_proj.weight.value, weight_sharding)
+        down_w = jax.lax.with_sharding_constraint(self.down_proj.weight.value, weight_sharding)
+        gate_lora_A = jax.lax.with_sharding_constraint(self.gate_proj.lora_A.value, lora_weight_sharding)
+        gate_lora_B = jax.lax.with_sharding_constraint(self.gate_proj.lora_B.value, lora_weight_sharding)
+        gate_lora_scaling = jax.lax.with_sharding_constraint(self.gate_proj.lora_scaling.value, lora_scaling_sharding)
+        up_lora_A = jax.lax.with_sharding_constraint(self.up_proj.lora_A.value, lora_weight_sharding)
+        up_lora_B = jax.lax.with_sharding_constraint(self.up_proj.lora_B.value, lora_weight_sharding)
+        up_lora_scaling = jax.lax.with_sharding_constraint(self.up_proj.lora_scaling.value, lora_scaling_sharding)
+        down_lora_A = jax.lax.with_sharding_constraint(self.down_proj.lora_A.value, lora_weight_sharding)
+        down_lora_B = jax.lax.with_sharding_constraint(self.down_proj.lora_B.value, lora_weight_sharding)
+        down_lora_scaling = jax.lax.with_sharding_constraint(self.down_proj.lora_scaling.value, lora_scaling_sharding)
         max_lora_adapters = self.gate_proj.max_lora_adapters
         max_lora_rank = self.gate_proj.max_lora_rank
 
@@ -430,15 +435,6 @@ class Qwen3Experts(nnx.Module):
                 experts_per_axis,
                 adapter_indices=adapters_local,
             )
-
-            # Debug: check group_sizes sum at runtime
-            def check_group_sizes(gs, num_tokens):
-                total = int(gs.sum())
-                if total != num_tokens:
-                    print(f"WARNING: group_sizes sum={total} != num_tokens={num_tokens}")
-                else:
-                    print(f"OK: group_sizes sum={total} == num_tokens={num_tokens}")
-            jax.debug.callback(check_group_sizes, group_sizes, routed_tokens.shape[0])
 
             # Apply expert computations using the passed weights
             gate_out = apply_expert_with_lora(
