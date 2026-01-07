@@ -241,12 +241,15 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
+        # Derive num_experts from weight shape (handles sharded case inside shard_map)
+        num_experts = self.weight.value.shape[0]
+
         # Reconstruct expert indices from group_sizes
-        expert_indices = jnp.repeat(jnp.arange(self.num_experts), group_sizes, total_repeat_length=x.shape[0])
+        expert_indices = jnp.repeat(jnp.arange(num_experts), group_sizes, total_repeat_length=x.shape[0])
 
         # Flatten (adapter, expert) into a single routing dimension.
-        flattened_indices = adapter_indices_sorted * self.num_experts + expert_indices
-        num_flattened_groups = self.max_lora_adapters * self.num_experts
+        flattened_indices = adapter_indices_sorted * num_experts + expert_indices
+        num_flattened_groups = self.max_lora_adapters * num_experts
 
         # Reshape lora_A and lora_B to merge (max_lora_adapters, num_experts) dimensions
         lora_A_reshaped = self.lora_A.value.reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
