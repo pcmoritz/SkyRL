@@ -410,27 +410,10 @@ class Qwen3Experts(nnx.Module):
             reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
             return jnp.sum(reshaped * weights[..., None], axis=1)
 
-        def filter_out_ep(spec_tree):
-            """Filter partition specs to remove 'ep' axis (handled by shard_map's axis_names)."""
-            def filter_spec(spec):
-                if spec is None or spec == P():
-                    return P()
-                new_axes = []
-                for axis in spec:
-                    if isinstance(axis, tuple):
-                        # Multi-axis sharding: remove 'ep' if present, keep others
-                        filtered = tuple(a for a in axis if a != "ep")
-                        new_axes.append(filtered or None)
-                    else:
-                        # Single axis: remove if it's 'ep', keep otherwise
-                        new_axes.append(None if axis == "ep" else axis)
-                return P(*new_axes)
-            return jax.tree.map(filter_spec, spec_tree, is_leaf=lambda x: isinstance(x, P))
-
-        # Get partition specs from the states, removing 'ep' (handled by shard_map)
-        gate_state_specs = filter_out_ep(nnx.get_partition_spec(gate_state))
-        up_state_specs = filter_out_ep(nnx.get_partition_spec(up_state))
-        down_state_specs = filter_out_ep(nnx.get_partition_spec(down_state))
+        # Get full partition specs from the states
+        gate_state_specs = nnx.get_partition_spec(gate_state)
+        up_state_specs = nnx.get_partition_spec(up_state)
+        down_state_specs = nnx.get_partition_spec(down_state)
 
         in_specs = (
             P(), P(), P(), P(),  # tokens, weights, experts, adapters
@@ -444,7 +427,7 @@ class Qwen3Experts(nnx.Module):
             mesh=get_abstract_mesh(),
             in_specs=in_specs,
             out_specs=P(),
-            axis_names={"ep",},
+            axis_names={"ep"},
         )
         return sharded_fn(
             hidden_states, routing_weights, selected_experts, adapter_arg,
