@@ -241,8 +241,10 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
-        # Derive num_experts from weight shape (handles sharded case inside shard_map)
+        # Derive dimensions from weight shapes (handles sharded case inside shard_map)
         num_experts = self.weight.value.shape[0]
+        in_features = self.weight.value.shape[1]
+        out_features = self.weight.value.shape[2]
 
         # Reconstruct expert indices from group_sizes
         expert_indices = jnp.repeat(jnp.arange(num_experts), group_sizes, total_repeat_length=x.shape[0])
@@ -251,9 +253,14 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         flattened_indices = adapter_indices_sorted * num_experts + expert_indices
         num_flattened_groups = self.max_lora_adapters * num_experts
 
+        # Get actual lora dimensions from shapes (may be sharded)
+        lora_in_features = self.lora_A.value.shape[2]
+        lora_rank = self.lora_A.value.shape[3]
+        lora_out_features = self.lora_B.value.shape[3]
+
         # Reshape lora_A and lora_B to merge (max_lora_adapters, num_experts) dimensions
-        lora_A_reshaped = self.lora_A.value.reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
-        lora_B_reshaped = self.lora_B.value.reshape(num_flattened_groups, self.max_lora_rank, self.out_features)
+        lora_A_reshaped = self.lora_A.value.reshape(num_flattened_groups, lora_in_features, lora_rank)
+        lora_B_reshaped = self.lora_B.value.reshape(num_flattened_groups, lora_rank, lora_out_features)
 
         # Sort tokens by combined index
         x_sorted, combined_group_sizes, unsort_indices, _ = prepare_routing(x, flattened_indices, num_flattened_groups)
