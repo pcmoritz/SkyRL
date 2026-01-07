@@ -428,17 +428,12 @@ class Qwen3Experts(nnx.Module):
                 adapter_indices=adapters_local,
             )
 
-            # Debug: print shapes inside shard_map
-            jax.debug.print(
-                "INSIDE SHARD_MAP: gate_weight={gw}, gate_lora_a={gla}, gate_lora_b={glb}, "
-                "group_sizes={gs}, routed_tokens={rt}, experts_per_axis={epa}, max_lora_adapters={mla}",
-                gw=gate_weight.shape,
-                gla=gate_lora_a.shape,
-                glb=gate_lora_b.shape,
-                gs=group_sizes.shape,
-                rt=routed_tokens.shape,
-                epa=experts_per_axis,
-                mla=max_lora_adapters,
+            # Debug: print shapes inside shard_map (during tracing)
+            print(
+                f"INSIDE SHARD_MAP: gate_weight={gate_weight.shape}, gate_lora_a={gate_lora_a.shape}, "
+                f"gate_lora_b={gate_lora_b.shape}, group_sizes={group_sizes.shape}, "
+                f"routed_tokens={routed_tokens.shape}, experts_per_axis={experts_per_axis}, "
+                f"max_lora_adapters={max_lora_adapters}"
             )
 
             # Apply expert computations using the passed weights
