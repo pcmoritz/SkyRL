@@ -250,8 +250,23 @@ class Qwen3Experts(nnx.Module):
         capacity = getattr(self.config, "expert_capacity", None)
         if capacity is None:
             capacity = total_pairs
-        use_adapters = adapter_indices is not None
         adapter_arg = adapter_indices if adapter_indices is not None else jnp.zeros((hidden_states.shape[0],), jnp.int32)
+
+        # Extract weights to pass explicitly to shard_map
+        gate_w = self.gate_proj.weight.value
+        up_w = self.up_proj.weight.value
+        down_w = self.down_proj.weight.value
+        gate_lora_A = self.gate_proj.lora_A.value
+        gate_lora_B = self.gate_proj.lora_B.value
+        gate_lora_scaling = self.gate_proj.lora_scaling.value
+        up_lora_A = self.up_proj.lora_A.value
+        up_lora_B = self.up_proj.lora_B.value
+        up_lora_scaling = self.up_proj.lora_scaling.value
+        down_lora_A = self.down_proj.lora_A.value
+        down_lora_B = self.down_proj.lora_B.value
+        down_lora_scaling = self.down_proj.lora_scaling.value
+        max_lora_adapters = self.gate_proj.max_lora_adapters
+        max_lora_rank = self.gate_proj.max_lora_rank
 
         def segment_starts(lengths: jax.Array) -> jax.Array:
             zeros = jnp.zeros((1,), dtype=jnp.int32)
@@ -259,18 +274,77 @@ class Qwen3Experts(nnx.Module):
                 return zeros
             return jnp.concatenate([zeros, jnp.cumsum(lengths[:-1], dtype=jnp.int32)])
 
+        def apply_expert_with_lora(
+            x: jax.Array,
+            group_sizes: jax.Array,
+            weight: jax.Array,
+            lora_A: jax.Array,
+            lora_B: jax.Array,
+            lora_scaling: jax.Array,
+            adapter_indices_sorted: jax.Array | None,
+            in_features: int,
+            out_features: int,
+        ) -> jax.Array:
+            """Apply expert linear + LoRA using passed weights."""
+            base_out = jax.lax.ragged_dot(x, weight, group_sizes)
+
+            if adapter_indices_sorted is None:
+                return base_out
+
+            num_local_experts = weight.shape[0]
+
+            # Reconstruct expert indices from group_sizes
+            expert_indices = jnp.repeat(
+                jnp.arange(num_local_experts), group_sizes, total_repeat_length=x.shape[0]
+            )
+
+            # Flatten (adapter, expert) into a single routing dimension
+            flattened_indices = adapter_indices_sorted * num_local_experts + expert_indices
+            num_flattened_groups = max_lora_adapters * num_local_experts
+
+            # Reshape lora_A and lora_B to merge (max_lora_adapters, num_local_experts) dimensions
+            lora_A_reshaped = lora_A.reshape(num_flattened_groups, in_features, max_lora_rank)
+            lora_B_reshaped = lora_B.reshape(num_flattened_groups, max_lora_rank, out_features)
+
+            # Sort tokens by combined index
+            x_sorted, combined_group_sizes, unsort_indices, _ = prepare_routing(
+                x, flattened_indices, num_flattened_groups
+            )
+
+            # Apply LoRA using ragged_dot: x @ A @ B
+            intermediate = jax.lax.ragged_dot(x_sorted, lora_A_reshaped, combined_group_sizes)
+            lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B_reshaped, combined_group_sizes)
+
+            # Unsort and apply scaling
+            lora_output = lora_output_sorted[unsort_indices]
+            lora_output = lora_output * lora_scaling[adapter_indices_sorted, None]
+
+            return base_out + lora_output
+
         def expert_parallel_fn(
             tokens: jax.Array,
             weights: jax.Array,
             experts: jax.Array,
             adapters: jax.Array,
+            gate_weight: jax.Array,
+            up_weight: jax.Array,
+            down_weight: jax.Array,
+            gate_lora_a: jax.Array,
+            gate_lora_b: jax.Array,
+            gate_lora_s: jax.Array,
+            up_lora_a: jax.Array,
+            up_lora_b: jax.Array,
+            up_lora_s: jax.Array,
+            down_lora_a: jax.Array,
+            down_lora_b: jax.Array,
+            down_lora_s: jax.Array,
         ) -> jax.Array:
             num_tokens = tokens.shape[0]
             hidden_size = tokens.shape[-1]
             expanded_tokens = jnp.repeat(tokens, self.config.num_experts_per_tok, axis=0)
             expanded_experts = experts.reshape(-1)
             expanded_indices = jnp.arange(expanded_tokens.shape[0], dtype=jnp.int32)
-            adapter_flat = jnp.repeat(adapters, self.config.num_experts_per_tok, axis=0) if use_adapters else None
+            adapter_flat = jnp.repeat(adapters, self.config.num_experts_per_tok, axis=0)
             target_ep = expanded_experts // experts_per_axis
             local_expert = expanded_experts % experts_per_axis
             sort_perm = jnp.argsort(target_ep, stable=True)
@@ -279,10 +353,7 @@ class Qwen3Experts(nnx.Module):
             local_expert_sorted = local_expert[sort_perm]
             dispatch_sorted = expanded_indices[sort_perm]
             origin_sorted = jnp.full_like(target_ep_sorted, jax.lax.axis_index("ep"), dtype=jnp.int32)
-            if use_adapters and adapter_flat is not None:
-                adapters_sorted = adapter_flat[sort_perm]
-            else:
-                adapters_sorted = None
+            adapters_sorted = adapter_flat[sort_perm]
 
             send_sizes = jnp.bincount(target_ep_sorted, length=ep_size).astype(jnp.int32)
             input_offsets = segment_starts(send_sizes)
@@ -293,6 +364,7 @@ class Qwen3Experts(nnx.Module):
             expert_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
             dispatch_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
             origin_buffer = jnp.zeros((capacity,), dtype=jnp.int32)
+            adapter_buffer = jnp.zeros((capacity,), dtype=adapters.dtype)
             tokens_recv = jax.lax.ragged_all_to_all(
                 tokens_sorted,
                 token_buffer,
@@ -329,19 +401,15 @@ class Qwen3Experts(nnx.Module):
                 recv_sizes,
                 axis_name="ep",
             )
-            if use_adapters and adapters_sorted is not None:
-                adapter_buffer = jnp.zeros((capacity,), dtype=adapters.dtype)
-                adapters_recv = jax.lax.ragged_all_to_all(
-                    adapters_sorted,
-                    adapter_buffer,
-                    input_offsets,
-                    send_sizes,
-                    output_offsets,
-                    recv_sizes,
-                    axis_name="ep",
-                )
-            else:
-                adapters_recv = None
+            adapters_recv = jax.lax.ragged_all_to_all(
+                adapters_sorted,
+                adapter_buffer,
+                input_offsets,
+                send_sizes,
+                output_offsets,
+                recv_sizes,
+                axis_name="ep",
+            )
 
             total_recv = jnp.sum(recv_sizes, dtype=jnp.int32)
             # Don't slice - use full buffers. Mark invalid entries with origin=ep_size
@@ -359,15 +427,23 @@ class Qwen3Experts(nnx.Module):
                 experts_per_axis,
                 adapter_indices=adapters_local,
             )
-            print(
-                f"[TRACE] group_sizes shape: {group_sizes.shape}, "
-                f"gate_proj weight shape: {self.gate_proj.weight.value.shape}, "
-                f"experts_per_axis: {experts_per_axis}, "
-                f"weight sharding: {getattr(self.gate_proj.weight.value, 'sharding', 'N/A')}"
+
+            # Apply expert computations using the passed weights
+            gate_out = apply_expert_with_lora(
+                routed_tokens, group_sizes, gate_weight,
+                gate_lora_a, gate_lora_b, gate_lora_s, adapters_grouped,
+                self.config.hidden_size, self.config.moe_intermediate_size,
             )
-            gate_out = self.gate_proj(routed_tokens, group_sizes, adapters_grouped)
-            up_out = self.up_proj(routed_tokens, group_sizes, adapters_grouped)
-            down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapters_grouped)
+            up_out = apply_expert_with_lora(
+                routed_tokens, group_sizes, up_weight,
+                up_lora_a, up_lora_b, up_lora_s, adapters_grouped,
+                self.config.hidden_size, self.config.moe_intermediate_size,
+            )
+            down_out = apply_expert_with_lora(
+                nnx.silu(gate_out) * up_out, group_sizes, down_weight,
+                down_lora_a, down_lora_b, down_lora_s, adapters_grouped,
+                self.config.moe_intermediate_size, self.config.hidden_size,
+            )
             expert_outputs = down_out[unsort_idx]
 
             back_perm = jnp.argsort(origin_local, stable=True)
@@ -406,22 +482,36 @@ class Qwen3Experts(nnx.Module):
             reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
             return jnp.sum(reshaped * weights[..., None], axis=1)
 
-        # Debug: check sharding OUTSIDE shard_map
-        print(f"[OUTSIDE SHARD_MAP] gate_proj weight shape: {self.gate_proj.weight.value.shape}")
-        print(f"[OUTSIDE SHARD_MAP] gate_proj weight type: {type(self.gate_proj.weight.value)}")
-        print(f"[OUTSIDE SHARD_MAP] gate_proj weight sharding: {getattr(self.gate_proj.weight.value, 'sharding', 'N/A')}")
-        print(f"[OUTSIDE SHARD_MAP] gate_proj.weight type: {type(self.gate_proj.weight)}")
-        print(f"[OUTSIDE SHARD_MAP] gate_proj.weight sharding attr: {getattr(self.gate_proj.weight, 'sharding', 'N/A')}")
-        print(f"[OUTSIDE SHARD_MAP] mesh: {get_abstract_mesh()}")
+        in_specs = (
+            P(), P(), P(), P(),  # tokens, weights, experts, adapters
+            P("ep", None, None),  # gate_weight
+            P("ep", None, None),  # up_weight
+            P("ep", None, None),  # down_weight
+            P(None, "ep", None, None),  # gate_lora_A
+            P(None, "ep", None, None),  # gate_lora_B
+            P(None),  # gate_lora_scaling
+            P(None, "ep", None, None),  # up_lora_A
+            P(None, "ep", None, None),  # up_lora_B
+            P(None),  # up_lora_scaling
+            P(None, "ep", None, None),  # down_lora_A
+            P(None, "ep", None, None),  # down_lora_B
+            P(None),  # down_lora_scaling
+        )
 
         sharded_fn = jax.shard_map(
             expert_parallel_fn,
             mesh=get_abstract_mesh(),
-            in_specs=(P(), P(), P(), P()),
+            in_specs=in_specs,
             out_specs=P(),
             axis_names={"ep",},
         )
-        return sharded_fn(hidden_states, routing_weights, selected_experts, adapter_arg)
+        return sharded_fn(
+            hidden_states, routing_weights, selected_experts, adapter_arg,
+            gate_w, up_w, down_w,
+            gate_lora_A, gate_lora_B, gate_lora_scaling,
+            up_lora_A, up_lora_B, up_lora_scaling,
+            down_lora_A, down_lora_B, down_lora_scaling,
+        )
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
