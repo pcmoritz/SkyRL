@@ -410,10 +410,14 @@ class Qwen3Experts(nnx.Module):
             reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
             return jnp.sum(reshaped * weights[..., None], axis=1)
 
-        # Get full partition specs from the states
-        gate_state_specs = nnx.get_partition_spec(gate_state)
-        up_state_specs = nnx.get_partition_spec(up_state)
-        down_state_specs = nnx.get_partition_spec(down_state)
+        def filter_tp(spec):
+            """Remove 'tp' from a PartitionSpec (auto-managed by GSPMD)."""
+            return P(*(None if a == "tp" else a for a in spec))
+
+        # Get partition specs, filtering out 'tp' (auto-managed by GSPMD)
+        gate_state_specs = jax.tree.map(filter_tp, nnx.get_partition_spec(gate_state), is_leaf=lambda x: isinstance(x, P))
+        up_state_specs = jax.tree.map(filter_tp, nnx.get_partition_spec(up_state), is_leaf=lambda x: isinstance(x, P))
+        down_state_specs = jax.tree.map(filter_tp, nnx.get_partition_spec(down_state), is_leaf=lambda x: isinstance(x, P))
 
         in_specs = (
             P(), P(), P(), P(),  # tokens, weights, experts, adapters
@@ -427,7 +431,7 @@ class Qwen3Experts(nnx.Module):
             mesh=get_abstract_mesh(),
             in_specs=in_specs,
             out_specs=P(),
-            axis_names={"ep"},
+            axis_names={"ep", "fsdp"},
         )
         return sharded_fn(
             hidden_states, routing_weights, selected_experts, adapter_arg,
