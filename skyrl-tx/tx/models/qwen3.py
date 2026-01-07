@@ -302,7 +302,7 @@ class Qwen3Experts(nnx.Module):
             tokens_sorted = expanded_tokens[sort_perm]
             local_expert_sorted = local_expert[sort_perm]
             dispatch_sorted = expanded_indices[sort_perm]
-            origin_sorted = jnp.full_like(target_ep_sorted, jax.lax.axis_index("ep"), dtype=jnp.int32)
+            origin_sorted = jnp.full(target_ep_sorted.shape, jax.lax.axis_index("ep"), dtype=jnp.int32)
             adapters_sorted = adapter_flat[sort_perm]
 
             send_sizes = jnp.bincount(target_ep_sorted, length=ep_size).astype(jnp.int32)
