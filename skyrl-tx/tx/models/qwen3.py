@@ -431,13 +431,14 @@ class Qwen3Experts(nnx.Module):
                 adapter_indices=adapters_local,
             )
 
-            # Debug: print shapes inside shard_map (during tracing)
-            print(
-                f"INSIDE SHARD_MAP: gate_weight={gate_weight.shape}, gate_lora_a={gate_lora_a.shape}, "
-                f"gate_lora_b={gate_lora_b.shape}, group_sizes={group_sizes.shape}, "
-                f"routed_tokens={routed_tokens.shape}, experts_per_axis={experts_per_axis}, "
-                f"max_lora_adapters={max_lora_adapters}"
-            )
+            # Debug: check group_sizes sum at runtime
+            def check_group_sizes(gs, num_tokens):
+                total = int(gs.sum())
+                if total != num_tokens:
+                    print(f"WARNING: group_sizes sum={total} != num_tokens={num_tokens}")
+                else:
+                    print(f"OK: group_sizes sum={total} == num_tokens={num_tokens}")
+            jax.debug.callback(check_group_sizes, group_sizes, routed_tokens.shape[0])
 
             # Apply expert computations using the passed weights
             gate_out = apply_expert_with_lora(
