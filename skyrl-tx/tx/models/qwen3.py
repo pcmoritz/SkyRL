@@ -288,6 +288,9 @@ class Qwen3Experts(nnx.Module):
             """Apply expert linear + LoRA using passed weights."""
             base_out = jax.lax.ragged_dot(x, weight, group_sizes)
 
+            # TODO: Temporarily disabled LoRA to debug base computation
+            return base_out
+
             if adapter_indices_sorted is None:
                 return base_out
 
