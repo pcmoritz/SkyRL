@@ -279,12 +279,22 @@ class Qwen3Experts(nnx.Module):
             up_proj = nnx.merge(up_graphdef, up_s)
             down_proj = nnx.merge(down_graphdef, down_s)
 
+            # Each device processes its slice of tokens (since tokens are replicated)
             num_tokens = tokens.shape[0]
             hidden_size = tokens.shape[-1]
-            expanded_tokens = jnp.repeat(tokens, self.config.num_experts_per_tok, axis=0)
-            expanded_experts = experts.reshape(-1)
-            expanded_indices = jnp.arange(expanded_tokens.shape[0], dtype=jnp.int32)
-            adapter_flat = jnp.repeat(adapters, self.config.num_experts_per_tok, axis=0)
+            my_ep = jax.lax.axis_index("ep")
+            tokens_per_device = num_tokens // ep_size
+            start_idx = my_ep * tokens_per_device
+            my_tokens = jax.lax.dynamic_slice(tokens, (start_idx, 0), (tokens_per_device, hidden_size))
+            my_experts = jax.lax.dynamic_slice(experts, (start_idx, 0), (tokens_per_device, self.config.num_experts_per_tok))
+            my_adapters = jax.lax.dynamic_slice(adapters, (start_idx,), (tokens_per_device,))
+
+            expanded_tokens = jnp.repeat(my_tokens, self.config.num_experts_per_tok, axis=0)
+            expanded_experts = my_experts.reshape(-1)
+            # Use global indices for dispatch (to scatter back to correct positions)
+            base_idx = start_idx * self.config.num_experts_per_tok
+            expanded_indices = base_idx + jnp.arange(expanded_tokens.shape[0], dtype=jnp.int32)
+            adapter_flat = jnp.repeat(my_adapters, self.config.num_experts_per_tok, axis=0)
             target_ep = expanded_experts // experts_per_axis
             local_expert = expanded_experts % experts_per_axis
             sort_perm = jnp.argsort(target_ep, stable=True)
@@ -380,10 +390,11 @@ class Qwen3Experts(nnx.Module):
             send_sizes_back = jnp.bincount(origin_sorted_back, length=ep_size).astype(jnp.int32)
             input_offsets_back = segment_starts(send_sizes_back)
             recv_sizes_back = jax.lax.all_to_all(send_sizes_back, "ep", 0, 0, tiled=True)
-            recv_offsets_back = segment_starts(recv_sizes_back)
-            output_offsets_back = jax.lax.all_to_all(recv_offsets_back, "ep", 0, 0, tiled=True)
-            output_buffer = jnp.zeros((total_pairs, hidden_size), dtype=expert_outputs.dtype)
-            index_buffer = jnp.zeros((total_pairs,), dtype=jnp.int32)
+            output_offsets_back = segment_starts(recv_sizes_back)
+            # Each device only handles its slice of tokens
+            local_pairs = tokens_per_device * self.config.num_experts_per_tok
+            output_buffer = jnp.zeros((local_pairs, hidden_size), dtype=expert_outputs.dtype)
+            index_buffer = jnp.zeros((local_pairs,), dtype=jnp.int32)
             outputs_returned = jax.lax.ragged_all_to_all(
                 outputs_sorted_back,
                 output_buffer,
@@ -402,12 +413,16 @@ class Qwen3Experts(nnx.Module):
                 recv_sizes_back,
                 axis_name="ep",
             )
+            # Convert global indices to local indices
+            local_indices = indices_returned - base_idx
             # Don't slice - reverse so valid entries (at the beginning) scatter last
             # and overwrite any invalid entries that scattered to the same position
-            scatter_buffer = jnp.zeros((total_pairs, hidden_size), dtype=expert_outputs.dtype)
-            scatter_buffer = scatter_buffer.at[indices_returned[::-1]].set(outputs_returned[::-1])
-            reshaped = scatter_buffer.reshape(num_tokens, self.config.num_experts_per_tok, hidden_size)
-            return jnp.sum(reshaped * weights[..., None], axis=1)
+            scatter_buffer = jnp.zeros((local_pairs, hidden_size), dtype=expert_outputs.dtype)
+            scatter_buffer = scatter_buffer.at[local_indices[::-1]].set(outputs_returned[::-1])
+            reshaped = scatter_buffer.reshape(tokens_per_device, self.config.num_experts_per_tok, hidden_size)
+            # Use local slice of weights
+            my_weights = jax.lax.dynamic_slice(weights, (start_idx, 0), (tokens_per_device, self.config.num_experts_per_tok))
+            return jnp.sum(reshaped * my_weights[..., None], axis=1)
 
         # Get full partition specs from the states
         gate_state_specs = nnx.get_partition_spec(gate_state)
@@ -425,7 +440,7 @@ class Qwen3Experts(nnx.Module):
             expert_parallel_fn,
             mesh=get_abstract_mesh(),
             in_specs=in_specs,
-            out_specs=P(),
+            out_specs=P("ep", None),  # Concatenate outputs along batch dimension
             axis_names={"ep", "fsdp", "tp"},
         )
         return sharded_fn(
