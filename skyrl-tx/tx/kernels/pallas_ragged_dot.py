@@ -191,6 +191,9 @@ def _ragged_dot_forward_impl(
         max_concurrent_steps=config.max_concurrent_steps,
         grid_block_n=config.grid_block_n,
     )
+    token_idx = jnp.arange(m, dtype=jnp.int32)
+    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
+    result = jnp.where(valid_mask[:, None], result, 0)
     return _ensure_manual_varying(result)
 
 
@@ -252,7 +255,6 @@ def _pallas_ragged_dot(
                 rhs_index = group_info.group_id - 1
 
                 def acc_scope(acc_ref):
-                    acc_ref[...] = jnp.zeros_like(acc_ref)
                     @pl.when(is_real_group & (group_info.actual_size > 0))
                     def _():
                         plgpu.emit_pipeline(
@@ -281,26 +283,28 @@ def _pallas_ragged_dot(
                     o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
                 )
                 def store_scope(o_smem):  # pylint: disable=unused-variable
-                    o_smem[...] = acc.astype(o_smem.dtype)
-                    plgpu.commit_smem()
+                    @pl.when(is_real_group & (group_info.actual_size > 0))
+                    def _store():
+                        o_smem[...] = acc.astype(o_smem.dtype)
+                        plgpu.commit_smem()
 
-                    smem_start = group_info.start_within_block
-                    remaining_rows = min(block_m, m)
-                    while remaining_rows > 0:
-                        const_rows_len = 1 << int(math.log2(remaining_rows))
-                        remaining_rows //= 2
+                        smem_start = group_info.start_within_block
+                        remaining_rows = min(block_m, m)
+                        while remaining_rows > 0:
+                            const_rows_len = 1 << int(math.log2(remaining_rows))
+                            remaining_rows //= 2
 
-                        @pl.when(group_info.actual_size & const_rows_len != 0)
-                        def _():
-                            o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-                            o_gref_slice = o_gmem.at[
-                                pl.ds(group_info.block_start + smem_start, const_rows_len),
-                                pl.ds(ni * block_n, block_n),
-                            ]
-                            plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+                            @pl.when(group_info.actual_size & const_rows_len != 0)
+                            def _():
+                                o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
+                                o_gref_slice = o_gmem.at[
+                                    pl.ds(group_info.block_start + smem_start, const_rows_len),
+                                    pl.ds(ni * block_n, block_n),
+                                ]
+                                plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
 
-                        smem_start += group_info.actual_size & const_rows_len
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                            smem_start += group_info.actual_size & const_rows_len
+                        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
         # pl.loop executes immediately upon definition.
 
