@@ -116,6 +116,8 @@ def ragged_dot_with_group_offset(
     group_sizes: jax.Array,
     group_offset: jax.Array,
 ) -> jax.Array:
+    lhs = _ensure_manual_varying(lhs)
+    rhs = _ensure_manual_varying(rhs)
     return _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
 
 
