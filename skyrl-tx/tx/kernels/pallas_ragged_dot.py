@@ -252,7 +252,7 @@ def _pallas_ragged_dot(
                 rhs_index = group_info.group_id - 1
 
                 def acc_scope(acc_ref):
-                    acc_ref[...] = 0
+                    acc_ref[...] = jnp.zeros_like(acc_ref)
                     @pl.when(is_real_group & (group_info.actual_size > 0))
                     def _():
                         plgpu.emit_pipeline(
