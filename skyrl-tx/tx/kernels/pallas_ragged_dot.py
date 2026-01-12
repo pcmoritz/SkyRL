@@ -95,6 +95,8 @@ def _ragged_dot_forward_impl(
     """
     lhs = _cast_manual_axes(lhs, "unreduced")
     rhs = _cast_manual_axes(rhs, "unreduced")
+    group_sizes = _cast_manual_axes(group_sizes, "unreduced")
+    group_offset = _cast_manual_axes(group_offset, "unreduced")
 
     (m, k) = lhs.shape
     g_local, k_rhs, n = rhs.shape
@@ -182,6 +184,8 @@ def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     lhs = _cast_manual_axes(lhs, "unreduced")
     rhs = _cast_manual_axes(rhs, "unreduced")
     cotangent = _cast_manual_axes(cotangent, "unreduced")
+    group_sizes = _cast_manual_axes(group_sizes, "unreduced")
+    group_offset = _cast_manual_axes(group_offset, "unreduced")
     g_local = rhs.shape[0]
     m = lhs.shape[0]
     shard_start, shard_end, _, group_ids = _local_group_metadata(
