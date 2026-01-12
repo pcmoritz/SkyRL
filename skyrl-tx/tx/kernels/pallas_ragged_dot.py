@@ -125,7 +125,7 @@ def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
 
 def ragged_dot_with_group_offset_bwd(res, cotangent):
     lhs, rhs, group_sizes, group_offset = res
-    grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent)
+    grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, _ensure_manual_varying(cotangent))
     return grad_lhs, grad_rhs, None, None
 
 
@@ -174,7 +174,7 @@ def _ragged_dot_forward_impl(
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
     config = _choose_kernel_config(k, n)
-    return _pallas_ragged_dot(
+    result = _pallas_ragged_dot(
         lhs,
         rhs,
         group_sizes=extended_group_sizes,
@@ -184,6 +184,7 @@ def _ragged_dot_forward_impl(
         max_concurrent_steps=config.max_concurrent_steps,
         grid_block_n=config.grid_block_n,
     )
+    return _ensure_manual_varying(result)
 
 
 def _pallas_ragged_dot(
@@ -308,6 +309,9 @@ def _pallas_ragged_dot(
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     """Backward pass that masks non-local tokens and accumulates group grads."""
+    lhs = _ensure_manual_varying(lhs)
+    rhs = _ensure_manual_varying(rhs)
+    cotangent = _ensure_manual_varying(cotangent)
     g_local = rhs.shape[0]
     m = lhs.shape[0]
     shard_start, shard_end, _, group_ids = _local_group_metadata(
@@ -326,7 +330,7 @@ def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     updates = lhs_masked[:, :, None] * cot_masked[:, None, :]
     grad_rhs = jnp.zeros_like(rhs).at[safe_group_ids].add(updates)
 
-    return grad_lhs, grad_rhs
+    return _ensure_manual_varying(grad_lhs), _ensure_manual_varying(grad_rhs)
 
 
 def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
@@ -345,7 +349,7 @@ def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
     adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
 
     result = lax.ragged_dot(lhs, rhs, adjusted_group_sizes)
-    return jnp.where(valid_mask[:, None], result, 0)
+    return _ensure_manual_varying(jnp.where(valid_mask[:, None], result, 0))
 
 
 def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=False):
@@ -368,18 +372,27 @@ def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=Fals
         # We return all_group_ids which caller will use with proper slicing
         return shard_start, shard_end, local_group_sizes, all_group_ids
     return shard_start, shard_end, local_group_sizes, None
+def _active_manual_axes() -> tuple[jax_core.AxisName, ...]:
+    axis_env = jax_core.get_axis_env()
+    if axis_env is None:
+        return ()
+    axes = []
+    # Include explicitly tracked SPMD/manual axes and any axis present in env.
+    for axis in getattr(axis_env, "spmd_axis_names", set()):
+        if axis is not None:
+            axes.append(axis)
+    for axis in axis_env.axis_names():
+        if axis is not None and axis not in axes:
+            axes.append(axis)
+    return tuple(axes)
+
+
 def _ensure_manual_varying(x: jax.Array) -> jax.Array:
     """Annotate arrays as varying along active manual axes if needed."""
-    axis_env = jax_core.get_axis_env()
-    manual_axes = getattr(axis_env, "spmd_axis_names", set())
-    if not manual_axes:
-        return x
-    for axis in manual_axes:
-        if not axis_env.axis_exists(axis):
-            continue
+    for axis in _active_manual_axes():
         try:
             x = lax.pcast(x, axis, to="varying")
-        except ValueError:
-            # Axis already marked as varying or unsupported transition, skip.
+        except (ValueError, TypeError):
+            # Axis may already be varying or unavailable; skip safely.
             continue
     return x
