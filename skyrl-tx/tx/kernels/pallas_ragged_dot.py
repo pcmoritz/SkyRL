@@ -23,7 +23,6 @@ from jax import lax
 from jax import numpy as jnp
 from jax import custom_vjp
 from jax.experimental.pallas.ops.gpu import ragged_dot_mgpu
-from jax._src import core as jax_core
 
 
 class _KernelConfig(NamedTuple):
@@ -133,8 +132,7 @@ def _ragged_dot_forward_impl(
     )
     token_idx = jnp.arange(m, dtype=jnp.int32)
     valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
-    result = jnp.where(valid_mask[:, None], result, 0)
-    return _ensure_manual_varying(result)
+    return jnp.where(valid_mask[:, None], result, 0)
 
 
 def _pallas_ragged_dot(
@@ -194,7 +192,7 @@ def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     updates = lhs_masked[:, :, None] * cot_masked[:, None, :]
     grad_rhs = jnp.zeros_like(rhs).at[safe_group_ids].add(updates)
 
-    return _ensure_manual_varying(grad_lhs), _ensure_manual_varying(grad_rhs)
+    return grad_lhs, grad_rhs
 
 
 def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
@@ -213,7 +211,7 @@ def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
     adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
 
     result = lax.ragged_dot(lhs, rhs, adjusted_group_sizes)
-    return _ensure_manual_varying(jnp.where(valid_mask[:, None], result, 0))
+    return jnp.where(valid_mask[:, None], result, 0)
 
 
 def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=False):
@@ -236,46 +234,3 @@ def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=Fals
         # We return all_group_ids which caller will use with proper slicing
         return shard_start, shard_end, local_group_sizes, all_group_ids
     return shard_start, shard_end, local_group_sizes, None
-def _active_manual_axes() -> tuple[jax_core.AxisName, ...]:
-    axis_env = jax_core.get_axis_env()
-    if axis_env is None:
-        return ()
-    axes = []
-    # Include explicitly tracked SPMD/manual axes and any axis present in env.
-    for axis in getattr(axis_env, "spmd_axis_names", set()):
-        if axis is not None:
-            axes.append(axis)
-    for axis in axis_env.axis_names():
-        if axis is not None and axis not in axes:
-            axes.append(axis)
-    return tuple(axes)
-
-
-def _axes_from_partition_spec(spec) -> set[str]:
-    if spec is None:
-        return set()
-    if isinstance(spec, str):
-        return {spec}
-    if isinstance(spec, (tuple, list)):
-        axes = set()
-        for elem in spec:
-            axes |= _axes_from_partition_spec(elem)
-        return axes
-    return set()
-
-
-def _ensure_manual_varying(x: jax.Array) -> jax.Array:
-    """Annotate arrays as varying along active manual axes if needed."""
-    axes = set(_active_manual_axes())
-    sharding = getattr(x, "sharding", None)
-    spec = getattr(sharding, "spec", None)
-    axes |= _axes_from_partition_spec(spec)
-    for axis in axes:
-        if axis is None:
-            continue
-        try:
-            x = lax.pcast(x, axis, to="varying")
-        except (ValueError, TypeError):
-            # Axis may already be varying or unavailable; skip safely.
-            continue
-    return x
