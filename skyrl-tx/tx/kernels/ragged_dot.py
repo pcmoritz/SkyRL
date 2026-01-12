@@ -199,64 +199,6 @@ def _ragged_dot_simple(
     return out
 
 
-def _trans_ragged_dot_simple(
-    lhs: jax.Array,
-    rhs: jax.Array,
-    group_sizes: jax.Array,
-    group_offset: jax.Array,
-    g_local: int,
-    precision=None,
-    preferred_element_type=None,
-) -> jax.Array:
-    """Compute transposed ragged dot: lhs.T @ rhs, accumulated by group.
-
-    This computes the gradient with respect to the weight matrix.
-    lhs: [m, k], rhs: [m, n], output: [g_local, k, n]
-    """
-    m, k = lhs.shape
-    _, n = rhs.shape
-    g = group_sizes.shape[0]
-    offset = group_offset[0]
-
-    # Compute group assignments
-    cumsum = jnp.cumsum(group_sizes)
-    token_indices = jnp.arange(m)
-    group_idx = jnp.searchsorted(cumsum, token_indices, side="right")
-
-    # Valid mask for tokens in local groups
-    valid_mask = (group_idx >= offset) & (group_idx < offset + g_local)
-    local_group_idx = group_idx - offset
-
-    # Initialize output
-    out = jnp.zeros((g_local, k, n), dtype=lhs.dtype)
-
-    # Use segment_sum to accumulate by group
-    # First, compute outer products: lhs[:, :, None] * rhs[:, None, :]
-    # This gives [m, k, n]
-    outer_products = lhs[:, :, None] * rhs[:, None, :]
-
-    # Mask invalid tokens
-    outer_products = jnp.where(valid_mask[:, None, None], outer_products, 0.0)
-
-    # Accumulate by local group using segment_sum
-    # We need to scatter-add outer_products[i] to out[local_group_idx[i]]
-    # Clip indices for safety (invalid tokens will contribute 0 anyway)
-    safe_local_idx = jnp.clip(local_group_idx, 0, g_local - 1)
-
-    # Use segment_sum with sorted indices
-    sort_idx = jnp.argsort(safe_local_idx)
-    sorted_local_idx = safe_local_idx[sort_idx]
-    sorted_outer = outer_products[sort_idx]
-
-    # Segment sum
-    out = jax.ops.segment_sum(sorted_outer, sorted_local_idx, num_segments=g_local)
-
-    if preferred_element_type is not None:
-        out = out.astype(preferred_element_type)
-
-    return out
-
-
 def ragged_dot_pallas(
     lhs: jax.Array,
     rhs: jax.Array,

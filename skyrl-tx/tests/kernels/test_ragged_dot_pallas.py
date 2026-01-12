@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from tx.kernels.ragged_dot import ragged_dot_pallas, _ragged_dot_simple, _trans_ragged_dot_simple
+from tx.kernels.ragged_dot import ragged_dot_pallas, _ragged_dot_simple
 from tx.layers.util import _ragged_dot_fallback
 
 
@@ -151,37 +151,6 @@ def test_ragged_dot_pallas_gradient_rhs(group_sizes, group_offset, g_local):
     assert jnp.allclose(grad_autodiff, grad_fd, rtol=1e-2, atol=1e-2), (
         f"Autodiff grad:\n{grad_autodiff}\nFinite diff:\n{grad_fd}"
     )
-
-
-def test_trans_ragged_dot_simple():
-    """Test transpose ragged dot (used in backward pass)."""
-    m, k, n = 6, 4, 3
-    g = 3
-    g_local = 2
-    group_offset = 1
-    group_sizes = jnp.array([2, 2, 2])
-
-    key = jax.random.PRNGKey(42)
-    key1, key2 = jax.random.split(key)
-    lhs = jax.random.normal(key1, (m, k), dtype=jnp.float32)
-    rhs = jax.random.normal(key2, (m, n), dtype=jnp.float32)
-    group_offset_arr = jnp.array([group_offset])
-
-    result = _trans_ragged_dot_simple(lhs, rhs, group_sizes, group_offset_arr, g_local)
-
-    # Verify shape
-    assert result.shape == (g_local, k, n), f"Expected shape {(g_local, k, n)}, got {result.shape}"
-
-    # Manual computation for verification
-    # Tokens 2,3 belong to group 1 (local index 0)
-    # Tokens 4,5 belong to group 2 (local index 1)
-    expected = jnp.zeros((g_local, k, n))
-    # Group 1 (local 0): tokens 2, 3
-    expected = expected.at[0].set(lhs[2:4].T @ rhs[2:4])
-    # Group 2 (local 1): tokens 4, 5
-    expected = expected.at[1].set(lhs[4:6].T @ rhs[4:6])
-
-    assert jnp.allclose(result, expected, atol=1e-5), f"Got:\n{result}\nExpected:\n{expected}"
 
 
 def test_ragged_dot_pallas_jit():
