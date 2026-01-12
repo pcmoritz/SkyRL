@@ -181,9 +181,12 @@ def _ragged_dot_forward_impl(
         config = config._replace(block_m=min(config.block_m, m))
     if n > 0:
         config = config._replace(block_n=min(config.block_n, n))
+    zero_slice = jnp.zeros((1, k, n), dtype=rhs.dtype)
+    padded_rhs = jnp.concatenate([zero_slice, rhs, zero_slice], axis=0)
+
     result = _pallas_ragged_dot(
         lhs,
-        rhs,
+        padded_rhs,
         group_sizes=extended_group_sizes,
         block_m=config.block_m,
         block_n=config.block_n,
@@ -212,12 +215,10 @@ def _pallas_ragged_dot(
     if lhs.dtype != rhs.dtype:
         raise NotImplementedError(f"dtype mismatch: lhs={lhs.dtype} rhs={rhs.dtype}")
     m, k = lhs.shape
-    g_local, k_rhs, n = rhs.shape
-    g_ext = group_sizes.shape[0]
-
-    if g_ext != g_local + 2:
+    g_ext, k_rhs, n = rhs.shape
+    if g_ext != group_sizes.shape[0]:
         raise ValueError(
-            f"Expected group_sizes to have length {g_local + 2} (with padding) but got {g_ext}"
+            f"Expected group_sizes to have length {g_ext} but got {group_sizes.shape[0]}"
         )
     if k != k_rhs:
         raise ValueError(f"lhs.shape[1]={k} must match rhs.shape[1]={k_rhs}")
