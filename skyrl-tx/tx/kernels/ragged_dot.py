@@ -415,8 +415,10 @@ def _ragged_dot_pallas_impl(
     )
 
     # Compiler params for GPU (if available)
+    # Use interpret mode on CPU/TPU, native Pallas on GPU
+    use_interpret = not (HAS_TRITON and is_gpu())
     compiler_params = {}
-    if HAS_TRITON and CompilerParams is not None:
+    if HAS_TRITON and CompilerParams is not None and is_gpu():
         compiler_params = {"compiler_params": CompilerParams(num_warps=4, num_stages=2)}
 
     y = pl.pallas_call(
@@ -425,7 +427,7 @@ def _ragged_dot_pallas_impl(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
-        interpret=not HAS_TRITON,
+        interpret=use_interpret,
         **compiler_params,
     )(lhs, rhs, group_sizes, group_offsets, group_offset)
 
@@ -484,8 +486,9 @@ def _ragged_dot_grad_lhs_impl_no_mask(
         acc_dtype=jnp.float32,
     )
 
+    use_interpret = not (HAS_TRITON and is_gpu())
     compiler_params = {}
-    if HAS_TRITON and CompilerParams is not None:
+    if HAS_TRITON and CompilerParams is not None and is_gpu():
         compiler_params = {"compiler_params": CompilerParams(num_warps=4, num_stages=2)}
 
     dx = pl.pallas_call(
@@ -494,7 +497,7 @@ def _ragged_dot_grad_lhs_impl_no_mask(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
-        interpret=not HAS_TRITON,
+        interpret=use_interpret,
         **compiler_params,
     )(dy, rhs, group_sizes, group_offsets, group_offset)
 
@@ -549,8 +552,9 @@ def _ragged_dot_grad_rhs_impl(
         acc_dtype=jnp.float32,
     )
 
+    use_interpret = not (HAS_TRITON and is_gpu())
     compiler_params = {}
-    if HAS_TRITON and CompilerParams is not None:
+    if HAS_TRITON and CompilerParams is not None and is_gpu():
         compiler_params = {"compiler_params": CompilerParams(num_warps=4, num_stages=2)}
 
     dA = pl.pallas_call(
@@ -559,7 +563,7 @@ def _ragged_dot_grad_rhs_impl(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
-        interpret=not HAS_TRITON,
+        interpret=use_interpret,
         **compiler_params,
     )(lhs, dy, group_sizes, group_offsets, group_offset)
 
@@ -612,35 +616,43 @@ def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, prefe
 def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
-    Uses reshape to strip VMA, then broadcast_to with input shape to match input type.
+    Handles VMA (Varying Manual Axes) for shard_map compatibility:
+    - If lhs is replicated (no VMA), d_lhs must also be replicated
+    - This requires summing local gradients across shards via psum
+    - If lhs is sharded (has VMA), d_lhs naturally has matching VMA
     """
     lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
     m = lhs.shape[0]
 
     # Compute raw gradients with Pallas kernels
-    d_lhs_raw = _ragged_dot_grad_lhs_impl_no_mask(
+    d_lhs_local = _ragged_dot_grad_lhs_impl_no_mask(
         g, rhs, group_sizes, group_offset,
         out_dtype=lhs.dtype,
     )
-    d_rhs_raw = _ragged_dot_grad_rhs_impl(
+    d_rhs = _ragged_dot_grad_rhs_impl(
         lhs, g, group_sizes, group_offset,
         g_local=g_local,
         out_dtype=rhs.dtype,
     )
 
-    # Compute valid mask
+    # Mask d_lhs to only include gradients for local tokens
+    # This is needed because Pallas may not zero-initialize non-local positions
     valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
+    d_lhs_local = jnp.where(valid_mask[:, None], d_lhs_local, 0)
 
-    # Apply masking to d_lhs
-    d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0).astype(lhs.dtype)
+    # For replicated inputs, we need to sum gradients across shards.
+    # Use psum with the expert parallel axis name 'ep'.
+    # If we're not inside shard_map, psum is a no-op (single device).
+    try:
+        # Try to sum across expert parallel axis
+        # Each shard computed gradient for its local tokens (others are 0)
+        # Sum gives the full gradient, which is now replicated across shards
+        d_lhs = jax.lax.psum(d_lhs_local, axis_name='ep')
+    except NameError:
+        # Not inside shard_map with 'ep' axis, use local gradient directly
+        d_lhs = d_lhs_local
 
-    # Use reshape to force new array, then multiply by (lhs * 0 + 1) to inherit VMA
-    # The (input * 0 + 1) creates ones with input's VMA
-    d_lhs = d_lhs_masked.reshape(lhs.shape) * (lhs * 0 + 1)
-    d_rhs = d_rhs_raw.astype(rhs.dtype).reshape(rhs.shape) * (rhs * 0 + 1)
-
-    # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
 
 
