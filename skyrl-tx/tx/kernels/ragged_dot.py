@@ -437,7 +437,7 @@ def _ragged_dot_pallas_impl(
     return y
 
 
-def _ragged_dot_grad_lhs_impl(
+def _ragged_dot_grad_lhs_impl_no_mask(
     dy: jax.Array,
     rhs: jax.Array,
     group_sizes: jax.Array,
@@ -447,7 +447,7 @@ def _ragged_dot_grad_lhs_impl(
     block_k: int = DEFAULT_BLOCK_K,
     block_n: int = DEFAULT_BLOCK_N,
 ) -> jax.Array:
-    """Compute d_lhs = dy @ rhs^T (ragged) using Pallas."""
+    """Compute d_lhs = dy @ rhs^T (ragged) using Pallas. No masking - caller handles it."""
     m, n = dy.shape
     g_local, k, _ = rhs.shape
     g = group_sizes.shape[0]
@@ -497,11 +497,6 @@ def _ragged_dot_grad_lhs_impl(
         interpret=not HAS_TRITON,
         **compiler_params,
     )(dy, rhs, group_sizes, group_offsets, group_offset)
-
-    # Pallas doesn't zero-initialize output, so tokens outside local groups
-    # may contain garbage. Explicitly mask them to zero.
-    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
-    dx = jnp.where(valid_mask[:, None], dx, 0)
 
     return dx
 
@@ -605,27 +600,37 @@ def ragged_dot_pallas(
 
 def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type):
     """Forward pass for custom_vjp."""
+    m, k = lhs.shape
+    g_local = rhs.shape[0]
+
     result = _ragged_dot_pallas_impl(
         lhs, rhs, group_sizes, group_offset,
         precision=precision,
         preferred_element_type=preferred_element_type,
     )
+
+    # Compute valid mask here (in forward context) to preserve correct VMA
+    # This mask will be reused in backward to ensure VMA consistency
+    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
+
     # Save residuals for backward pass
-    return result, (lhs, rhs, group_sizes, group_offset)
+    return result, (lhs, rhs, group_sizes, group_offset, valid_mask)
 
 
 def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
-    To preserve VMA (varying manual axes) annotations for shard_map compatibility,
-    we add a zero-weighted input to the output. This forces JAX to propagate the
-    VMA from the input to the gradient output.
+    Uses the valid_mask computed in forward pass to ensure VMA consistency.
+    The gradients are computed as:
+    - d_lhs = g @ rhs^T (for tokens in local groups)
+    - d_rhs[i] = lhs[tokens_in_group_i]^T @ g[tokens_in_group_i]
     """
-    lhs, rhs, group_sizes, group_offset = residuals
+    lhs, rhs, group_sizes, group_offset, valid_mask = residuals
     g_local = rhs.shape[0]
+    m = lhs.shape[0]
 
-    # Compute gradients with Pallas kernels
-    d_lhs_raw = _ragged_dot_grad_lhs_impl(
+    # Compute raw gradients with Pallas kernels (no masking inside)
+    d_lhs_raw = _ragged_dot_grad_lhs_impl_no_mask(
         g, rhs, group_sizes, group_offset,
         out_dtype=lhs.dtype,
     )
@@ -635,11 +640,16 @@ def _ragged_dot_pallas_bwd(residuals, g):
         out_dtype=rhs.dtype,
     )
 
-    # Inherit VMA from inputs by adding zero-weighted input
-    # This doesn't change the value but ensures the output type matches the input type
-    # (including VMA annotations for shard_map compatibility)
-    d_lhs = d_lhs_raw + lhs * 0
-    d_rhs = d_rhs_raw + rhs * 0
+    # Apply mask using lhs as base to ensure correct VMA
+    # jax.lax.select preserves the type of the first array when shapes match
+    d_lhs = jax.lax.select(
+        jnp.broadcast_to(valid_mask[:, None], lhs.shape),
+        d_lhs_raw.astype(lhs.dtype),
+        jnp.zeros_like(lhs),
+    )
+
+    # For d_rhs, use rhs as base for VMA
+    d_rhs = jnp.zeros_like(rhs) + d_rhs_raw
 
     # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
