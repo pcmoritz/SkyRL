@@ -4,6 +4,19 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec
 
+try:
+    from tx.kernels.pallas_ragged_dot import ragged_dot_with_group_offset as _pallas_ragged_dot
+except Exception:  # pragma: no cover - fallback when GPU kernel is unavailable
+    _pallas_ragged_dot = None
+
+
+def _can_use_pallas(dtype: jnp.dtype) -> bool:
+    if _pallas_ragged_dot is None:
+        return False
+    if jax.default_backend() != "gpu":
+        return False
+    return dtype in (jnp.float16, jnp.bfloat16)
+
 
 def ragged_dot(
     lhs: jax.Array,
@@ -28,6 +41,13 @@ def ragged_dot(
         )
 
     assert group_offset.shape == (1,), "group_offset must have shape (1,)"
+    if _can_use_pallas(lhs.dtype):
+        try:
+            return _pallas_ragged_dot(lhs, rhs, group_sizes=group_sizes, group_offset=group_offset)
+        except (ValueError, NotImplementedError):
+            # Fall back to the masking implementation when the kernel rejects the shape.
+            pass
+
     offset = group_offset[0]
     m = lhs.shape[0]
     g_local = rhs.shape[0]
