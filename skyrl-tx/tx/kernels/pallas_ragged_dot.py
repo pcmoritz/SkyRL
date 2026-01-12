@@ -336,10 +336,8 @@ def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=Fals
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
     if return_ids:
         local_len = shard_end - shard_start
-        group_ids = jnp.repeat(
-            jnp.arange(g_local, dtype=jnp.int32),
-            local_group_sizes,
-            total_repeat_length=local_len,
-        )
+        token_idx = jnp.arange(local_len, dtype=jnp.int32)
+        bins = jnp.cumsum(local_group_sizes, dtype=jnp.int32)[:-1]
+        group_ids = jnp.searchsorted(bins, token_idx, side="right")
         return shard_start, shard_end, local_group_sizes, group_ids
     return shard_start, shard_end, local_group_sizes, None
