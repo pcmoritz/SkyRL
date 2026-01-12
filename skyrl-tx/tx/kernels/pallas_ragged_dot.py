@@ -58,8 +58,6 @@ def ragged_dot_with_group_offset(
     group_sizes: jax.Array,
     group_offset: jax.Array,
 ) -> jax.Array:
-    lhs = _ensure_manual_varying(lhs)
-    rhs = _ensure_manual_varying(rhs)
     return _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
 
 
@@ -70,7 +68,7 @@ def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
 
 def ragged_dot_with_group_offset_bwd(res, cotangent):
     lhs, rhs, group_sizes, group_offset = res
-    grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, _ensure_manual_varying(cotangent))
+    grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent)
     return grad_lhs, grad_rhs, None, None
 
 
@@ -94,9 +92,6 @@ def _ragged_dot_forward_impl(
     Returns:
         Output array of shape (M, N) containing zeros for non-local experts.
     """
-    lhs = _ensure_manual_varying(lhs)
-    rhs = _ensure_manual_varying(rhs)
-
     (m, k) = lhs.shape
     g_local, k_rhs, n = rhs.shape
 
@@ -181,9 +176,6 @@ def _pallas_ragged_dot(
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     """Backward pass that masks non-local tokens and accumulates group grads."""
-    lhs = _ensure_manual_varying(lhs)
-    rhs = _ensure_manual_varying(rhs)
-    cotangent = _ensure_manual_varying(cotangent)
     g_local = rhs.shape[0]
     m = lhs.shape[0]
     shard_start, shard_end, _, group_ids = _local_group_metadata(
