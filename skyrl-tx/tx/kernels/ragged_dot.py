@@ -599,37 +599,27 @@ def ragged_dot_pallas(
 
 
 def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type):
-    """Forward pass for custom_vjp."""
-    m, k = lhs.shape
-    g_local = rhs.shape[0]
-
+    """Forward pass for custom_vjp - uses Pallas kernel."""
     result = _ragged_dot_pallas_impl(
         lhs, rhs, group_sizes, group_offset,
         precision=precision,
         preferred_element_type=preferred_element_type,
     )
-
-    # Compute valid mask here (in forward context) to preserve correct VMA
-    # This mask will be reused in backward to ensure VMA consistency
-    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
-
     # Save residuals for backward pass
-    return result, (lhs, rhs, group_sizes, group_offset, valid_mask)
+    return result, (lhs, rhs, group_sizes, group_offset)
 
 
 def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
-    Uses the valid_mask computed in forward pass to ensure VMA consistency.
-    The gradients are computed as:
-    - d_lhs = g @ rhs^T (for tokens in local groups)
-    - d_rhs[i] = lhs[tokens_in_group_i]^T @ g[tokens_in_group_i]
+    Uses jax.lax.cond to force output types to match input types exactly,
+    which is required for shard_map VMA compatibility.
     """
-    lhs, rhs, group_sizes, group_offset, valid_mask = residuals
+    lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
     m = lhs.shape[0]
 
-    # Compute raw gradients with Pallas kernels (no masking inside)
+    # Compute raw gradients with Pallas kernels
     d_lhs_raw = _ragged_dot_grad_lhs_impl_no_mask(
         g, rhs, group_sizes, group_offset,
         out_dtype=lhs.dtype,
@@ -640,16 +630,26 @@ def _ragged_dot_pallas_bwd(residuals, g):
         out_dtype=rhs.dtype,
     )
 
-    # Apply mask using lhs as base to ensure correct VMA
-    # jax.lax.select preserves the type of the first array when shapes match
-    d_lhs = jax.lax.select(
-        jnp.broadcast_to(valid_mask[:, None], lhs.shape),
-        d_lhs_raw.astype(lhs.dtype),
-        jnp.zeros_like(lhs),
-    )
+    # Compute valid mask
+    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
 
-    # For d_rhs, use rhs as base for VMA
-    d_rhs = jnp.zeros_like(rhs) + d_rhs_raw
+    # Apply masking to d_lhs
+    d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0)
+
+    # Use jax.lax.cond to force output type to match input type exactly
+    # The false branch (lhs, rhs) is never taken but determines the output type/VMA
+    d_lhs = jax.lax.cond(
+        True,
+        lambda _: d_lhs_masked.astype(lhs.dtype),
+        lambda _: lhs,
+        None
+    )
+    d_rhs = jax.lax.cond(
+        True,
+        lambda _: d_rhs_raw.astype(rhs.dtype),
+        lambda _: rhs,
+        None
+    )
 
     # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
