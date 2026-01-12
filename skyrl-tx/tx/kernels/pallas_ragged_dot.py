@@ -252,11 +252,10 @@ def _pallas_ragged_dot(
                     grid_block_n,
                 )
                 group_info = GroupInfo.create(rows_per_expert, block_m, mi)
-                is_real_group = (group_info.group_id > 0) & (group_info.group_id < g_ext - 1)
-                rhs_index = group_info.group_id - 1
+                rhs_index = group_info.group_id
 
                 def acc_scope(acc_ref):
-                    @pl.when(is_real_group & (group_info.actual_size > 0))
+                    @pl.when(group_info.actual_size > 0)
                     def _():
                         plgpu.emit_pipeline(
                             lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
@@ -284,7 +283,7 @@ def _pallas_ragged_dot(
                     o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
                 )
                 def store_scope(o_smem):  # pylint: disable=unused-variable
-                    @pl.when(is_real_group & (group_info.actual_size > 0))
+                    @pl.when(group_info.actual_size > 0)
                     def _store():
                         o_smem[...] = acc.astype(o_smem.dtype)
                         plgpu.commit_smem()
