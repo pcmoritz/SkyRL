@@ -177,6 +177,9 @@ def _ragged_dot_forward_impl(
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
     config = _choose_kernel_config(k, n)
+    block_m = min(config.block_m, m if m > 0 else config.block_m)
+    block_n = min(config.block_n, n if n > 0 else config.block_n)
+    config = config._replace(block_m=block_m, block_n=block_n)
     result = _pallas_ragged_dot(
         lhs,
         rhs,
