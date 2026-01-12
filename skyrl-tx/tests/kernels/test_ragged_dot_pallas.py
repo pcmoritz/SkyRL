@@ -4,8 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from tx.kernels.ragged_dot import ragged_dot_pallas, _ragged_dot_simple
-from tx.layers.util import _ragged_dot_fallback
+from tx.layers.util import ragged_dot
 
 
 @pytest.mark.parametrize(
@@ -19,7 +18,7 @@ from tx.layers.util import _ragged_dot_fallback
         ([1, 3, 2], 1, 2, [0, 1, 1, 1, 2, 2]),  # uneven sizes
     ],
 )
-def test_ragged_dot_pallas_forward(group_sizes, group_offset, g_local, expected_scale):
+def test_ragged_dot_forward(group_sizes, group_offset, g_local, expected_scale):
     """Test Pallas kernel forward pass matches expected output."""
     group_sizes = jnp.array(group_sizes)
     m, d = 6, 2
@@ -27,7 +26,7 @@ def test_ragged_dot_pallas_forward(group_sizes, group_offset, g_local, expected_
     lhs = jnp.arange(m * d, dtype=jnp.float32).reshape(m, d)
     rhs = jnp.stack([(i + 1) * jnp.eye(d) for i in range(g_local)])  # 1*I, 2*I, ...
 
-    result = jax.jit(ragged_dot_pallas)(lhs, rhs, group_sizes, jnp.array([group_offset]))
+    result = jax.jit(ragged_dot)(lhs, rhs, group_sizes, group_offset=jnp.array([group_offset]))
 
     # expected_scale: 0 for masked tokens, else local_group_idx + 1
     scale = jnp.array(expected_scale, dtype=jnp.float32)[:, None]
@@ -43,38 +42,9 @@ def test_ragged_dot_pallas_forward(group_sizes, group_offset, g_local, expected_
         ([2, 2, 2], 0, 2),  # first shard
         ([2, 2, 2], 2, 1),  # last shard
         ([6], 0, 1),  # single group
-        ([1, 3, 2], 1, 2),  # uneven sizes
     ],
 )
-def test_ragged_dot_pallas_matches_fallback(group_sizes, group_offset, g_local):
-    """Test Pallas kernel matches fallback implementation."""
-    group_sizes = jnp.array(group_sizes)
-    m, k, n = 6, 4, 3
-
-    key = jax.random.PRNGKey(42)
-    key1, key2 = jax.random.split(key)
-    lhs = jax.random.normal(key1, (m, k), dtype=jnp.float32)
-    rhs = jax.random.normal(key2, (g_local, k, n), dtype=jnp.float32)
-    group_offset_arr = jnp.array([group_offset])
-
-    result_pallas = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
-    result_fallback = _ragged_dot_fallback(lhs, rhs, group_sizes, group_offset_arr)
-
-    assert jnp.allclose(result_pallas, result_fallback, atol=1e-5), (
-        f"Pallas:\n{result_pallas}\nFallback:\n{result_fallback}"
-    )
-
-
-@pytest.mark.parametrize(
-    "group_sizes,group_offset,g_local",
-    [
-        ([2, 2, 2], 1, 2),  # middle shard
-        ([2, 2, 2], 0, 2),  # first shard
-        ([2, 2, 2], 2, 1),  # last shard
-        ([6], 0, 1),  # single group
-    ],
-)
-def test_ragged_dot_pallas_gradient_lhs(group_sizes, group_offset, g_local):
+def test_ragged_dot_gradient_lhs(group_sizes, group_offset, g_local):
     """Test gradient w.r.t. lhs is correct."""
     group_sizes = jnp.array(group_sizes)
     m, k, n = 6, 4, 3
@@ -87,7 +57,7 @@ def test_ragged_dot_pallas_gradient_lhs(group_sizes, group_offset, g_local):
 
     # Compute gradient via autodiff
     def loss_fn(lhs):
-        out = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
+        out = ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset_arr)
         return jnp.sum(out**2)
 
     grad_autodiff = jax.grad(loss_fn)(lhs)
@@ -117,7 +87,7 @@ def test_ragged_dot_pallas_gradient_lhs(group_sizes, group_offset, g_local):
         ([6], 0, 1),  # single group
     ],
 )
-def test_ragged_dot_pallas_gradient_rhs(group_sizes, group_offset, g_local):
+def test_ragged_dot_gradient_rhs(group_sizes, group_offset, g_local):
     """Test gradient w.r.t. rhs is correct."""
     group_sizes = jnp.array(group_sizes)
     m, k, n = 6, 4, 3
@@ -130,7 +100,7 @@ def test_ragged_dot_pallas_gradient_rhs(group_sizes, group_offset, g_local):
 
     # Compute gradient via autodiff
     def loss_fn(rhs):
-        out = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
+        out = ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset_arr)
         return jnp.sum(out**2)
 
     grad_autodiff = jax.grad(loss_fn)(rhs)
@@ -153,7 +123,7 @@ def test_ragged_dot_pallas_gradient_rhs(group_sizes, group_offset, g_local):
     )
 
 
-def test_ragged_dot_pallas_jit():
+def test_ragged_dot_jit():
     """Test that Pallas kernel works under JIT."""
     group_sizes = jnp.array([2, 2, 2])
     m, k, n = 6, 4, 3
@@ -167,15 +137,15 @@ def test_ragged_dot_pallas_jit():
     group_offset_arr = jnp.array([group_offset])
 
     # Non-JIT result
-    result_eager = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
+    result_eager = ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset_arr)
 
     # JIT result
-    result_jit = jax.jit(ragged_dot_pallas)(lhs, rhs, group_sizes, group_offset_arr)
+    result_jit = jax.jit(ragged_dot)(lhs, rhs, group_sizes, group_offset=group_offset_arr)
 
     assert jnp.allclose(result_eager, result_jit, atol=1e-5)
 
 
-def test_ragged_dot_pallas_bfloat16():
+def test_ragged_dot_bfloat16():
     """Test Pallas kernel with bfloat16 inputs."""
     group_sizes = jnp.array([2, 2, 2])
     m, k, n = 6, 4, 3
@@ -188,13 +158,13 @@ def test_ragged_dot_pallas_bfloat16():
     rhs = jax.random.normal(key2, (g_local, k, n), dtype=jnp.bfloat16)
     group_offset_arr = jnp.array([group_offset])
 
-    result = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
+    result = ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset_arr)
 
     assert result.dtype == jnp.bfloat16
     assert result.shape == (m, n)
 
 
-def test_ragged_dot_pallas_larger_problem():
+def test_ragged_dot_larger_problem():
     """Test with larger problem size."""
     g = 8
     m = 64
@@ -213,7 +183,7 @@ def test_ragged_dot_pallas_larger_problem():
     rhs = jax.random.normal(key2, (g_local, k, n), dtype=jnp.float32)
     group_offset_arr = jnp.array([group_offset])
 
-    result = ragged_dot_pallas(lhs, rhs, group_sizes, group_offset_arr)
+    result = ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset_arr)
 
     # Verify basic properties
     assert result.shape == (m, n)
