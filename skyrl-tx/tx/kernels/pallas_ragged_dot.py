@@ -29,6 +29,7 @@ from jax import custom_vjp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax._src import core as jax_core
+from jax.sharding import NamedSharding
 
 _DEFAULT_SMS = int(os.environ.get("SKYRL_RAGGED_DOT_NUM_SMS", "132"))
 
@@ -387,9 +388,28 @@ def _active_manual_axes() -> tuple[jax_core.AxisName, ...]:
     return tuple(axes)
 
 
+def _axes_from_partition_spec(spec) -> set[str]:
+    if spec is None:
+        return set()
+    if isinstance(spec, str):
+        return {spec}
+    if isinstance(spec, (tuple, list)):
+        axes = set()
+        for elem in spec:
+            axes |= _axes_from_partition_spec(elem)
+        return axes
+    return set()
+
+
 def _ensure_manual_varying(x: jax.Array) -> jax.Array:
     """Annotate arrays as varying along active manual axes if needed."""
-    for axis in _active_manual_axes():
+    axes = set(_active_manual_axes())
+    sharding = getattr(x, "sharding", None)
+    spec = getattr(sharding, "spec", None)
+    axes |= _axes_from_partition_spec(spec)
+    for axis in axes:
+        if axis is None:
+            continue
         try:
             x = lax.pcast(x, axis, to="varying")
         except (ValueError, TypeError):
