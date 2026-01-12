@@ -10,12 +10,19 @@ except Exception:  # pragma: no cover - fallback when GPU kernel is unavailable
     _pallas_ragged_dot = None
 
 
-def _can_use_pallas(dtype: jnp.dtype) -> bool:
+def _can_use_pallas(lhs: jax.Array, rhs: jax.Array) -> bool:
     if _pallas_ragged_dot is None:
         return False
     if jax.default_backend() != "gpu":
         return False
-    return dtype in (jnp.float16, jnp.bfloat16)
+    if lhs.dtype not in (jnp.float16, jnp.bfloat16):
+        return False
+    k = lhs.shape[-1]
+    if k == 0 or k % 16 != 0:
+        return False
+    if rhs.shape[-2] != k:
+        return False
+    return True
 
 
 def ragged_dot(
@@ -41,7 +48,7 @@ def ragged_dot(
         )
 
     assert group_offset.shape == (1,), "group_offset must have shape (1,)"
-    if _can_use_pallas(lhs.dtype):
+    if _can_use_pallas(lhs, rhs):
         return _pallas_ragged_dot(lhs, rhs, group_sizes, group_offset)
 
     offset = group_offset[0]
