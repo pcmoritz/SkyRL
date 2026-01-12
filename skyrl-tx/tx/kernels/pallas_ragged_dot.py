@@ -322,12 +322,6 @@ def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
     updates = lhs_masked[:, :, None] * cot_masked[:, None, :]
     grad_rhs = jnp.zeros_like(rhs).at[safe_group_ids].add(updates)
 
-    lhs_sharding = getattr(lhs, "sharding", None)
-    rhs_sharding = getattr(rhs, "sharding", None)
-    if lhs_sharding is not None:
-        grad_lhs = lax.with_sharding_constraint(grad_lhs, lhs_sharding)
-    if rhs_sharding is not None:
-        grad_rhs = lax.with_sharding_constraint(grad_rhs, rhs_sharding)
     return grad_lhs, grad_rhs
 
 
