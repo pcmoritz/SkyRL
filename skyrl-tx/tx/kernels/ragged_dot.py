@@ -350,6 +350,16 @@ def _normalize_block(b, s):
     return b
 
 
+def _compute_valid_mask(group_sizes: jax.Array, group_offset: jax.Array, m: int, g_local: int):
+    """Compute mask for tokens belonging to local groups."""
+    offset = group_offset[0]
+    cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    shard_start = cumsum[offset]
+    shard_end = cumsum[offset + g_local]
+    token_idx = jnp.arange(m)
+    return (token_idx >= shard_start) & (token_idx < shard_end)
+
+
 def _ragged_dot_pallas_impl(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -419,6 +429,11 @@ def _ragged_dot_pallas_impl(
         **compiler_params,
     )(lhs, rhs, group_sizes, group_offsets, group_offset)
 
+    # Pallas doesn't zero-initialize output, so tokens outside local groups
+    # may contain garbage. Explicitly mask them to zero.
+    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
+    y = jnp.where(valid_mask[:, None], y, 0)
+
     return y
 
 
@@ -482,6 +497,11 @@ def _ragged_dot_grad_lhs_impl(
         interpret=not HAS_TRITON,
         **compiler_params,
     )(dy, rhs, group_sizes, group_offsets, group_offset)
+
+    # Pallas doesn't zero-initialize output, so tokens outside local groups
+    # may contain garbage. Explicitly mask them to zero.
+    valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
+    dx = jnp.where(valid_mask[:, None], dx, 0)
 
     return dx
 
