@@ -304,46 +304,32 @@ def _pallas_ragged_dot(
 
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
-    """Backward pass for ragged_dot with group_offset.
+    """Backward pass that reuses the masking implementation for gradients."""
 
-    Uses masking instead of dynamic slicing to handle traced shard boundaries.
-    """
-    m, k = lhs.shape
+    def fallback(lhs_arg, rhs_arg):
+        return _fallback_ragged_dot(lhs_arg, rhs_arg, group_sizes, group_offset)
+
+    _, pullback = jax.vjp(fallback, lhs, rhs)
+    return pullback(cotangent)
+
+
+def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
+    offset = jnp.asarray(group_offset, dtype=jnp.int32).reshape(())
+    m = lhs.shape[0]
     g_local = rhs.shape[0]
-    n = rhs.shape[2]
 
-    # Get shard boundaries and group assignments for all tokens
-    shard_start, shard_end, local_group_sizes, all_group_ids = _local_group_metadata(
-        group_sizes, group_offset, g_local, m, return_ids=True
-    )
+    cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    shard_start = cumsum[offset]
+    shard_end = cumsum[offset + g_local]
 
-    # Create mask for tokens in local shard
     token_idx = jnp.arange(m, dtype=jnp.int32)
     valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
 
-    # Clamp group_ids to valid range [0, g_local-1] for indexing
-    # Invalid tokens will be masked out anyway
-    group_ids_clamped = jnp.clip(all_group_ids, 0, g_local - 1)
+    local_group_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
+    adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
 
-    # Compute lhs gradient: d_lhs[i] = dy[i] @ rhs[group_id[i]].T
-    # For each token, get its corresponding rhs matrix
-    rhs_for_tokens = rhs[group_ids_clamped]  # (m, k, n)
-    rhs_t_for_tokens = jnp.swapaxes(rhs_for_tokens, -1, -2)  # (m, n, k)
-
-    # Compute gradient: (m, 1, n) @ (m, n, k) -> (m, 1, k) -> (m, k)
-    lhs_grad = jnp.matmul(cotangent[:, None, :], rhs_t_for_tokens).squeeze(axis=1)
-    # Zero out gradients for non-local tokens
-    lhs_grad = jnp.where(valid_mask[:, None], lhs_grad, 0)
-
-    # Compute rhs gradient: d_rhs[g] = sum over tokens in group g of: lhs[i].T @ dy[i]
-    # token_contrib[i] = lhs[i, :, None] * dy[i, None, :] has shape (m, k, n)
-    token_contrib = lhs[:, :, None] * cotangent[:, None, :]
-    # Zero out contributions from non-local tokens
-    token_contrib = jnp.where(valid_mask[:, None, None], token_contrib, 0)
-    # Sum contributions by group
-    rhs_grad = ops.segment_sum(token_contrib, group_ids_clamped, g_local)
-
-    return lhs_grad, rhs_grad
+    result = lax.ragged_dot(lhs, rhs, adjusted_group_sizes)
+    return jnp.where(valid_mask[:, None], result, 0)
 
 
 def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=False):
