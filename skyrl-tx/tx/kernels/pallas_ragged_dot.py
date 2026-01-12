@@ -53,8 +53,8 @@ def _choose_kernel_config(k: int, n: int) -> _KernelConfig:
 
     block_k = _select_block_k(k)
     # Use a wide tile for large outputs, otherwise fall back to a smaller tile.
-    block_n = 128 if n >= 128 else 64 if n >= 64 else 32
-    return _KernelConfig(block_m=128, block_n=block_n, block_k=block_k, max_concurrent_steps=4, grid_block_n=1)
+    block_n = 64 if n >= 64 else 32
+    return _KernelConfig(block_m=64, block_n=block_n, block_k=block_k, max_concurrent_steps=3, grid_block_n=1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,9 +177,10 @@ def _ragged_dot_forward_impl(
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
     config = _choose_kernel_config(k, n)
-    block_m = min(config.block_m, m if m > 0 else config.block_m)
-    block_n = min(config.block_n, n if n > 0 else config.block_n)
-    config = config._replace(block_m=block_m, block_n=block_n)
+    if m > 0:
+        config = config._replace(block_m=min(config.block_m, m))
+    if n > 0:
+        config = config._replace(block_n=min(config.block_n, n))
     result = _pallas_ragged_dot(
         lhs,
         rhs,
