@@ -1,8 +1,12 @@
+import os
+
 from flax import nnx
 import jax
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec
+
+import os
 
 try:
     from tx.kernels.pallas_ragged_dot import ragged_dot_with_group_offset as _pallas_ragged_dot

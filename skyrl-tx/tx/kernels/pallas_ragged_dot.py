@@ -28,7 +28,6 @@ from jax import numpy as jnp
 from jax import custom_vjp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jax import ops
 
 _DEFAULT_SMS = int(os.environ.get("SKYRL_RAGGED_DOT_NUM_SMS", "132"))
 
@@ -120,15 +119,11 @@ def ragged_dot_with_group_offset(
 
 def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
     y = _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
-    aval = jax.core.get_aval(y)
-    return y, (lhs, rhs, group_sizes, group_offset, aval)
+    return y, (lhs, rhs, group_sizes, group_offset)
 
 
 def ragged_dot_with_group_offset_bwd(res, cotangent):
-    lhs, rhs, group_sizes, group_offset, aval = res
-    sharding = getattr(aval, "sharding", None)
-    if sharding is not None:
-        cotangent = jax.lax.with_sharding_constraint(cotangent, sharding)
+    lhs, rhs, group_sizes, group_offset = res
     grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent)
     return grad_lhs, grad_rhs, None, None
 
@@ -198,7 +193,7 @@ def _pallas_ragged_dot(
     max_concurrent_steps: int,
     grid_block_n: int,
 ) -> jax.Array:
-    """Pallas kernel based on jax.lax.ragged_dot."""
+    """Pallas kernel based on jax.lax.ragged_dot that skips boundary groups."""
     if lhs.dtype != rhs.dtype:
         raise NotImplementedError(f"dtype mismatch: lhs={lhs.dtype} rhs={rhs.dtype}")
     m, k = lhs.shape
@@ -214,88 +209,76 @@ def _pallas_ragged_dot(
     if k % block_k != 0:
         raise ValueError(f"k={k} must be a multiple of block_k={block_k}")
 
-    def _ceil_div(x: int, y: int) -> int:
-        return -(-x // y)
-
-    grid_m = _ceil_div(m, block_m) + g_ext - 1
-    grid_n = _ceil_div(n, block_n)
-    grid_size = grid_m * grid_n
-    # Keep at most _DEFAULT_SMS warpgroups but avoid launching more SMs than work tiles.
-    num_sms = max(1, min(_DEFAULT_SMS, grid_size))
+    grid_m = pl.cdiv(m, block_m) + g_ext - 1
+    grid_n = pl.cdiv(n, block_n)
+    grid = (grid_m * grid_n,)
+    num_sms = max(1, min(_DEFAULT_SMS, grid[0]))
 
     def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
-        rows_per_expert = [rows_per_expert_gmem[i] for i in range(len(rows_per_expert_gmem))]
-        thread_idx = pl.program_id(0)
-        num_threads = pl.num_programs(0)
-        total_iters = _ceil_div(grid_size, num_threads)
+        @plgpu.nd_loop(grid, collective_axes="sm")
+        def mn_loop(loop_info: plgpu.NDLoopInfo):  # pylint: disable=unused-variable
+            mi, ni = plgpu.planar_snake(
+                loop_info.index[0],
+                (grid_m, grid_n),
+                1,
+                grid_block_n,
+            )
+            group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
+            is_real_group = (group_info.group_id > 0) & (group_info.group_id < g_ext - 1)
+            rhs_index = group_info.group_id - 1
 
-        @pl.loop(0, total_iters)
-        def _worker(loop_idx):
-            tile = thread_idx + loop_idx * num_threads
+            def acc_scope(acc_ref):
+                @pl.when(is_real_group & (group_info.actual_size > 0))
+                def _():
+                    plgpu.emit_pipeline(
+                        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
+                        grid=(k // block_k,),
+                        in_specs=[
+                            plgpu.BlockSpec(
+                                (block_m, block_k),
+                                lambda kk: (group_info.block, kk),
+                                delay_release=1,
+                            ),
+                            plgpu.BlockSpec(
+                                (block_k, block_n),
+                                lambda kk: (kk, ni),
+                                delay_release=1,
+                            ),
+                        ],
+                        max_concurrent_steps=max_concurrent_steps,
+                    )(lhs_gmem, rhs_gmem.at[rhs_index])
+                return acc_ref[...]
 
-            @pl.when(tile < grid_size)
-            def _process_tile():
-                mi, ni = plgpu.planar_snake(
-                    tile,
-                    (grid_m, grid_n),
-                    1,
-                    grid_block_n,
-                )
-                group_info = GroupInfo.create(rows_per_expert, block_m, mi)
-                is_real_group = (group_info.group_id > 0) & (group_info.group_id < g_ext - 1)
-                rhs_index = group_info.group_id - 1
+            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+            acc = lax.select(is_real_group, acc, jnp.zeros_like(acc))
 
-                def acc_scope(acc_ref):
-                    @pl.when(is_real_group & (group_info.actual_size > 0))
+            @functools.partial(
+                pl.run_scoped,
+                o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
+            )
+            def store_scope(o_smem):  # pylint: disable=unused-variable
+                o_smem[...] = acc.astype(o_smem.dtype)
+                plgpu.commit_smem()
+
+                smem_start = group_info.start_within_block
+                remaining_rows = min(block_m, m)
+                while remaining_rows > 0:
+                    const_rows_len = 1 << int(math.log2(remaining_rows))
+                    remaining_rows //= 2
+
+                    @pl.when(group_info.actual_size & const_rows_len != 0)
                     def _():
-                        plgpu.emit_pipeline(
-                            lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
-                            grid=(k // block_k,),
-                            in_specs=[
-                                plgpu.BlockSpec(
-                                    (block_m, block_k),
-                                    lambda kk: (group_info.block, kk),
-                                    delay_release=1,
-                                ),
-                                plgpu.BlockSpec(
-                                    (block_k, block_n),
-                                    lambda kk: (kk, ni),
-                                    delay_release=1,
-                                ),
-                            ],
-                            max_concurrent_steps=max_concurrent_steps,
-                        )(lhs_gmem, rhs_gmem.at[rhs_index])
-                    return acc_ref[...]
+                        o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
+                        o_gref_slice = o_gmem.at[
+                            pl.ds(group_info.block_start + smem_start, const_rows_len),
+                            pl.ds(ni * block_n, block_n),
+                        ]
+                        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
 
-                acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+                    smem_start += group_info.actual_size & const_rows_len
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-                @functools.partial(
-                    pl.run_scoped,
-                    o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
-                )
-                def store_scope(o_smem):  # pylint: disable=unused-variable
-                    o_smem[...] = acc.astype(o_smem.dtype)
-                    plgpu.commit_smem()
-
-                    smem_start = group_info.start_within_block
-                    remaining_rows = min(block_m, m)
-                    while remaining_rows > 0:
-                        const_rows_len = 1 << int(math.log2(remaining_rows))
-                        remaining_rows //= 2
-
-                        @pl.when(group_info.actual_size & const_rows_len != 0)
-                        def _():
-                            o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-                            o_gref_slice = o_gmem.at[
-                                pl.ds(group_info.block_start + smem_start, const_rows_len),
-                                pl.ds(ni * block_n, block_n),
-                            ]
-                            plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
-
-                        smem_start += group_info.actual_size & const_rows_len
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-        # pl.loop executes immediately upon definition.
+        # The decorator executes immediately.
 
     kernel = plgpu.kernel(
         body,
@@ -308,13 +291,32 @@ def _pallas_ragged_dot(
 
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
-    """Backward pass that reuses the masking implementation for gradients."""
+    """Backward pass that masks non-local tokens and accumulates group grads."""
+    g_local = rhs.shape[0]
+    m = lhs.shape[0]
+    shard_start, shard_end, _, group_ids = _local_group_metadata(
+        group_sizes, group_offset, g_local, m, return_ids=True
+    )
+    token_idx = jnp.arange(m, dtype=jnp.int32)
+    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
 
-    def fallback(lhs_arg, rhs_arg):
-        return _fallback_ragged_dot(lhs_arg, rhs_arg, group_sizes, group_offset)
+    rhs_t = jnp.swapaxes(rhs, -1, -2)
+    grad_lhs = _fallback_ragged_dot(cotangent, rhs_t, group_sizes, group_offset)
+    grad_lhs = jnp.where(valid_mask[:, None], grad_lhs, 0)
 
-    _, pullback = jax.vjp(fallback, lhs, rhs)
-    return pullback(cotangent)
+    safe_group_ids = jnp.clip(group_ids, 0, g_local - 1)
+    lhs_masked = jnp.where(valid_mask[:, None], lhs, 0)
+    cot_masked = jnp.where(valid_mask[:, None], cotangent, 0)
+    updates = lhs_masked[:, :, None] * cot_masked[:, None, :]
+    grad_rhs = jnp.zeros_like(rhs).at[safe_group_ids].add(updates)
+
+    lhs_sharding = getattr(lhs, "sharding", None)
+    rhs_sharding = getattr(rhs, "sharding", None)
+    if lhs_sharding is not None:
+        grad_lhs = lax.with_sharding_constraint(grad_lhs, lhs_sharding)
+    if rhs_sharding is not None:
+        grad_rhs = lax.with_sharding_constraint(grad_rhs, rhs_sharding)
+    return grad_lhs, grad_rhs
 
 
 def _fallback_ragged_dot(lhs, rhs, group_sizes, group_offset):
