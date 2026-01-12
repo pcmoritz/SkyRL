@@ -213,8 +213,8 @@ def ragged_dot_pallas(
         pl.BlockSpec((1,), lambda gi, nj: (0,)),               # offset
     ]
 
-    # Output spec
-    out_shape = jax.ShapeDtypeStruct((m, n), dtype=out_dtype)
+    # Output spec - vma=() indicates no variation across mesh axes (for shard_map compatibility)
+    out_shape = jax.ShapeDtypeStruct((m, n), dtype=out_dtype, vma=())
     out_specs = pl.BlockSpec((m, n), lambda gi, nj: (0, 0))
 
     # Build kernel
