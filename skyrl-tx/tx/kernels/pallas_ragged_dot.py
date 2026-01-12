@@ -195,70 +195,78 @@ def _pallas_ragged_dot(
     num_sms = max(1, min(_DEFAULT_SMS, grid_size))
 
     def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
-        grid = (grid_size,)
         rows_per_expert = [rows_per_expert_gmem[i] for i in range(len(rows_per_expert_gmem))]
+        thread_idx = pl.program_id(0)
+        num_threads = pl.num_programs(0)
+        total_iters = _ceil_div(grid_size, num_threads)
 
-        @plgpu.nd_loop(grid, collective_axes="sm")
-        def mn_loop(loop_info: plgpu.NDLoopInfo):  # pylint: disable=unused-variable
-            mi, ni = plgpu.planar_snake(
-                loop_info.index[0],
-                (grid_m, grid_n),
-                1,
-                grid_block_n,
-            )
-            group_info = GroupInfo.create(rows_per_expert, block_m, mi)
-            is_real_group = (group_info.group_id > 0) & (group_info.group_id < g_ext - 1)
-            rhs_index = group_info.group_id - 1
+        @pl.loop(0, total_iters)
+        def _worker(loop_idx):
+            tile = thread_idx + loop_idx * num_threads
 
-            def acc_scope(acc_ref):
-                @pl.when(is_real_group & (group_info.actual_size > 0))
-                def _():
-                    plgpu.emit_pipeline(
-                        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
-                        grid=(k // block_k,),
-                        in_specs=[
-                            plgpu.BlockSpec(
-                                (block_m, block_k),
-                                lambda kk: (group_info.block, kk),
-                                delay_release=1,
-                            ),
-                            plgpu.BlockSpec(
-                                (block_k, block_n),
-                                lambda kk: (kk, ni),
-                                delay_release=1,
-                            ),
-                        ],
-                        max_concurrent_steps=max_concurrent_steps,
-                    )(lhs_gmem, rhs_gmem.at[rhs_index])
-                return acc_ref[...]
+            @pl.when(tile < grid_size)
+            def _process_tile():
+                mi, ni = plgpu.planar_snake(
+                    tile,
+                    (grid_m, grid_n),
+                    1,
+                    grid_block_n,
+                )
+                group_info = GroupInfo.create(rows_per_expert, block_m, mi)
+                is_real_group = (group_info.group_id > 0) & (group_info.group_id < g_ext - 1)
+                rhs_index = group_info.group_id - 1
 
-            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
-
-            @functools.partial(
-                pl.run_scoped,
-                o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
-            )
-            def store_scope(o_smem):  # pylint: disable=unused-variable
-                o_smem[...] = acc.astype(o_smem.dtype)
-                plgpu.commit_smem()
-
-                smem_start = group_info.start_within_block
-                remaining_rows = min(block_m, m)
-                while remaining_rows > 0:
-                    const_rows_len = 1 << int(math.log2(remaining_rows))
-                    remaining_rows //= 2
-
-                    @pl.when(group_info.actual_size & const_rows_len != 0)
+                def acc_scope(acc_ref):
+                    @pl.when(is_real_group & (group_info.actual_size > 0))
                     def _():
-                        o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-                        o_gref_slice = o_gmem.at[
-                            pl.ds(group_info.block_start + smem_start, const_rows_len),
-                            pl.ds(ni * block_n, block_n),
-                        ]
-                        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+                        plgpu.emit_pipeline(
+                            lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
+                            grid=(k // block_k,),
+                            in_specs=[
+                                plgpu.BlockSpec(
+                                    (block_m, block_k),
+                                    lambda kk: (group_info.block, kk),
+                                    delay_release=1,
+                                ),
+                                plgpu.BlockSpec(
+                                    (block_k, block_n),
+                                    lambda kk: (kk, ni),
+                                    delay_release=1,
+                                ),
+                            ],
+                            max_concurrent_steps=max_concurrent_steps,
+                        )(lhs_gmem, rhs_gmem.at[rhs_index])
+                    return acc_ref[...]
 
-                    smem_start += group_info.actual_size & const_rows_len
-                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+
+                @functools.partial(
+                    pl.run_scoped,
+                    o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
+                )
+                def store_scope(o_smem):  # pylint: disable=unused-variable
+                    o_smem[...] = acc.astype(o_smem.dtype)
+                    plgpu.commit_smem()
+
+                    smem_start = group_info.start_within_block
+                    remaining_rows = min(block_m, m)
+                    while remaining_rows > 0:
+                        const_rows_len = 1 << int(math.log2(remaining_rows))
+                        remaining_rows //= 2
+
+                        @pl.when(group_info.actual_size & const_rows_len != 0)
+                        def _():
+                            o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
+                            o_gref_slice = o_gmem.at[
+                                pl.ds(group_info.block_start + smem_start, const_rows_len),
+                                pl.ds(ni * block_n, block_n),
+                            ]
+                            plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+
+                        smem_start += group_info.actual_size & const_rows_len
+                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+        # pl.loop executes immediately upon definition.
 
     kernel = plgpu.kernel(
         body,
