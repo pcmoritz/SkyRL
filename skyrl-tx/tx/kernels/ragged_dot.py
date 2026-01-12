@@ -595,22 +595,31 @@ def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, prefe
 
 
 def _ragged_dot_pallas_bwd(residuals, g):
-    """Backward pass using Pallas kernels."""
+    """Backward pass using Pallas kernels.
+
+    To preserve VMA (varying manual axes) annotations for shard_map compatibility,
+    we add a zero-weighted input to the output. This forces JAX to propagate the
+    VMA from the input to the gradient output.
+    """
     lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
 
-    # d_lhs = dy @ rhs^T (ragged)
-    d_lhs = _ragged_dot_grad_lhs_impl(
+    # Compute gradients with Pallas kernels
+    d_lhs_raw = _ragged_dot_grad_lhs_impl(
         g, rhs, group_sizes, group_offset,
         out_dtype=lhs.dtype,
     )
-
-    # d_rhs[g] = lhs[tokens_in_g]^T @ dy[tokens_in_g]
-    d_rhs = _ragged_dot_grad_rhs_impl(
+    d_rhs_raw = _ragged_dot_grad_rhs_impl(
         lhs, g, group_sizes, group_offset,
         g_local=g_local,
         out_dtype=rhs.dtype,
     )
+
+    # Inherit VMA from inputs by adding zero-weighted input
+    # This doesn't change the value but ensures the output type matches the input type
+    # (including VMA annotations for shard_map compatibility)
+    d_lhs = d_lhs_raw + lhs * 0
+    d_rhs = d_rhs_raw + rhs * 0
 
     # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
