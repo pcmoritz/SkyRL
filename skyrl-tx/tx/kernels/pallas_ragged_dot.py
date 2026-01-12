@@ -185,10 +185,17 @@ def _pallas_ragged_dot(
     if k % block_k != 0:
         raise ValueError(f"k={k} must be a multiple of block_k={block_k}")
 
+    def _ceil_div(x: int, y: int) -> int:
+        return -(-x // y)
+
+    grid_m = _ceil_div(m, block_m) + g_ext - 1
+    grid_n = _ceil_div(n, block_n)
+    grid_size = grid_m * grid_n
+    # Keep at most _DEFAULT_SMS warpgroups but avoid launching more SMs than work tiles.
+    num_sms = max(1, min(_DEFAULT_SMS, grid_size))
+
     def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
-        grid_m = pl.cdiv(m, block_m) + g_ext - 1
-        grid_n = pl.cdiv(n, block_n)
-        grid = (grid_m * grid_n,)
+        grid = (grid_size,)
         rows_per_expert = [rows_per_expert_gmem[i] for i in range(len(rows_per_expert_gmem))]
 
         @plgpu.nd_loop(grid, collective_axes="sm")
@@ -256,7 +263,7 @@ def _pallas_ragged_dot(
     kernel = plgpu.kernel(
         body,
         out_shape=jax.ShapeDtypeStruct((m, n), lhs.dtype),
-        grid=(_DEFAULT_SMS,),
+        grid=(num_sms,),
         grid_names=("sm",),
         compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup),
     )
