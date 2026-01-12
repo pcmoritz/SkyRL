@@ -617,16 +617,15 @@ def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
     Handles VMA (Varying Manual Axes) for shard_map compatibility:
-    - If lhs is replicated (no VMA), d_lhs must also be replicated
-    - This requires summing local gradients across shards via psum
-    - If lhs is sharded (has VMA), d_lhs naturally has matching VMA
+    - The gradient output VMA must match the input VMA
+    - We use jnp.where with lhs to inherit its VMA structure
     """
     lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
     m = lhs.shape[0]
 
     # Compute raw gradients with Pallas kernels
-    d_lhs_local = _ragged_dot_grad_lhs_impl_no_mask(
+    d_lhs_raw = _ragged_dot_grad_lhs_impl_no_mask(
         g, rhs, group_sizes, group_offset,
         out_dtype=lhs.dtype,
     )
@@ -639,19 +638,16 @@ def _ragged_dot_pallas_bwd(residuals, g):
     # Mask d_lhs to only include gradients for local tokens
     # This is needed because Pallas may not zero-initialize non-local positions
     valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
-    d_lhs_local = jnp.where(valid_mask[:, None], d_lhs_local, 0)
+    d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0)
 
-    # For replicated inputs, we need to sum gradients across shards.
-    # Use psum with the expert parallel axis name 'ep'.
-    # If we're not inside shard_map, psum is a no-op (single device).
-    try:
-        # Try to sum across expert parallel axis
-        # Each shard computed gradient for its local tokens (others are 0)
-        # Sum gives the full gradient, which is now replicated across shards
-        d_lhs = jax.lax.psum(d_lhs_local, axis_name='ep')
-    except NameError:
-        # Not inside shard_map with 'ep' axis, use local gradient directly
-        d_lhs = d_lhs_local
+    # Use jnp.where with lhs to inherit its VMA structure
+    # The condition is always True, so we get d_lhs_masked values
+    # but with VMA matching lhs
+    d_lhs = jnp.where(
+        jnp.ones(lhs.shape, dtype=bool),
+        d_lhs_masked,
+        lhs  # Never selected, but provides VMA
+    )
 
     return (d_lhs, d_rhs, None, None, None, None)
 
