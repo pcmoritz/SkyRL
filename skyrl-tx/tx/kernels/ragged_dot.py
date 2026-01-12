@@ -612,8 +612,7 @@ def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, prefe
 def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
-    Uses jax.lax.cond to force output types to match input types exactly,
-    which is required for shard_map VMA compatibility.
+    Uses zeros_like(input).at[:].set(gradient) to preserve input's VMA.
     """
     lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
@@ -634,22 +633,12 @@ def _ragged_dot_pallas_bwd(residuals, g):
     valid_mask = _compute_valid_mask(group_sizes, group_offset, m, g_local)
 
     # Apply masking to d_lhs
-    d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0)
+    d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0).astype(lhs.dtype)
 
-    # Use jax.lax.cond to force output type to match input type exactly
-    # The false branch (lhs, rhs) is never taken but determines the output type/VMA
-    d_lhs = jax.lax.cond(
-        True,
-        lambda _: d_lhs_masked.astype(lhs.dtype),
-        lambda _: lhs,
-        None
-    )
-    d_rhs = jax.lax.cond(
-        True,
-        lambda _: d_rhs_raw.astype(rhs.dtype),
-        lambda _: rhs,
-        None
-    )
+    # Use zeros_like to create arrays with same type/VMA as inputs,
+    # then use at[].set() to copy gradient values (preserves VMA)
+    d_lhs = jnp.zeros_like(lhs).at[:].set(d_lhs_masked)
+    d_rhs = jnp.zeros_like(rhs).at[:].set(d_rhs_raw.astype(rhs.dtype))
 
     # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
