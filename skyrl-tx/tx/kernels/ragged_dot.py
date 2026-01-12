@@ -8,13 +8,10 @@ When group_offset is specified, only tokens belonging to groups
 on tokens that belong to other shards.
 """
 
-from functools import partial
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jax.experimental import pallas as pl
 
 
 class ProblemSizes(NamedTuple):
@@ -260,8 +257,6 @@ def _trans_ragged_dot_simple(
     return out
 
 
-# Custom VJP implementation
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5))
 def ragged_dot_pallas(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -272,67 +267,22 @@ def ragged_dot_pallas(
 ) -> jax.Array:
     """Ragged dot product with group_offset support.
 
+    This implementation uses pure JAX operations that are automatically
+    differentiable, which ensures compatibility with shard_map and other
+    JAX transformations.
+
     Args:
         lhs: Input tokens, shape [m, k]
         rhs: Group weights, shape [g_local, k, n]
         group_sizes: Size of each group, shape [g]
         group_offset: Starting group index, shape [1]
-        precision: JAX precision setting
+        precision: JAX precision setting (currently unused)
         preferred_element_type: Output dtype
 
     Returns:
         Output tensor, shape [m, n]
     """
     return _ragged_dot_simple(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type)
-
-
-def _ragged_dot_fwd(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type):
-    """Forward pass for custom VJP."""
-    out = _ragged_dot_simple(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type)
-    # Save residuals for backward pass
-    return out, (lhs, rhs, group_sizes, group_offset, rhs.shape[0])
-
-
-def _ragged_dot_bwd(precision, preferred_element_type, residuals, g):
-    """Backward pass for custom VJP.
-
-    Gradients:
-    - d_lhs[i] = g[i] @ rhs[group[i]].T = g[i] @ rhs[group[i], :, :].T
-    - d_rhs[j] = sum over tokens in group j: lhs[i].T @ g[i]
-    """
-    lhs, rhs, group_sizes, group_offset, g_local = residuals
-    m, k = lhs.shape
-    _, n = g.shape
-
-    # Gradient w.r.t. lhs: d_lhs[i] = g[i] @ rhs[group[i]].T
-    # We need to compute: for each token i, dot(g[i], rhs[group[i]].T)
-    # This is similar to forward but with rhs transposed
-
-    # Compute group assignments
-    cumsum = jnp.cumsum(group_sizes)
-    token_indices = jnp.arange(m)
-    group_idx = jnp.searchsorted(cumsum, token_indices, side="right")
-    offset = group_offset[0]
-
-    valid_mask = (group_idx >= offset) & (group_idx < offset + g_local)
-    local_group_idx = jnp.clip(group_idx - offset, 0, g_local - 1)
-
-    # Gather transposed weights: rhs.swapaxes(-1, -2) has shape [g_local, n, k]
-    rhs_t = rhs.swapaxes(-1, -2)  # [g_local, n, k]
-    weights_t = rhs_t[local_group_idx]  # [m, n, k]
-
-    # d_lhs[i] = g[i] @ weights_t[i]
-    d_lhs = jnp.einsum("mn,mnk->mk", g, weights_t)
-    d_lhs = jnp.where(valid_mask[:, None], d_lhs, 0.0)
-
-    # Gradient w.r.t. rhs: accumulated outer products by group
-    d_rhs = _trans_ragged_dot_simple(lhs, g, group_sizes, group_offset, g_local, precision, preferred_element_type)
-
-    # Gradients w.r.t. group_sizes and group_offset are None (integer indices)
-    return d_lhs, d_rhs, None, None
-
-
-ragged_dot_pallas.defvjp(_ragged_dot_fwd, _ragged_dot_bwd)
 
 
 def is_gpu() -> bool:
