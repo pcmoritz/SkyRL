@@ -3,6 +3,8 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 
+from tx.kernels.ragged_dot import is_gpu, ragged_dot_pallas
+
 
 def ragged_dot(
     lhs: jax.Array,
@@ -15,7 +17,12 @@ def ragged_dot(
     """Ragged dot product with group_offset support.
 
     When group_offset is specified, rhs contains groups [offset, offset + g_local).
-    Tokens outside this range are routed to boundary groups and masked to zero.
+    Tokens outside this range are computed only by their assigned shard.
+
+    Dispatch logic:
+    - group_offset is None: Use native JAX lax.ragged_dot
+    - group_offset provided + GPU: Use optimized Pallas kernel
+    - group_offset provided + TPU: Use fallback implementation
     """
     if group_offset is None:
         return lax.ragged_dot(
@@ -27,6 +34,35 @@ def ragged_dot(
         )
 
     assert group_offset.shape == (1,), "group_offset must have shape (1,)"
+
+    # Use Pallas kernel on GPU for better performance
+    if is_gpu():
+        return ragged_dot_pallas(
+            lhs,
+            rhs,
+            group_sizes,
+            group_offset,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+
+    # Fallback implementation for TPU and other backends
+    return _ragged_dot_fallback(lhs, rhs, group_sizes, group_offset, precision, preferred_element_type)
+
+
+def _ragged_dot_fallback(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    precision=None,
+    preferred_element_type=None,
+) -> jax.Array:
+    """Fallback implementation using native JAX ragged_dot with masking.
+
+    This absorbs extra tokens at boundaries and masks them to zero.
+    Less efficient than the Pallas kernel but works on all backends.
+    """
     offset = group_offset[0]
     m = lhs.shape[0]
     g_local = rhs.shape[0]
