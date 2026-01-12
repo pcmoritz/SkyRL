@@ -42,7 +42,7 @@ def ragged_dot(
 
     assert group_offset.shape == (1,), "group_offset must have shape (1,)"
     if _can_use_pallas(lhs.dtype):
-        return _pallas_ragged_dot(lhs, rhs, group_sizes=group_sizes, group_offset=group_offset)
+        return _pallas_ragged_dot(lhs, rhs, group_sizes, group_offset)
 
     offset = group_offset[0]
     m = lhs.shape[0]

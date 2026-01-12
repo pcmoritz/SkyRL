@@ -25,8 +25,10 @@ from typing import NamedTuple
 import jax
 from jax import lax
 from jax import numpy as jnp
+from jax import custom_vjp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax import ops
 
 _DEFAULT_SMS = int(os.environ.get("SKYRL_RAGGED_DOT_NUM_SMS", "132"))
 
@@ -106,10 +108,33 @@ class GroupInfo:
         )
 
 
+@custom_vjp
 def ragged_dot_with_group_offset(
     lhs: jax.Array,
     rhs: jax.Array,
-    *,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+) -> jax.Array:
+    return _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
+
+
+def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
+    y = _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
+    return y, (lhs, rhs, group_sizes, group_offset)
+
+
+def ragged_dot_with_group_offset_bwd(res, cotangent):
+    lhs, rhs, group_sizes, group_offset = res
+    grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent)
+    return grad_lhs, grad_rhs, None, None
+
+
+ragged_dot_with_group_offset.defvjp(ragged_dot_with_group_offset_fwd, ragged_dot_with_group_offset_bwd)
+
+
+def _ragged_dot_forward_impl(
+    lhs: jax.Array,
+    rhs: jax.Array,
     group_sizes: jax.Array,
     group_offset: jax.Array,
 ) -> jax.Array:
@@ -276,3 +301,45 @@ def _pallas_ragged_dot(
         compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup),
     )
     return kernel(group_sizes, lhs, rhs)
+
+
+def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
+    m = lhs.shape[0]
+    g_local = rhs.shape[0]
+    shard_start, shard_end, local_group_sizes, group_ids = _local_group_metadata(
+        group_sizes, group_offset, g_local, m, return_ids=True
+    )
+    local_len = shard_end - shard_start
+    lhs_grad = jnp.zeros_like(lhs)
+    if local_len == 0:
+        return lhs_grad, jnp.zeros_like(rhs)
+
+    lhs_local = lax.dynamic_slice_in_dim(lhs, shard_start, local_len, axis=0)
+    dy_local = lax.dynamic_slice_in_dim(cotangent, shard_start, local_len, axis=0)
+
+    rhs_for_tokens = rhs[group_ids]
+    rhs_t_for_tokens = jnp.swapaxes(rhs_for_tokens, -1, -2)
+    lhs_grad_local = jnp.matmul(dy_local[:, None, :], rhs_t_for_tokens).squeeze(axis=1)
+    lhs_grad = lhs_grad.at[shard_start:shard_end].set(lhs_grad_local)
+
+    token_contrib = lhs_local[:, :, None] * dy_local[:, None, :]
+    rhs_grad = ops.segment_sum(token_contrib, group_ids, g_local)
+    return lhs_grad, rhs_grad
+
+
+def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=False):
+    sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    offset = jnp.asarray(group_offset, dtype=jnp.int32).reshape(())
+    cumsum = jnp.cumulative_sum(sizes, include_initial=True)
+    shard_start = lax.dynamic_index_in_dim(cumsum, offset, axis=0, keepdims=False)
+    shard_end = lax.dynamic_index_in_dim(cumsum, offset + g_local, axis=0, keepdims=False)
+    local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
+    if return_ids:
+        local_len = shard_end - shard_start
+        group_ids = jnp.repeat(
+            jnp.arange(g_local, dtype=jnp.int32),
+            local_group_sizes,
+            total_repeat_length=local_len,
+        )
+        return shard_start, shard_end, local_group_sizes, group_ids
+    return shard_start, shard_end, local_group_sizes, None
