@@ -120,14 +120,15 @@ def ragged_dot_with_group_offset(
 
 def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
     y = _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
-    sharding = getattr(y, "sharding", None)
-    return y, (lhs, rhs, group_sizes, group_offset, sharding)
+    aval = jax.core.get_aval(y)
+    return y, (lhs, rhs, group_sizes, group_offset, aval)
 
 
 def ragged_dot_with_group_offset_bwd(res, cotangent):
-    lhs, rhs, group_sizes, group_offset, sharding = res
+    lhs, rhs, group_sizes, group_offset, aval = res
+    sharding = getattr(aval, "sharding", None)
     if sharding is not None:
-        cotangent = sharding.replicate(cotangent)
+        cotangent = jax.lax.with_sharding_constraint(cotangent, sharding)
     grad_lhs, grad_rhs = _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent)
     return grad_lhs, grad_rhs, None, None
 
