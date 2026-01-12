@@ -120,7 +120,7 @@ def ragged_dot_with_group_offset(
 
 def ragged_dot_with_group_offset_fwd(lhs, rhs, group_sizes, group_offset):
     y = _ragged_dot_forward_impl(lhs, rhs, group_sizes, group_offset)
-    sharding = y.sharding
+    sharding = getattr(y, "sharding", None)
     return y, (lhs, rhs, group_sizes, group_offset, sharding)
 
 
