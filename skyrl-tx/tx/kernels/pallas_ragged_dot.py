@@ -28,6 +28,7 @@ from jax import numpy as jnp
 from jax import custom_vjp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax._src import core as jax_core
 
 _DEFAULT_SMS = int(os.environ.get("SKYRL_RAGGED_DOT_NUM_SMS", "132"))
 
@@ -148,6 +149,9 @@ def _ragged_dot_forward_impl(
     Returns:
         Output array of shape (M, N) containing zeros for non-local experts.
     """
+    lhs = _ensure_manual_varying(lhs)
+    rhs = _ensure_manual_varying(rhs)
+
     (m, k) = lhs.shape
     g_local, k_rhs, n = rhs.shape
 
@@ -364,3 +368,18 @@ def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=Fals
         # We return all_group_ids which caller will use with proper slicing
         return shard_start, shard_end, local_group_sizes, all_group_ids
     return shard_start, shard_end, local_group_sizes, None
+def _ensure_manual_varying(x: jax.Array) -> jax.Array:
+    """Annotate arrays as varying along active manual axes if needed."""
+    axis_env = jax_core.get_axis_env()
+    manual_axes = getattr(axis_env, "spmd_axis_names", set())
+    if not manual_axes:
+        return x
+    for axis in manual_axes:
+        if not axis_env.axis_exists(axis):
+            continue
+        try:
+            x = lax.pcast(x, axis, to="varying")
+        except ValueError:
+            # Axis already marked as varying or unsupported transition, skip.
+            continue
+    return x
