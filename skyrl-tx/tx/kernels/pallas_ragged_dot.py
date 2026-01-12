@@ -304,26 +304,45 @@ def _pallas_ragged_dot(
 
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
-    m = lhs.shape[0]
+    """Backward pass for ragged_dot with group_offset.
+
+    Uses masking instead of dynamic slicing to handle traced shard boundaries.
+    """
+    m, k = lhs.shape
     g_local = rhs.shape[0]
-    shard_start, shard_end, local_group_sizes, group_ids = _local_group_metadata(
+    n = rhs.shape[2]
+
+    # Get shard boundaries and group assignments for all tokens
+    shard_start, shard_end, local_group_sizes, all_group_ids = _local_group_metadata(
         group_sizes, group_offset, g_local, m, return_ids=True
     )
-    local_len = shard_end - shard_start
-    lhs_grad = jnp.zeros_like(lhs)
-    if local_len == 0:
-        return lhs_grad, jnp.zeros_like(rhs)
 
-    lhs_local = lax.dynamic_slice_in_dim(lhs, shard_start, local_len, axis=0)
-    dy_local = lax.dynamic_slice_in_dim(cotangent, shard_start, local_len, axis=0)
+    # Create mask for tokens in local shard
+    token_idx = jnp.arange(m, dtype=jnp.int32)
+    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
 
-    rhs_for_tokens = rhs[group_ids]
-    rhs_t_for_tokens = jnp.swapaxes(rhs_for_tokens, -1, -2)
-    lhs_grad_local = jnp.matmul(dy_local[:, None, :], rhs_t_for_tokens).squeeze(axis=1)
-    lhs_grad = lhs_grad.at[shard_start:shard_end].set(lhs_grad_local)
+    # Clamp group_ids to valid range [0, g_local-1] for indexing
+    # Invalid tokens will be masked out anyway
+    group_ids_clamped = jnp.clip(all_group_ids, 0, g_local - 1)
 
-    token_contrib = lhs_local[:, :, None] * dy_local[:, None, :]
-    rhs_grad = ops.segment_sum(token_contrib, group_ids, g_local)
+    # Compute lhs gradient: d_lhs[i] = dy[i] @ rhs[group_id[i]].T
+    # For each token, get its corresponding rhs matrix
+    rhs_for_tokens = rhs[group_ids_clamped]  # (m, k, n)
+    rhs_t_for_tokens = jnp.swapaxes(rhs_for_tokens, -1, -2)  # (m, n, k)
+
+    # Compute gradient: (m, 1, n) @ (m, n, k) -> (m, 1, k) -> (m, k)
+    lhs_grad = jnp.matmul(cotangent[:, None, :], rhs_t_for_tokens).squeeze(axis=1)
+    # Zero out gradients for non-local tokens
+    lhs_grad = jnp.where(valid_mask[:, None], lhs_grad, 0)
+
+    # Compute rhs gradient: d_rhs[g] = sum over tokens in group g of: lhs[i].T @ dy[i]
+    # token_contrib[i] = lhs[i, :, None] * dy[i, None, :] has shape (m, k, n)
+    token_contrib = lhs[:, :, None] * cotangent[:, None, :]
+    # Zero out contributions from non-local tokens
+    token_contrib = jnp.where(valid_mask[:, None, None], token_contrib, 0)
+    # Sum contributions by group
+    rhs_grad = ops.segment_sum(token_contrib, group_ids_clamped, g_local)
+
     return lhs_grad, rhs_grad
 
 
@@ -335,9 +354,15 @@ def _local_group_metadata(group_sizes, group_offset, g_local, m, return_ids=Fals
     shard_end = lax.dynamic_index_in_dim(cumsum, offset + g_local, axis=0, keepdims=False)
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
     if return_ids:
-        local_len = shard_end - shard_start
-        token_idx = jnp.arange(local_len, dtype=jnp.int32)
+        # Use m (total tokens) as the fixed size since local_len is traced
+        # and jnp.arange requires a concrete stop value
+        token_idx = jnp.arange(m, dtype=jnp.int32)
         bins = jnp.cumsum(local_group_sizes, dtype=jnp.int32)[:-1]
-        group_ids = jnp.searchsorted(bins, token_idx, side="right")
-        return shard_start, shard_end, local_group_sizes, group_ids
+        # Compute group_ids for all m tokens, then slice to local range
+        # For tokens before shard_start, subtract shard_start to get negative indices
+        # which will be clamped when used
+        all_group_ids = jnp.searchsorted(bins, token_idx - shard_start, side="right")
+        # The group_ids are only valid for indices in [shard_start, shard_end)
+        # We return all_group_ids which caller will use with proper slicing
+        return shard_start, shard_end, local_group_sizes, all_group_ids
     return shard_start, shard_end, local_group_sizes, None
