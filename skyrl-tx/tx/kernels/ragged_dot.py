@@ -612,7 +612,7 @@ def _ragged_dot_pallas_fwd(lhs, rhs, group_sizes, group_offset, precision, prefe
 def _ragged_dot_pallas_bwd(residuals, g):
     """Backward pass using Pallas kernels.
 
-    Uses zeros_like(input).at[:].set(gradient) to preserve input's VMA.
+    Uses reshape to strip VMA, then broadcast_to with input shape to match input type.
     """
     lhs, rhs, group_sizes, group_offset = residuals
     g_local = rhs.shape[0]
@@ -635,10 +635,10 @@ def _ragged_dot_pallas_bwd(residuals, g):
     # Apply masking to d_lhs
     d_lhs_masked = jnp.where(valid_mask[:, None], d_lhs_raw, 0).astype(lhs.dtype)
 
-    # Use zeros_like to create arrays with same type/VMA as inputs,
-    # then use at[].set() to copy gradient values (preserves VMA)
-    d_lhs = jnp.zeros_like(lhs).at[:].set(d_lhs_masked)
-    d_rhs = jnp.zeros_like(rhs).at[:].set(d_rhs_raw.astype(rhs.dtype))
+    # Use reshape to force new array, then multiply by (lhs * 0 + 1) to inherit VMA
+    # The (input * 0 + 1) creates ones with input's VMA
+    d_lhs = d_lhs_masked.reshape(lhs.shape) * (lhs * 0 + 1)
+    d_rhs = d_rhs_raw.astype(rhs.dtype).reshape(rhs.shape) * (rhs * 0 + 1)
 
     # Return gradients for all inputs (None for non-differentiable args)
     return (d_lhs, d_rhs, None, None, None, None)
