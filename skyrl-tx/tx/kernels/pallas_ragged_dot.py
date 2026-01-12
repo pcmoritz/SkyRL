@@ -29,7 +29,6 @@ from jax import custom_vjp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax._src import core as jax_core
-from jax.sharding import NamedSharding
 
 _DEFAULT_SMS = int(os.environ.get("SKYRL_RAGGED_DOT_NUM_SMS", "132"))
 
@@ -227,13 +226,11 @@ def _pallas_ragged_dot(
 
     grid_m = pl.cdiv(m, block_m) + g_ext - 1
     grid_n = pl.cdiv(n, block_n)
-    grid_size = grid_m * grid_n
-    num_sms = max(1, min(_DEFAULT_SMS, grid_size))
+    grid = (grid_m * grid_n,)
+    num_sms = max(1, min(_DEFAULT_SMS, grid[0]))
 
     def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
-        rows_per_expert = [rows_per_expert_gmem[i] for i in range(len(rows_per_expert_gmem))]
-
-        @plgpu.nd_loop((grid_size,), collective_axes="sm")
+        @plgpu.nd_loop(grid, collective_axes="sm")
         def mn_loop(loop_info: plgpu.NDLoopInfo):  # pylint: disable=unused-variable
             mi, ni = plgpu.planar_snake(
                 loop_info.index[0],
@@ -241,29 +238,26 @@ def _pallas_ragged_dot(
                 1,
                 grid_block_n,
             )
-            group_info = GroupInfo.create(rows_per_expert, block_m, mi)
-            rhs_index = group_info.group_id
+            group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
 
             def acc_scope(acc_ref):
-                @pl.when(group_info.actual_size > 0)
-                def _():
-                    plgpu.emit_pipeline(
-                        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
-                        grid=(k // block_k,),
-                        in_specs=[
-                            plgpu.BlockSpec(
-                                (block_m, block_k),
-                                lambda kk: (group_info.block, kk),
-                                delay_release=1,
-                            ),
-                            plgpu.BlockSpec(
-                                (block_k, block_n),
-                                lambda kk: (kk, ni),
-                                delay_release=1,
-                            ),
-                        ],
-                        max_concurrent_steps=max_concurrent_steps,
-                    )(lhs_gmem, rhs_gmem.at[rhs_index])
+                plgpu.emit_pipeline(
+                    lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
+                    grid=(k // block_k,),
+                    in_specs=[
+                        plgpu.BlockSpec(
+                            (block_m, block_k),
+                            lambda kk: (group_info.block, kk),
+                            delay_release=1,
+                        ),
+                        plgpu.BlockSpec(
+                            (block_k, block_n),
+                            lambda kk: (kk, ni),
+                            delay_release=1,
+                        ),
+                    ],
+                    max_concurrent_steps=max_concurrent_steps,
+                )(lhs_gmem, rhs_gmem.at[group_info.group_id])
                 return acc_ref[...]
 
             acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
@@ -273,28 +267,26 @@ def _pallas_ragged_dot(
                 o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
             )
             def store_scope(o_smem):  # pylint: disable=unused-variable
-                @pl.when(group_info.actual_size > 0)
-                def _store():
-                    o_smem[...] = acc.astype(o_smem.dtype)
-                    plgpu.commit_smem()
+                o_smem[...] = acc.astype(o_smem.dtype)
+                plgpu.commit_smem()
 
-                    smem_start = group_info.start_within_block
-                    remaining_rows = min(block_m, m)
-                    while remaining_rows > 0:
-                        const_rows_len = 1 << int(math.log2(remaining_rows))
-                        remaining_rows //= 2
+                smem_start = group_info.start_within_block
+                remaining_rows = min(block_m, m)
+                while remaining_rows > 0:
+                    const_rows_len = 1 << int(math.log2(remaining_rows))
+                    remaining_rows //= 2
 
-                        @pl.when(group_info.actual_size & const_rows_len != 0)
-                        def _():
-                            o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-                            o_gref_slice = o_gmem.at[
-                                pl.ds(group_info.block_start + smem_start, const_rows_len),
-                                pl.ds(ni * block_n, block_n),
-                            ]
-                            plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+                    @pl.when(group_info.actual_size & const_rows_len != 0)
+                    def _():
+                        o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
+                        o_gref_slice = o_gmem.at[
+                            pl.ds(group_info.block_start + smem_start, const_rows_len),
+                            pl.ds(ni * block_n, block_n),
+                        ]
+                        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
 
-                        smem_start += group_info.actual_size & const_rows_len
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                    smem_start += group_info.actual_size & const_rows_len
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     kernel = plgpu.kernel(
         body,
