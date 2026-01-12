@@ -209,8 +209,11 @@ def _pallas_ragged_dot(
     if k % block_k != 0:
         raise ValueError(f"k={k} must be a multiple of block_k={block_k}")
 
-    grid_m = pl.cdiv(m, block_m) + g_ext - 1
-    grid_n = pl.cdiv(n, block_n)
+    def _ceil_div_int(x: int, y: int) -> int:
+        return -(-x // y)
+
+    grid_m = _ceil_div_int(m, block_m) + g_ext - 1
+    grid_n = _ceil_div_int(n, block_n)
     grid = (grid_m * grid_n,)
     num_sms = max(1, min(_DEFAULT_SMS, grid[0]))
 
