@@ -70,7 +70,9 @@ def ragged_dot(
         chunk_idx, _ = carry
         return chunk_idx * local_capacity < num_valid
 
-    init = (jnp.array(0, dtype=jnp.int32), jnp.zeros((m, n), dtype=lhs.dtype))
+    init_result = jnp.zeros((m, n), dtype=lhs.dtype)
+    init_result = lax.pcast(init_result, ("ep",), to="varying")
+    init = (jnp.array(0, dtype=jnp.int32), init_result)
     _, result = lax.while_loop(continue_loop, process_chunk, init)
     return result
 
