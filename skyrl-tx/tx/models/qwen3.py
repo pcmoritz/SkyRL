@@ -4,7 +4,7 @@ from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
-from tx.layers.util import prepare_routing, shard_map_ep, get_local_capacity
+from tx.layers.util import prepare_routing, shard_map_ep
 from tx.layers.rotary_embedding import apply_rope
 from tx.models.configs import Qwen3Config
 from tx.layers.layernorm import RMSNorm
@@ -215,30 +215,23 @@ class Qwen3Experts(nnx.Module):
             hidden_expanded, selected_experts.ravel(), num_experts, adapter_indices=adapter_expanded
         )
 
-        def forward(experts, hidden_sorted, group_sizes, unsort_indices, adapter_sorted, routing_weights, use_fast_path):
+        def forward(experts, hidden_sorted, group_sizes, unsort_indices, adapter_sorted, routing_weights):
             # Calculate local offset for this shard
             ep_rank = jax.lax.axis_index("ep")
             experts_per_rank = num_experts // jax.lax.axis_size("ep")
             group_offset = jnp.array([ep_rank * experts_per_rank], dtype=jnp.int32)
 
             # Expert computation
-            gate = experts.gate_proj(hidden_sorted, group_sizes, adapter_sorted, group_offset=group_offset, use_fast_path=use_fast_path)
-            up = experts.up_proj(hidden_sorted, group_sizes, adapter_sorted, group_offset=group_offset, use_fast_path=use_fast_path)
-            down = experts.down_proj(nnx.silu(gate) * up, group_sizes, adapter_sorted, group_offset=group_offset, use_fast_path=use_fast_path)
+            gate = experts.gate_proj(hidden_sorted, group_sizes, adapter_sorted, group_offset=group_offset)
+            up = experts.up_proj(hidden_sorted, group_sizes, adapter_sorted, group_offset=group_offset)
+            down = experts.down_proj(nnx.silu(gate) * up, group_sizes, adapter_sorted, group_offset=group_offset)
 
             # Unsort and combine
             out = down[unsort_indices].reshape(-1, num_experts_per_tok, hidden_size)
             local_out = jnp.sum(out * routing_weights[..., None], axis=1)
             return jax.lax.psum(local_out, axis_name="ep")
 
-        # Compute condition for fast path outside shard_map
-        m = hidden_sorted.shape[0]
-        g_local = num_experts // ep
-        local_capacity = get_local_capacity(m, g_local, num_experts)
-        max_per_shard = jnp.max(jnp.array([jnp.sum(group_sizes[i*g_local:(i+1)*g_local]) for i in range(ep)]))
-        use_fast_path = max_per_shard <= local_capacity
-
-        return shard_map_ep(self, forward, hidden_sorted, group_sizes, unsort_indices, adapter_sorted, routing_weights, use_fast_path)
+        return shard_map_ep(self, forward, hidden_sorted, group_sizes, unsort_indices, adapter_sorted, routing_weights)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):

@@ -238,9 +238,8 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         adapter_indices_sorted: jax.Array | None = None,
         *,
         group_offset: jax.Array | None = None,
-        use_fast_path: bool = False,
     ) -> jax.Array:
-        base_out = ragged_dot(x, self.weight.value, group_sizes, group_offset=group_offset, use_fast_path=use_fast_path)
+        base_out = ragged_dot(x, self.weight.value, group_sizes, group_offset=group_offset)
 
         if self.max_lora_adapters == 0 or adapter_indices_sorted is None:
             return base_out

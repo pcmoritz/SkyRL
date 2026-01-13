@@ -12,9 +12,8 @@ def ragged_dot(
     precision=None,
     preferred_element_type=None,
     group_offset: jax.Array | None = None,
-    use_fast_path: jax.Array | bool = False,
 ) -> jax.Array:
-    """Ragged dot with group_offset support and fast path optimization."""
+    """Ragged dot with group_offset support and chunked processing optimization."""
     if group_offset is None:
         return lax.ragged_dot(lhs, rhs, group_sizes, precision=precision, preferred_element_type=preferred_element_type)
 
@@ -22,29 +21,58 @@ def ragged_dot(
     m, k = lhs.shape
     g_local, g_total = rhs.shape[0], group_sizes.shape[0]
     local_capacity = min(int(3.0 * m * g_local / g_total), m)
+    n = rhs.shape[-1]
 
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
     shard_start, shard_end = cumsum[offset], cumsum[offset + g_local]
     num_valid = shard_end - shard_start
     local_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
+    local_cumsum = jnp.cumulative_sum(local_sizes, include_initial=True)
 
-    def fast_path(_):
-        clamped_start = jnp.minimum(shard_start, m - local_capacity)
-        offset_in_slice = shard_start - clamped_start
-        lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
-        adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
-        result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
+    def process_chunk(carry):
+        chunk_idx, result = carry
+
+        # This chunk covers local tokens [local_start, local_end)
+        local_start = chunk_idx * local_capacity
+        local_end = jnp.minimum(local_start + local_capacity, num_valid)
+        chunk_size = local_end - local_start
+
+        # Global position in lhs
+        global_start = shard_start + local_start
+
+        # Compute group sizes for this chunk
+        chunk_group_sizes = jnp.clip(
+            jnp.minimum(local_cumsum[1:], local_end) - jnp.maximum(local_cumsum[:-1], local_start),
+            0, None
+        )
+
+        # Handle dynamic_slice clamping
+        clamped_start = jnp.minimum(global_start, m - local_capacity)
+        offset_in_slice = global_start - clamped_start
+
+        lhs_slice = lax.dynamic_slice(lhs, (global_start, 0), (local_capacity, k))
+
+        # Adjust group sizes: absorb prefix and suffix
+        adjusted = chunk_group_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - chunk_size)
+
+        chunk_result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
+
+        # Mask to keep only valid tokens
         idx = jnp.arange(local_capacity)
-        result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
-        return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
+        chunk_result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + chunk_size))[:, None], chunk_result, 0)
 
-    def full_path(_):
-        adjusted = local_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
-        result = lax.ragged_dot(lhs, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
-        mask = (jnp.arange(m) >= shard_start) & (jnp.arange(m) < shard_end)
-        return jnp.where(mask[:, None], result, 0)
+        # Update result at correct position
+        result = lax.dynamic_update_slice(result, chunk_result, (clamped_start, 0))
 
-    return lax.cond(use_fast_path, fast_path, full_path, None)
+        return (chunk_idx + 1, result)
+
+    def continue_loop(carry):
+        chunk_idx, _ = carry
+        return chunk_idx * local_capacity < num_valid
+
+    init = (jnp.array(0, dtype=jnp.int32), jnp.zeros((m, n), dtype=lhs.dtype))
+    _, result = lax.while_loop(continue_loop, process_chunk, init)
+    return result
 
 
 def get_local_capacity(m: int, g_local: int, g_total: int) -> int:
