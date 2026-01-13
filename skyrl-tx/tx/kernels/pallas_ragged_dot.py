@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import NamedTuple
 
 import jax
@@ -34,19 +35,93 @@ class _KernelConfig(NamedTuple):
     grid_block_n: int
 
 
-def _choose_kernel_config(k: int) -> _KernelConfig:
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    return int(value) if value is not None else None
+
+
+def _env_bool(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "t", "yes", "y")
+
+
+@lru_cache(maxsize=None)
+def _is_h100() -> bool:
+    try:
+        return any("H100" in device.device_kind for device in jax.devices("gpu"))
+    except Exception:
+        return False
+
+
+def _choose_kernel_config(m: int, k: int, n: int) -> _KernelConfig:
     """Pick a conservative kernel configuration that works on most shapes."""
 
     def _select_block_k(value: int) -> int:
-        for candidate in (128, 64, 32, 16):
+        for candidate in (64, 32, 16):
             if value % candidate == 0:
                 return candidate
         raise ValueError(f"k={value} must be divisible by 16")
 
+    def _select_block_n(value: int, prefer_large_tiles: bool) -> int:
+        candidates = (192, 128, 64) if prefer_large_tiles else (128, 64)
+        for candidate in candidates:
+            if value >= candidate:
+                pad = (-value) % candidate
+                if pad == 0 or pad <= candidate // 4:
+                    return candidate
+        return 64
+
     block_k = _select_block_k(k)
-    # Use a single block_n that is supported by the WGMMA kernel.
-    block_n = 64
-    return _KernelConfig(block_m=64, block_n=block_n, block_k=block_k, max_concurrent_steps=3, grid_block_n=1)
+    prefer_large_tiles = _is_h100()
+    block_n = _select_block_n(n, prefer_large_tiles)
+    if prefer_large_tiles and m >= 192:
+        block_m = 192
+    elif m >= 128:
+        block_m = 128
+    else:
+        block_m = 64
+    if block_k >= 64:
+        max_concurrent_steps = 6 if prefer_large_tiles and (block_m >= 128 or block_n >= 128) else 4
+    else:
+        max_concurrent_steps = 3
+
+    padded_n = n + (-n) % block_n
+    grid_n = max(1, (padded_n + block_n - 1) // block_n)
+    if grid_n >= 16:
+        grid_block_n = 8
+    elif grid_n >= 8:
+        grid_block_n = 4
+    elif grid_n >= 4:
+        grid_block_n = 2
+    else:
+        grid_block_n = 1
+
+    env_block_m = _env_int("SKYRL_RAGGED_DOT_BLOCK_M")
+    env_block_n = _env_int("SKYRL_RAGGED_DOT_BLOCK_N")
+    env_block_k = _env_int("SKYRL_RAGGED_DOT_BLOCK_K")
+    env_steps = _env_int("SKYRL_RAGGED_DOT_MAX_STEPS")
+    env_grid_block_n = _env_int("SKYRL_RAGGED_DOT_GRID_BLOCK_N")
+
+    if env_block_m is not None:
+        block_m = env_block_m
+    if env_block_n is not None:
+        block_n = env_block_n
+    if env_block_k is not None:
+        block_k = env_block_k
+    if env_steps is not None:
+        max_concurrent_steps = env_steps
+    if env_grid_block_n is not None:
+        grid_block_n = env_grid_block_n
+
+    return _KernelConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        max_concurrent_steps=max_concurrent_steps,
+        grid_block_n=grid_block_n,
+    )
 
 
 
@@ -128,15 +203,11 @@ def _ragged_dot_forward_impl(
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
-    config = _choose_kernel_config(k)
+    config = _choose_kernel_config(m, k, n)
     n_pad = (-n) % config.block_n
     if n_pad:
         rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, n_pad)))
         n = n + n_pad
-    if m > 0:
-        config = config._replace(block_m=min(config.block_m, m))
-    if n > 0:
-        config = config._replace(block_n=min(config.block_n, n))
     zero_slice = jnp.zeros((1, k, n), dtype=rhs.dtype)
     padded_rhs = jnp.concatenate([zero_slice, rhs, zero_slice], axis=0)
 
@@ -182,6 +253,9 @@ def _pallas_ragged_dot(
     if k % block_k != 0:
         raise ValueError(f"k={k} must be a multiple of block_k={block_k}")
 
+    env_load_group_sizes = _env_bool("SKYRL_RAGGED_DOT_LOAD_GROUP_SIZES")
+    load_group_sizes = False if env_load_group_sizes is None else env_load_group_sizes
+
     return ragged_dot_mgpu.ragged_dot(
         lhs,
         rhs,
@@ -191,7 +265,7 @@ def _pallas_ragged_dot(
         block_k=block_k,
         max_concurrent_steps=max_concurrent_steps,
         grid_block_n=grid_block_n,
-        load_group_sizes_to_register=False,
+        load_group_sizes_to_register=load_group_sizes,
     )
 
 
