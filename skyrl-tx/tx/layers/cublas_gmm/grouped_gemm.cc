@@ -19,19 +19,20 @@ ffi::Error GroupedGemmBf16Impl(
     ffi::Buffer<ffi::S64> A_ptrs,           // [g_local] workspace
     ffi::Buffer<ffi::S64> B_ptrs,           // [g_local] workspace
     ffi::Buffer<ffi::S64> C_ptrs,           // [g_local] workspace
-    int64_t g_local,
-    int64_t k,
-    int64_t n,
     bool trans_rhs,
     ffi::ResultBuffer<ffi::BF16> out        // [m, n]
 ) {
     if (!g_handle) cublasCreate(&g_handle);
     cublasSetStream(g_handle, stream);
 
-    if (g_local == 0) return ffi::Error::Success();
-
+    // Get dimensions from arrays
     int64_t m = lhs.dimensions()[0];
+    int64_t k = lhs.dimensions()[1];
+    int64_t g_local = rhs.dimensions()[0];
+    int64_t n = rhs.dimensions()[2];  // rhs is [g_local, k, n]
     int num_groups = static_cast<int>(group_sizes.dimensions()[0]);
+
+    if (g_local == 0) return ffi::Error::Success();
 
     // Read group_offset from device
     int32_t group_offset;
@@ -112,9 +113,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::S64>>()    // A_ptrs workspace
         .Arg<ffi::Buffer<ffi::S64>>()    // B_ptrs workspace
         .Arg<ffi::Buffer<ffi::S64>>()    // C_ptrs workspace
-        .Attr<int64_t>("g_local")
-        .Attr<int64_t>("k")
-        .Attr<int64_t>("n")
         .Attr<bool>("trans_rhs")
         .Ret<ffi::Buffer<ffi::BF16>>()   // out
 );
