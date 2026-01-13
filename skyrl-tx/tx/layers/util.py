@@ -4,6 +4,21 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec
 
+# cuBLAS grouped GEMM (optional, for GPU)
+_cublas_available = None
+
+
+def _try_cublas():
+    """Check if cuBLAS grouped GEMM is available."""
+    global _cublas_available
+    if _cublas_available is None:
+        try:
+            from tx.layers.cublas_gmm import grouped_gemm_bf16
+            _cublas_available = True
+        except Exception:
+            _cublas_available = False
+    return _cublas_available
+
 
 def ragged_dot(
     lhs: jax.Array,
@@ -12,17 +27,19 @@ def ragged_dot(
     precision=None,
     preferred_element_type=None,
     group_offset: jax.Array | None = None,
+    use_cublas: bool = False,
 ) -> jax.Array:
     """Ragged dot product with group_offset support.
 
     When group_offset is specified, rhs contains groups [offset, offset + g_local).
     Tokens outside this range are routed to boundary groups and masked to zero.
+
+    Args:
+        use_cublas: If True and available, use cuBLAS grouped GEMM on GPU.
     """
     if group_offset is None:
         return lax.ragged_dot(
-            lhs,
-            rhs,
-            group_sizes,
+            lhs, rhs, group_sizes,
             precision=precision,
             preferred_element_type=preferred_element_type,
         )
@@ -33,6 +50,11 @@ def ragged_dot(
     g_local = rhs.shape[0]
 
     assert g_local > 0, "rhs must have at least one group"
+
+    # Use cuBLAS if requested and available
+    if use_cublas and _try_cublas() and lhs.dtype == jnp.bfloat16:
+        from tx.layers.cublas_gmm import grouped_gemm_bf16
+        return grouped_gemm_bf16(lhs, rhs, group_sizes, int(offset))
 
     # Compute token boundaries for local groups
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
@@ -49,9 +71,7 @@ def ragged_dot(
 
     # Call ragged_dot - extra tokens use boundary groups but get masked out
     result = lax.ragged_dot(
-        lhs,
-        rhs,
-        adjusted_group_sizes,
+        lhs, rhs, adjusted_group_sizes,
         precision=precision,
         preferred_element_type=preferred_element_type,
     )
