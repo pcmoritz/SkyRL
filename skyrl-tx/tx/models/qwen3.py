@@ -231,6 +231,16 @@ class Qwen3Experts(nnx.Module):
             local_out = jnp.sum(out * routing_weights[..., None], axis=1)
             return jax.lax.psum(local_out, axis_name="ep")
 
+        # Debug: print group_sizes distribution
+        m = hidden_sorted.shape[0]
+        g_total = group_sizes.shape[0]
+        g_local = g_total // ep
+        local_capacity = int(2.0 * m * g_local / g_total)
+        jax.debug.print(
+            "ragged_dot debug: m={m}, g_total={g_total}, g_local={g_local}, local_capacity={lc}, group_sizes={gs}, max_per_shard={mx}",
+            m=m, g_total=g_total, g_local=g_local, lc=local_capacity, gs=group_sizes,
+            mx=jnp.max(jnp.array([jnp.sum(group_sizes[i*g_local:(i+1)*g_local]) for i in range(ep)]))
+        )
         return shard_map_ep(self, forward, hidden_sorted, group_sizes, unsort_indices, adapter_sorted, routing_weights)
 
 
