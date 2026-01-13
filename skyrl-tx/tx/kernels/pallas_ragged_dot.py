@@ -184,6 +184,7 @@ def _pallas_ragged_dot(
         block_k=block_k,
         max_concurrent_steps=max_concurrent_steps,
         grid_block_n=grid_block_n,
+        load_group_sizes_to_register=False,
     )
 
 
