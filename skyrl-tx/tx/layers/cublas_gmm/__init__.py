@@ -3,6 +3,7 @@
 from pathlib import Path
 import ctypes
 import jax
+jax.config.update("jax_enable_x64", True)
 from jax import numpy as jnp
 
 _registered = False
