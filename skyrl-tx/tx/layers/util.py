@@ -27,32 +27,16 @@ def ragged_dot(
     num_valid = shard_end - shard_start
     local_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
 
-    # Global decision: use fast path only if ALL shards can use it
-    can_use_fast = (num_valid <= local_capacity).astype(jnp.int32)
-    all_use_fast = lax.pmin(can_use_fast, axis_name="ep") > 0
+    # Hardcoded fast path for testing
+    clamped_start = jnp.minimum(shard_start, m - local_capacity)
+    offset_in_slice = shard_start - clamped_start
 
-    def fast_path(_):
-        # Handle dynamic_slice clamping: when shard_start + local_capacity > m,
-        # the slice starts at m - local_capacity instead of shard_start
-        clamped_start = jnp.minimum(shard_start, m - local_capacity)
-        offset_in_slice = shard_start - clamped_start
-
-        lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
-        # Absorb prefix (offset_in_slice tokens) into first group, suffix into last group
-        adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
-        result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
-        # Mask to keep only valid tokens at [offset_in_slice, offset_in_slice + num_valid)
-        idx = jnp.arange(local_capacity)
-        result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
-        return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
-
-    def full_path(_):
-        adjusted = local_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
-        result = lax.ragged_dot(lhs, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
-        mask = (jnp.arange(m) >= shard_start) & (jnp.arange(m) < shard_end)
-        return jnp.where(mask[:, None], result, 0)
-
-    return lax.cond(all_use_fast, fast_path, full_path, None)
+    lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
+    adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
+    result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
+    idx = jnp.arange(local_capacity)
+    result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
+    return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
