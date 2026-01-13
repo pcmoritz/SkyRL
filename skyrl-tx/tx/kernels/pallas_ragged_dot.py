@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import jax
@@ -91,6 +92,20 @@ def _ragged_dot_forward_impl(
     Returns:
         Output array of shape (M, N) containing zeros for non-local experts.
     """
+    if os.environ.get("SKYRL_DEBUG_RAGGED_DOT_LAYOUTS"):
+        def _spec(x):
+            sharding = getattr(x, "sharding", None)
+            spec = getattr(sharding, "spec", None)
+            return spec if spec is not None else sharding
+
+        jax.debug.print(
+            "ragged_dot kernel specs lhs={} rhs={} groups={} offset={}",
+            _spec(lhs),
+            _spec(rhs),
+            _spec(group_sizes),
+            _spec(group_offset),
+        )
+
     (m, k) = lhs.shape
     g_local, k_rhs, n = rhs.shape
 
