@@ -15,17 +15,16 @@ def _register():
     _registered = True
 
 
-def grouped_gemm_bf16(lhs, rhs, group_sizes, group_offset, trans_rhs=False):
+def grouped_gemm_bf16(lhs, rhs, group_sizes, group_offset):
     """Grouped GEMM: out[offsets[i]:offsets[i+1]] = lhs[...] @ rhs[i - offset]"""
     _register()
 
     m, k = lhs.shape
-    g_local, n = rhs.shape[0], rhs.shape[1 if trans_rhs else 2]
+    g_local, n = rhs.shape[0], rhs.shape[2]
 
     # Pointer workspaces
     ptrs = jnp.zeros(g_local, jnp.int64)
 
     return jax.ffi.ffi_call(
         "grouped_gemm_bf16", jax.ShapeDtypeStruct((m, n), lhs.dtype),
-        attributes=(("trans_rhs", trans_rhs),),
     )(lhs, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), ptrs, ptrs, ptrs)

@@ -19,7 +19,6 @@ ffi::Error GroupedGemmBf16Impl(
     ffi::Buffer<ffi::S64> A_ptrs,           // [g_local] workspace
     ffi::Buffer<ffi::S64> B_ptrs,           // [g_local] workspace
     ffi::Buffer<ffi::S64> C_ptrs,           // [g_local] workspace
-    bool trans_rhs,
     ffi::ResultBuffer<ffi::BF16> out        // [m, n]
 ) {
     if (!g_handle) cublasCreate(&g_handle);
@@ -61,7 +60,7 @@ ffi::Error GroupedGemmBf16Impl(
 
     std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
     std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
-    std::vector<cublasOperation_t> transa(g_local, trans_rhs ? CUBLAS_OP_T : CUBLAS_OP_N);
+    std::vector<cublasOperation_t> transa(g_local, CUBLAS_OP_N);
     std::vector<cublasOperation_t> transb(g_local, CUBLAS_OP_N);
     std::vector<int> group_size(g_local, 1);
 
@@ -77,7 +76,7 @@ ffi::Error GroupedGemmBf16Impl(
         Ms[i] = static_cast<int>(n);
         Ns[i] = group_m;
         Ks[i] = static_cast<int>(k);
-        lda[i] = trans_rhs ? static_cast<int>(k) : static_cast<int>(n);
+        lda[i] = static_cast<int>(n);
         ldb[i] = static_cast<int>(k);
         ldc[i] = static_cast<int>(n);
     }
@@ -113,6 +112,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::S64>>()    // A_ptrs workspace
         .Arg<ffi::Buffer<ffi::S64>>()    // B_ptrs workspace
         .Arg<ffi::Buffer<ffi::S64>>()    // C_ptrs workspace
-        .Attr<bool>("trans_rhs")
         .Ret<ffi::Buffer<ffi::BF16>>()   // out
 );
