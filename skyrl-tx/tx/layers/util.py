@@ -5,6 +5,9 @@ from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec
 
 
+DEFAULT_RAGGED_DOT_BUCKET_SIZES = (128, 256, 512, 1024, 2048, 4096)
+
+
 def ragged_dot(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -31,6 +34,7 @@ def ragged_dot(
     offset = group_offset[0]
     m = lhs.shape[0]
     g_local = rhs.shape[0]
+    n = rhs.shape[2]
 
     assert g_local > 0, "rhs must have at least one group"
 
@@ -38,25 +42,48 @@ def ragged_dot(
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
     shard_start = cumsum[offset]
     shard_end = cumsum[offset + g_local]
+    local_len = shard_end - shard_start
 
-    # Valid mask for tokens in local groups
-    token_idx = jnp.arange(m)
-    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
+    bucket_sizes = tuple(size for size in DEFAULT_RAGGED_DOT_BUCKET_SIZES if size < m) + (m,)
+    bucket_sizes_array = jnp.array(bucket_sizes, dtype=local_len.dtype)
+    bucket_index = jnp.sum(local_len > bucket_sizes_array)
 
-    # Adjust group sizes: absorb extra tokens at boundaries
-    local_group_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
-    adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
+    def _bucketed_result(bucket_len: int) -> jax.Array:
+        max_start = m - bucket_len
+        window_start = jnp.minimum(shard_start, max_start)
+        window_start = jnp.maximum(window_start, 0)
+        window_end = window_start + bucket_len
+        prefix = shard_start - window_start
+        suffix = window_end - shard_end
 
-    # Call ragged_dot - extra tokens use boundary groups but get masked out
-    result = lax.ragged_dot(
-        lhs,
-        rhs,
-        adjusted_group_sizes,
-        precision=precision,
-        preferred_element_type=preferred_element_type,
-    )
+        local_group_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
+        adjusted_group_sizes = local_group_sizes.at[0].add(prefix).at[-1].add(suffix)
 
-    return jnp.where(valid_mask[:, None], result, 0)
+        window_lhs = lax.dynamic_slice_in_dim(lhs, window_start, bucket_len, axis=0)
+        window_result = lax.ragged_dot(
+            window_lhs,
+            rhs,
+            adjusted_group_sizes,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+
+        window_idx = jnp.arange(bucket_len, dtype=shard_start.dtype) + window_start
+        window_valid = (window_idx >= shard_start) & (window_idx < shard_end)
+        window_result = jnp.where(window_valid[:, None], window_result, 0)
+
+        out = jnp.zeros((m, n), dtype=window_result.dtype)
+        return lax.dynamic_update_slice(out, window_result, (window_start, 0))
+
+    def _branch(bucket_len: int):
+        def _run(_):
+            return _bucketed_result(bucket_len)
+
+        return _run
+
+    branches = [_branch(size) for size in bucket_sizes]
+    dummy = jnp.array(0, dtype=local_len.dtype)
+    return lax.switch(bucket_index, branches, dummy)
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
