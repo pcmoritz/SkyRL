@@ -54,7 +54,7 @@ def ragged_dot(
     # Use cuBLAS if requested and available
     if use_cublas and _try_cublas() and lhs.dtype == jnp.bfloat16:
         from tx.layers.cublas_gmm import grouped_gemm_bf16
-        return grouped_gemm_bf16(lhs, rhs, group_sizes, int(offset))
+        return grouped_gemm_bf16(lhs, rhs, group_sizes, group_offset)
 
     # Compute token boundaries for local groups
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
