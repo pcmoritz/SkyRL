@@ -20,7 +20,7 @@ def ragged_dot(
     offset = group_offset[0]
     m, k = lhs.shape
     g_local, g_total = rhs.shape[0], group_sizes.shape[0]
-    local_capacity = min(int(2.0 * m * g_local / g_total), m)
+    local_capacity = min(int(3.0 * m * g_local / g_total), m)
 
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
     shard_start, shard_end = cumsum[offset], cumsum[offset + g_local]
@@ -32,12 +32,19 @@ def ragged_dot(
     all_use_fast = lax.pmin(can_use_fast, axis_name="ep") > 0
 
     def fast_path(_):
-        lhs_padded = jnp.pad(lhs, ((0, local_capacity), (0, 0)))
-        lhs_slice = lax.dynamic_slice(lhs_padded, (shard_start, 0), (local_capacity, k))
-        adjusted = local_sizes.at[-1].add(local_capacity - num_valid)
+        # Handle dynamic_slice clamping: when shard_start + local_capacity > m,
+        # the slice starts at m - local_capacity instead of shard_start
+        clamped_start = jnp.minimum(shard_start, m - local_capacity)
+        offset_in_slice = shard_start - clamped_start
+
+        lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
+        # Absorb prefix (offset_in_slice tokens) into first group, suffix into last group
+        adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
         result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
-        result = jnp.where((jnp.arange(local_capacity) < num_valid)[:, None], result, 0)
-        return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (shard_start, 0))
+        # Mask to keep only valid tokens at [offset_in_slice, offset_in_slice + num_valid)
+        idx = jnp.arange(local_capacity)
+        result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
+        return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
 
     def full_path(_):
         adjusted = local_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
