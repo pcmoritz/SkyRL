@@ -98,6 +98,17 @@ def _env_bool(name: str) -> bool | None:
     return value.strip().lower() in ("1", "true", "t", "yes", "y")
 
 
+def _bucket_sizes(m: int) -> tuple[int, ...]:
+    raw = os.environ.get("SKYRL_RAGGED_DOT_BUCKETS")
+    if raw:
+        base = [int(value) for value in raw.split(",") if value.strip()]
+    else:
+        base = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    sizes = [size for size in base if size < m]
+    sizes.append(m)
+    return tuple(sorted(set(sizes)))
+
+
 @lru_cache(maxsize=None)
 def _is_h100() -> bool:
     try:
@@ -330,36 +341,64 @@ def _ragged_dot_forward_impl(
     group_boundaries = jnp.cumulative_sum(sizes, include_initial=True)
     shard_start = lax.dynamic_index_in_dim(group_boundaries, offset, axis=0, keepdims=False)
     shard_end = lax.dynamic_index_in_dim(group_boundaries, offset + g_local, axis=0, keepdims=False)
-    prefix = shard_start
-    suffix = jnp.asarray(m, dtype=jnp.int32) - shard_end
+    local_len = shard_end - shard_start
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
-    extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
-    dtype_size = jnp.dtype(lhs.dtype).itemsize
-    config = _choose_kernel_config(m, k, n)
-    config = _adjust_config_for_smem(m, n, dtype_size, config)
-    n_pad = (-n) % config.block_n
-    if n_pad:
-        rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, n_pad)))
-        n = n + n_pad
-    zero_slice = jnp.zeros((1, k, n), dtype=rhs.dtype)
-    padded_rhs = jnp.concatenate([zero_slice, rhs, zero_slice], axis=0)
+    if m == 0:
+        return jnp.zeros((0, orig_n), dtype=lhs.dtype)
 
-    result = _pallas_ragged_dot(
-        lhs,
-        padded_rhs,
-        group_sizes=extended_group_sizes,
-        block_m=config.block_m,
-        block_n=config.block_n,
-        block_k=config.block_k,
-        max_concurrent_steps=config.max_concurrent_steps,
-        grid_block_n=config.grid_block_n,
-    )
-    if n_pad:
-        result = result[:, :orig_n]
-    token_idx = jnp.arange(m, dtype=jnp.int32)
-    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
-    return jnp.where(valid_mask[:, None], result, 0)
+    bucket_sizes = _bucket_sizes(m)
+    bucket_sizes_arr = jnp.array(bucket_sizes, dtype=jnp.int32)
+    idxs = jnp.arange(len(bucket_sizes), dtype=jnp.int32)
+    mask = local_len <= bucket_sizes_arr
+    bucket_idx = jnp.min(jnp.where(mask, idxs, idxs[-1]))
+
+    def _run_bucket(bucket: int) -> jax.Array:
+        window_len = int(bucket)
+        window_start = jnp.minimum(
+            shard_start, jnp.asarray(m - window_len, dtype=jnp.int32)
+        )
+        window_start = jnp.maximum(window_start, jnp.int32(0))
+        window_end = window_start + window_len
+
+        prefix = shard_start - window_start
+        suffix = window_end - shard_end
+        extended_group_sizes = jnp.concatenate(
+            [prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0
+        )
+
+        dtype_size = jnp.dtype(lhs.dtype).itemsize
+        config = _choose_kernel_config(window_len, k, n)
+        config = _adjust_config_for_smem(window_len, n, dtype_size, config)
+        n_pad = (-n) % config.block_n
+        rhs_padded = rhs
+        n_eff = n
+        if n_pad:
+            rhs_padded = jnp.pad(rhs_padded, ((0, 0), (0, 0), (0, n_pad)))
+            n_eff = n + n_pad
+
+        zero_slice = jnp.zeros((1, k, n_eff), dtype=rhs_padded.dtype)
+        padded_rhs = jnp.concatenate([zero_slice, rhs_padded, zero_slice], axis=0)
+        lhs_window = lax.dynamic_slice_in_dim(lhs, window_start, window_len, axis=0)
+
+        result = _pallas_ragged_dot(
+            lhs_window,
+            padded_rhs,
+            group_sizes=extended_group_sizes,
+            block_m=config.block_m,
+            block_n=config.block_n,
+            block_k=config.block_k,
+            max_concurrent_steps=config.max_concurrent_steps,
+            grid_block_n=config.grid_block_n,
+        )
+        if n_pad:
+            result = result[:, :orig_n]
+
+        output = jnp.zeros((m, orig_n), dtype=result.dtype)
+        return lax.dynamic_update_slice(output, result, (window_start, 0))
+
+    fns = [functools.partial(_run_bucket, bucket) for bucket in bucket_sizes]
+    return lax.switch(bucket_idx, fns)
 
 
 def _pallas_ragged_dot(
