@@ -34,7 +34,7 @@ class _KernelConfig(NamedTuple):
     grid_block_n: int
 
 
-def _choose_kernel_config(k: int, n: int) -> _KernelConfig:
+def _choose_kernel_config(k: int) -> _KernelConfig:
     """Pick a conservative kernel configuration that works on most shapes."""
 
     def _select_block_k(value: int) -> int:
@@ -44,8 +44,8 @@ def _choose_kernel_config(k: int, n: int) -> _KernelConfig:
         raise ValueError(f"k={value} must be divisible by 16")
 
     block_k = _select_block_k(k)
-    # Use a wide tile for large outputs, otherwise fall back to a smaller tile.
-    block_n = 64 if n >= 64 else 32
+    # Use a single block_n that is supported by the WGMMA kernel.
+    block_n = 64
     return _KernelConfig(block_m=64, block_n=block_n, block_k=block_k, max_concurrent_steps=3, grid_block_n=1)
 
 
@@ -108,6 +108,7 @@ def _ragged_dot_forward_impl(
 
     (m, k) = lhs.shape
     g_local, k_rhs, n = rhs.shape
+    orig_n = n
 
     if k != k_rhs:
         raise ValueError(f"Incompatible shapes lhs={lhs.shape} rhs={rhs.shape}")
@@ -127,7 +128,11 @@ def _ragged_dot_forward_impl(
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
-    config = _choose_kernel_config(k, n)
+    config = _choose_kernel_config(k)
+    n_pad = (-n) % config.block_n
+    if n_pad:
+        rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, n_pad)))
+        n = n + n_pad
     if m > 0:
         config = config._replace(block_m=min(config.block_m, m))
     if n > 0:
@@ -145,6 +150,8 @@ def _ragged_dot_forward_impl(
         max_concurrent_steps=config.max_concurrent_steps,
         grid_block_n=config.grid_block_n,
     )
+    if n_pad:
+        result = result[:, :orig_n]
     token_idx = jnp.arange(m, dtype=jnp.int32)
     valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
     return jnp.where(valid_mask[:, None], result, 0)
