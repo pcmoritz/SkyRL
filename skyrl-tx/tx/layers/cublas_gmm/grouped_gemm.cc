@@ -37,9 +37,6 @@ ffi::Error GroupedGemmBf16Impl(
     ffi::Buffer<ffi::BF16> rhs,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S64> A_ptrs,
-    ffi::Buffer<ffi::S64> B_ptrs,
-    ffi::Buffer<ffi::S64> C_ptrs,
     ffi::ResultBuffer<ffi::BF16> out
 ) {
     cublasSetStream(get_handle(), stream);
@@ -58,9 +55,9 @@ ffi::Error GroupedGemmBf16Impl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* out_base = reinterpret_cast<char*>(out->typed_data());
 
-    int64_t* A_ptr = const_cast<int64_t*>(A_ptrs.typed_data());
-    int64_t* B_ptr = const_cast<int64_t*>(B_ptrs.typed_data());
-    int64_t* C_ptr = const_cast<int64_t*>(C_ptrs.typed_data());
+    // Allocate pointer arrays on CPU
+    std::vector<const void*> A_ptrs(g_local), B_ptrs(g_local);
+    std::vector<void*> C_ptrs(g_local);
 
     std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
     std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
@@ -73,9 +70,9 @@ ffi::Error GroupedGemmBf16Impl(
         int group_m = offsets[group_offset + i + 1] - start;
 
         // Row-major: C = A @ B becomes C^T = B^T @ A^T in col-major
-        A_ptr[i] = reinterpret_cast<int64_t>(rhs_base + i * k * n * 2);
-        B_ptr[i] = reinterpret_cast<int64_t>(lhs_base + start * k * 2);
-        C_ptr[i] = reinterpret_cast<int64_t>(out_base + start * n * 2);
+        A_ptrs[i] = rhs_base + i * k * n * 2;
+        B_ptrs[i] = lhs_base + start * k * 2;
+        C_ptrs[i] = out_base + start * n * 2;
 
         Ms[i] = n; Ns[i] = group_m; Ks[i] = k;
         lda[i] = n; ldb[i] = k; ldc[i] = n;
@@ -84,9 +81,9 @@ ffi::Error GroupedGemmBf16Impl(
     float alpha = 1.0f, beta = 0.0f;
     cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(A_ptr), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(B_ptr), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(C_ptr), CUDA_R_16BF, ldc.data(),
+        A_ptrs.data(), CUDA_R_16BF, lda.data(),
+        B_ptrs.data(), CUDA_R_16BF, ldb.data(),
+        &beta, C_ptrs.data(), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
 
     return ffi::Error::Success();
@@ -100,9 +97,6 @@ ffi::Error GroupedGemmBf16TransImpl(
     ffi::Buffer<ffi::BF16> rhs,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S64> A_ptrs,
-    ffi::Buffer<ffi::S64> B_ptrs,
-    ffi::Buffer<ffi::S64> C_ptrs,
     ffi::ResultBuffer<ffi::BF16> d_lhs
 ) {
     cublasSetStream(get_handle(), stream);
@@ -121,9 +115,8 @@ ffi::Error GroupedGemmBf16TransImpl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* dlhs_base = reinterpret_cast<char*>(d_lhs->typed_data());
 
-    int64_t* A_ptr = const_cast<int64_t*>(A_ptrs.typed_data());
-    int64_t* B_ptr = const_cast<int64_t*>(B_ptrs.typed_data());
-    int64_t* C_ptr = const_cast<int64_t*>(C_ptrs.typed_data());
+    std::vector<const void*> A_ptrs(g_local), B_ptrs(g_local);
+    std::vector<void*> C_ptrs(g_local);
 
     std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
     std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
@@ -136,9 +129,9 @@ ffi::Error GroupedGemmBf16TransImpl(
         int group_m = offsets[group_offset + i + 1] - start;
 
         // d_lhs = dout @ rhs^T: [group_m, n] @ [n, k] -> [group_m, k]
-        A_ptr[i] = reinterpret_cast<int64_t>(rhs_base + i * k * n * 2);
-        B_ptr[i] = reinterpret_cast<int64_t>(dout_base + start * n * 2);
-        C_ptr[i] = reinterpret_cast<int64_t>(dlhs_base + start * k * 2);
+        A_ptrs[i] = rhs_base + i * k * n * 2;
+        B_ptrs[i] = dout_base + start * n * 2;
+        C_ptrs[i] = dlhs_base + start * k * 2;
 
         Ms[i] = k; Ns[i] = group_m; Ks[i] = n;
         lda[i] = n;  // rhs is [k, n], transposed access
@@ -149,9 +142,9 @@ ffi::Error GroupedGemmBf16TransImpl(
     float alpha = 1.0f, beta = 0.0f;
     cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(A_ptr), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(B_ptr), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(C_ptr), CUDA_R_16BF, ldc.data(),
+        A_ptrs.data(), CUDA_R_16BF, lda.data(),
+        B_ptrs.data(), CUDA_R_16BF, ldb.data(),
+        &beta, C_ptrs.data(), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
 
     return ffi::Error::Success();
@@ -165,9 +158,6 @@ ffi::Error GroupedGemmBf16DwImpl(
     ffi::Buffer<ffi::BF16> dout,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S64> A_ptrs,
-    ffi::Buffer<ffi::S64> B_ptrs,
-    ffi::Buffer<ffi::S64> C_ptrs,
     ffi::ResultBuffer<ffi::BF16> d_rhs
 ) {
     cublasSetStream(get_handle(), stream);
@@ -187,9 +177,8 @@ ffi::Error GroupedGemmBf16DwImpl(
     const char* dout_base = reinterpret_cast<const char*>(dout.typed_data());
     char* drhs_base = reinterpret_cast<char*>(d_rhs->typed_data());
 
-    int64_t* A_ptr = const_cast<int64_t*>(A_ptrs.typed_data());
-    int64_t* B_ptr = const_cast<int64_t*>(B_ptrs.typed_data());
-    int64_t* C_ptr = const_cast<int64_t*>(C_ptrs.typed_data());
+    std::vector<const void*> A_ptrs(g_local), B_ptrs(g_local);
+    std::vector<void*> C_ptrs(g_local);
 
     std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
     std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
@@ -202,9 +191,9 @@ ffi::Error GroupedGemmBf16DwImpl(
         int group_m = offsets[group_offset + i + 1] - start;
 
         // d_rhs = lhs^T @ dout: [k, group_m] @ [group_m, n] -> [k, n]
-        A_ptr[i] = reinterpret_cast<int64_t>(dout_base + start * n * 2);
-        B_ptr[i] = reinterpret_cast<int64_t>(lhs_base + start * k * 2);
-        C_ptr[i] = reinterpret_cast<int64_t>(drhs_base + i * k * n * 2);
+        A_ptrs[i] = dout_base + start * n * 2;
+        B_ptrs[i] = lhs_base + start * k * 2;
+        C_ptrs[i] = drhs_base + i * k * n * 2;
 
         Ms[i] = n; Ns[i] = k; Ks[i] = group_m;
         lda[i] = n;
@@ -215,9 +204,9 @@ ffi::Error GroupedGemmBf16DwImpl(
     float alpha = 1.0f, beta = 0.0f;
     cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(A_ptr), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(B_ptr), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(C_ptr), CUDA_R_16BF, ldc.data(),
+        A_ptrs.data(), CUDA_R_16BF, lda.data(),
+        B_ptrs.data(), CUDA_R_16BF, ldb.data(),
+        &beta, C_ptrs.data(), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
 
     return ffi::Error::Success();
@@ -230,9 +219,6 @@ ffi::Error GroupedGemmBf16DwImpl(
         .Arg<ffi::Buffer<ffi::BF16>>() \
         .Arg<ffi::Buffer<ffi::S32>>() \
         .Arg<ffi::Buffer<ffi::S32>>() \
-        .Arg<ffi::Buffer<ffi::S64>>() \
-        .Arg<ffi::Buffer<ffi::S64>>() \
-        .Arg<ffi::Buffer<ffi::S64>>() \
         .Ret<ffi::Buffer<ffi::BF16>>()
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmBf16, GroupedGemmBf16Impl, BINDING);
