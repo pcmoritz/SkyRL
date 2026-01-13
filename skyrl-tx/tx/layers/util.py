@@ -135,7 +135,6 @@ def shard_map_ep(module: nnx.Module, func, *args):
         mesh=get_abstract_mesh(),
         in_specs=in_specs,
         out_specs=PartitionSpec(),
-        axis_names={"ep"},
         check_vma=False,
     )
     def _body(state, *fn_args):
