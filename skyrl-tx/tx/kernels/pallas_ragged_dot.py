@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import math
 import os
 from functools import lru_cache
 from typing import NamedTuple
@@ -24,7 +27,8 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 from jax import custom_vjp
-from jax.experimental.pallas.ops.gpu import ragged_dot_mgpu
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 
 
 class _KernelConfig(NamedTuple):
@@ -33,6 +37,53 @@ class _KernelConfig(NamedTuple):
     block_k: int
     max_concurrent_steps: int
     grid_block_n: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _GroupInfo:
+    group_id: jax.Array
+    block: jax.Array
+    block_start: jax.Array
+    actual_start: jax.Array
+    actual_end: jax.Array
+    start_within_block: jax.Array
+    actual_size: jax.Array
+
+    @classmethod
+    def create(cls, group_lengths, tile, tid):
+        tile = jnp.int32(tile)
+        group_boundaries = [group_lengths[i] for i in range(len(group_lengths))]
+
+        group_end = group_start = block = group = end = jnp.array(0, dtype=jnp.int32)
+        for i, b in enumerate(group_boundaries):
+            start = end
+            end = start + b
+            final = end - 1
+            start_block = lax.div(start, tile)
+            final_block = lax.div(final, tile)
+            block_end = final_block + 1
+            tid_begin = start_block + i
+            tid_end = block_end + i
+            this_is_group = (tid_begin <= tid) & (tid < tid_end)
+            block = lax.select(this_is_group, tid - tid_begin + start_block, block)
+            group = lax.select(this_is_group, jnp.int32(i), group)
+            group_start = lax.select(this_is_group, start, group_start)
+            group_end = lax.select(this_is_group, end, group_end)
+
+        block_start = block * tile
+        actual_start = jnp.maximum(group_start, block_start)
+        actual_end = jnp.minimum(group_end, block_start + tile)
+        start_within_block = actual_start - block_start
+        actual_size = actual_end - actual_start
+        return cls(
+            group_id=group,
+            block=block,
+            block_start=block_start,
+            actual_start=actual_start,
+            actual_end=actual_end,
+            start_within_block=start_within_block,
+            actual_size=actual_size,
+        )
 
 
 def _env_int(name: str) -> int | None:
@@ -136,7 +187,8 @@ def _estimate_smem_bytes(
 ) -> int:
     stage_bytes = (block_m * block_k + block_k * block_n) * dtype_size
     acc_bytes = block_m * block_n * dtype_size
-    return stage_bytes * max_concurrent_steps + acc_bytes
+    # Account for accumulator + output smem buffers.
+    return stage_bytes * max_concurrent_steps + acc_bytes * 2
 
 
 def _adjust_config_for_smem(
@@ -338,17 +390,95 @@ def _pallas_ragged_dot(
     env_load_group_sizes = _env_bool("SKYRL_RAGGED_DOT_LOAD_GROUP_SIZES")
     load_group_sizes = False if env_load_group_sizes is None else env_load_group_sizes
 
-    return ragged_dot_mgpu.ragged_dot(
-        lhs,
-        rhs,
-        group_sizes=group_sizes,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        max_concurrent_steps=max_concurrent_steps,
-        grid_block_n=grid_block_n,
-        load_group_sizes_to_register=load_group_sizes,
+    def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
+        grid_m = pl.cdiv(m, block_m) + g_ext - 1
+        grid_n = pl.cdiv(n, block_n)
+        grid = (grid_m * grid_n,)
+        if load_group_sizes:
+            rows_per_expert = [rows_per_expert_gmem[i] for i in range(len(rows_per_expert_gmem))]
+        else:
+            rows_per_expert = rows_per_expert_gmem
+
+        last_group = jnp.int32(g_ext - 1)
+
+        @plgpu.nd_loop(grid, collective_axes="sm")
+        def mn_loop(loop_info: plgpu.NDLoopInfo):  # pylint: disable=unused-variable
+            mi, ni = plgpu.planar_snake(
+                loop_info.index[0],
+                (grid_m, grid_n),
+                1,
+                grid_block_n,
+            )
+            group_info = _GroupInfo.create(rows_per_expert, block_m, mi)
+            is_local_group = (group_info.group_id > 0) & (group_info.group_id < last_group)
+
+            def acc_scope(acc_ref):
+                acc_ref[...] = jnp.zeros((block_m, block_n), dtype=acc_ref.dtype)
+
+                @pl.when(is_local_group)
+                def _():
+                    plgpu.emit_pipeline(
+                        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(
+                            acc_ref,
+                            lhs_smem,
+                            rhs_smem,
+                        ),
+                        grid=(k // block_k,),
+                        in_specs=[
+                            plgpu.BlockSpec(
+                                (block_m, block_k),
+                                lambda k: (group_info.block, k),
+                                delay_release=1,
+                            ),
+                            plgpu.BlockSpec(
+                                (block_k, block_n),
+                                lambda k: (k, ni),
+                                delay_release=1,
+                            ),
+                        ],
+                        max_concurrent_steps=max_concurrent_steps,
+                    )(lhs_gmem, rhs_gmem.at[group_info.group_id])
+                return acc_ref[...]
+
+            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+
+            @functools.partial(
+                pl.run_scoped,
+                o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype),
+            )
+            def store_scope(o_smem):  # pylint: disable=unused-variable
+                o_smem[...] = acc.astype(o_smem.dtype)
+                plgpu.commit_smem()
+
+                smem_start = group_info.start_within_block
+                remaining_rows = min(block_m, m)
+                while remaining_rows > 0:
+                    const_rows_len = 1 << int(math.log2(remaining_rows))
+                    remaining_rows //= 2
+
+                    @pl.when(group_info.actual_size & const_rows_len != 0)
+                    def _():
+                        o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
+                        o_gref_slice = o_gmem.at[
+                            pl.ds(group_info.block_start + smem_start, const_rows_len),
+                            pl.ds(ni * block_n, block_n),
+                        ]
+                        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+
+                    smem_start += group_info.actual_size & const_rows_len
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+    num_sms = 132
+    kernel = plgpu.kernel(
+        body,
+        out_shape=jax.ShapeDtypeStruct((m, n), lhs.dtype),
+        grid=(num_sms,),
+        grid_names=("sm",),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        ),
     )
+    return kernel(group_sizes, lhs, rhs)
 
 
 def _ragged_dot_backward(lhs, rhs, group_sizes, group_offset, cotangent):
