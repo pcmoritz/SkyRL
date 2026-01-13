@@ -27,6 +27,5 @@ def grouped_gemm_bf16(lhs, rhs, group_sizes, group_offset, trans_rhs=False):
 
     return jax.ffi.ffi_call(
         "grouped_gemm_bf16", jax.ShapeDtypeStruct((m, n), lhs.dtype),
-        lhs, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), ptrs, ptrs, ptrs,
-        trans_rhs=trans_rhs,
-    )
+        attributes=(("trans_rhs", trans_rhs),),
+    )(lhs, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), ptrs, ptrs, ptrs)
