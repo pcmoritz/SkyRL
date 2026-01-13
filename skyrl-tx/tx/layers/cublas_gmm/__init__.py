@@ -61,9 +61,14 @@ def _fwd(lhs, rhs, group_sizes, group_offset):
 
 def _bwd(res, g):
     lhs, rhs, group_sizes, group_offset = res
-    g_local = rhs.shape[0]
-    d_lhs = _dlhs_impl(g, rhs, group_sizes, group_offset)
-    d_rhs = _drhs_impl(lhs, g, group_sizes, group_offset, g_local)
+    # Use JAX for backward to preserve shard_map axis annotations
+    from tx.layers.util import ragged_dot as jax_ragged_dot
+
+    def fwd_jax(lhs, rhs):
+        return jax_ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset, use_cublas=False)
+
+    _, vjp_fn = jax.vjp(fwd_jax, lhs, rhs)
+    d_lhs, d_rhs = vjp_fn(g)
     return d_lhs, d_rhs, None, None
 
 
