@@ -32,7 +32,8 @@ def ragged_dot(
     all_use_fast = lax.pmin(can_use_fast, axis_name="ep") > 0
 
     def fast_path(_):
-        lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
+        lhs_padded = jnp.pad(lhs, ((0, local_capacity), (0, 0)))
+        lhs_slice = lax.dynamic_slice(lhs_padded, (shard_start, 0), (local_capacity, k))
         adjusted = local_sizes.at[-1].add(local_capacity - num_valid)
         result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
         result = jnp.where((jnp.arange(local_capacity) < num_valid)[:, None], result, 0)
