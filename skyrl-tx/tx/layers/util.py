@@ -12,6 +12,7 @@ def ragged_dot(
     precision=None,
     preferred_element_type=None,
     group_offset: jax.Array | None = None,
+    use_fast_path: jax.Array | bool = False,
 ) -> jax.Array:
     """Ragged dot with group_offset support and fast path optimization."""
     if group_offset is None:
@@ -27,16 +28,28 @@ def ragged_dot(
     num_valid = shard_end - shard_start
     local_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
 
-    # Hardcoded fast path for testing
-    clamped_start = jnp.minimum(shard_start, m - local_capacity)
-    offset_in_slice = shard_start - clamped_start
+    def fast_path(_):
+        clamped_start = jnp.minimum(shard_start, m - local_capacity)
+        offset_in_slice = shard_start - clamped_start
+        lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
+        adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
+        result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
+        idx = jnp.arange(local_capacity)
+        result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
+        return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
 
-    lhs_slice = lax.dynamic_slice(lhs, (shard_start, 0), (local_capacity, k))
-    adjusted = local_sizes.at[0].add(offset_in_slice).at[-1].add(local_capacity - offset_in_slice - num_valid)
-    result = lax.ragged_dot(lhs_slice, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
-    idx = jnp.arange(local_capacity)
-    result = jnp.where(((idx >= offset_in_slice) & (idx < offset_in_slice + num_valid))[:, None], result, 0)
-    return lax.dynamic_update_slice(jnp.zeros((m, rhs.shape[-1]), result.dtype), result, (clamped_start, 0))
+    def full_path(_):
+        adjusted = local_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
+        result = lax.ragged_dot(lhs, rhs, adjusted, precision=precision, preferred_element_type=preferred_element_type)
+        mask = (jnp.arange(m) >= shard_start) & (jnp.arange(m) < shard_end)
+        return jnp.where(mask[:, None], result, 0)
+
+    return lax.cond(use_fast_path, fast_path, full_path, None)
+
+
+def get_local_capacity(m: int, g_local: int, g_total: int) -> int:
+    """Get the local capacity for fast path."""
+    return min(int(3.0 * m * g_local / g_total), m)
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
