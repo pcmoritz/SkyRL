@@ -58,6 +58,17 @@ def _is_h100() -> bool:
 def _choose_kernel_config(m: int, k: int, n: int) -> _KernelConfig:
     """Pick a conservative kernel configuration that works on most shapes."""
 
+    def _grid_block_n_for(value: int, block_n: int) -> int:
+        padded_n = value + (-value) % block_n
+        grid_n = max(1, (padded_n + block_n - 1) // block_n)
+        if grid_n >= 16:
+            return 8
+        if grid_n >= 8:
+            return 4
+        if grid_n >= 4:
+            return 2
+        return 1
+
     def _select_block_k(value: int) -> int:
         for candidate in (64, 32, 16):
             if value % candidate == 0:
@@ -87,16 +98,7 @@ def _choose_kernel_config(m: int, k: int, n: int) -> _KernelConfig:
     else:
         max_concurrent_steps = 3
 
-    padded_n = n + (-n) % block_n
-    grid_n = max(1, (padded_n + block_n - 1) // block_n)
-    if grid_n >= 16:
-        grid_block_n = 8
-    elif grid_n >= 8:
-        grid_block_n = 4
-    elif grid_n >= 4:
-        grid_block_n = 2
-    else:
-        grid_block_n = 1
+    grid_block_n = _grid_block_n_for(n, block_n)
 
     env_block_m = _env_int("SKYRL_RAGGED_DOT_BLOCK_M")
     env_block_n = _env_int("SKYRL_RAGGED_DOT_BLOCK_N")
@@ -122,6 +124,84 @@ def _choose_kernel_config(m: int, k: int, n: int) -> _KernelConfig:
         max_concurrent_steps=max_concurrent_steps,
         grid_block_n=grid_block_n,
     )
+
+
+def _estimate_smem_bytes(
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    max_concurrent_steps: int,
+    dtype_size: int,
+) -> int:
+    stage_bytes = (block_m * block_k + block_k * block_n) * dtype_size
+    acc_bytes = block_m * block_n * dtype_size
+    return stage_bytes * max_concurrent_steps + acc_bytes
+
+
+def _adjust_config_for_smem(
+    m: int,
+    n: int,
+    dtype_size: int,
+    config: _KernelConfig,
+) -> _KernelConfig:
+    max_smem_bytes = _env_int("SKYRL_RAGGED_DOT_MAX_SMEM_BYTES") or 232_448
+
+    def _grid_block_n_for(value: int, block_n: int) -> int:
+        padded_n = value + (-value) % block_n
+        grid_n = max(1, (padded_n + block_n - 1) // block_n)
+        if grid_n >= 16:
+            return 8
+        if grid_n >= 8:
+            return 4
+        if grid_n >= 4:
+            return 2
+        return 1
+
+    def _block_n_candidates(value: int) -> list[int]:
+        candidates: list[int] = []
+        for candidate in (config.block_n, 192, 128, 64):
+            if candidate in candidates:
+                continue
+            pad = (-value) % candidate
+            if pad <= candidate // 4:
+                candidates.append(candidate)
+        return candidates
+
+    def _block_m_candidates(value: int) -> list[int]:
+        candidates: list[int] = []
+        for candidate in (config.block_m, 192, 128, 64):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def _step_candidates(value: int) -> list[int]:
+        candidates: list[int] = []
+        for candidate in (value, 6, 5, 4, 2):
+            if candidate <= value and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    for steps in _step_candidates(config.max_concurrent_steps):
+        for block_m in _block_m_candidates(m):
+            for block_n in _block_n_candidates(n):
+                smem = _estimate_smem_bytes(
+                    block_m=block_m,
+                    block_n=block_n,
+                    block_k=config.block_k,
+                    max_concurrent_steps=steps,
+                    dtype_size=dtype_size,
+                )
+                if smem <= max_smem_bytes:
+                    grid_block_n = _grid_block_n_for(n, block_n)
+                    return config._replace(
+                        block_m=block_m,
+                        block_n=block_n,
+                        max_concurrent_steps=steps,
+                        grid_block_n=grid_block_n,
+                    )
+
+    return config
 
 
 
@@ -203,7 +283,9 @@ def _ragged_dot_forward_impl(
     local_group_sizes = lax.dynamic_slice_in_dim(sizes, offset, g_local, axis=0)
     extended_group_sizes = jnp.concatenate([prefix[jnp.newaxis], local_group_sizes, suffix[jnp.newaxis]], axis=0)
 
+    dtype_size = jnp.dtype(lhs.dtype).itemsize
     config = _choose_kernel_config(m, k, n)
+    config = _adjust_config_for_smem(m, n, dtype_size, config)
     n_pad = (-n) % config.block_n
     if n_pad:
         rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, n_pad)))
