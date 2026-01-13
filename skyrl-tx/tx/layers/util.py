@@ -20,7 +20,7 @@ def ragged_dot(
     offset = group_offset[0]
     m, k = lhs.shape
     g_local, g_total = rhs.shape[0], group_sizes.shape[0]
-    local_capacity = min(int(1.2 * m * g_local / g_total), m)
+    local_capacity = min(int(2.0 * m * g_local / g_total), m)
 
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
     shard_start, shard_end = cumsum[offset], cumsum[offset + g_local]
