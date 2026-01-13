@@ -27,7 +27,7 @@ def ragged_dot(
     precision=None,
     preferred_element_type=None,
     group_offset: jax.Array | None = None,
-    use_cublas: bool = False,
+    use_cublas: bool = True,
 ) -> jax.Array:
     """Ragged dot product with group_offset support.
 

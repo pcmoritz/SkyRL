@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 # Find XLA FFI headers (from jaxlib)
-XLA_INCLUDE=$(python3 -c "import jaxlib; print(jaxlib.__path__[0])")/include
+XLA_INCLUDE=$(uv run --extra gpu python -c "import jaxlib; print(jaxlib.__path__[0])")/include
 
 nvcc -shared -o libgrouped_gemm.so grouped_gemm.cc \
     -I"$XLA_INCLUDE" \
