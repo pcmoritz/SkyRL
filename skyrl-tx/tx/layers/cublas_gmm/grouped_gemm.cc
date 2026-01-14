@@ -73,38 +73,39 @@ ffi::Error GroupedGemmBf16Impl(
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
     int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
-    // Build pointer arrays on host, then copy to device
-    std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
-
-    std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
-    std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
-    std::vector<cublasOperation_t> transa(g_local, CUBLAS_OP_N);
-    std::vector<cublasOperation_t> transb(g_local, CUBLAS_OP_N);
-    std::vector<int> group_size(g_local, 1);
-
-    // Debug: print parameters
-    fprintf(stderr, "DEBUG fwd: m=%ld, k=%ld, n=%ld, g_local=%ld, group_offset=%d, num_groups=%d\n",
-            m, k, n, g_local, group_offset, num_groups);
+    // Build pointer arrays on host, skipping zero-sized groups
+    std::vector<int64_t> h_A_ptrs, h_B_ptrs, h_C_ptrs;
+    std::vector<int> Ms, Ns, Ks;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<cublasOperation_t> transa, transb;
 
     for (int i = 0; i < g_local; i++) {
         int64_t start = offsets[group_offset + i];
         int group_m = offsets[group_offset + i + 1] - start;
 
-        fprintf(stderr, "  group %d: start=%ld, group_m=%d\n", i, start, group_m);
+        // Skip zero-sized groups
+        if (group_m == 0) continue;
 
         // Row-major: C = A @ B becomes C^T = B^T @ A^T in col-major
-        h_A_ptrs[i] = reinterpret_cast<int64_t>(rhs_base + i * k * n * 2);
-        h_B_ptrs[i] = reinterpret_cast<int64_t>(lhs_base + start * k * 2);
-        h_C_ptrs[i] = reinterpret_cast<int64_t>(out_base + start * n * 2);
+        h_A_ptrs.push_back(reinterpret_cast<int64_t>(rhs_base + i * k * n * 2));
+        h_B_ptrs.push_back(reinterpret_cast<int64_t>(lhs_base + start * k * 2));
+        h_C_ptrs.push_back(reinterpret_cast<int64_t>(out_base + start * n * 2));
 
-        Ms[i] = n; Ns[i] = group_m; Ks[i] = k;
-        lda[i] = n; ldb[i] = k; ldc[i] = n;
+        Ms.push_back(n); Ns.push_back(group_m); Ks.push_back(k);
+        lda_vec.push_back(n); ldb_vec.push_back(k); ldc_vec.push_back(n);
+        transa.push_back(CUBLAS_OP_N);
+        transb.push_back(CUBLAS_OP_N);
     }
 
+    int num_active = h_A_ptrs.size();
+    if (num_active == 0) return ffi::Error::Success();
+
+    std::vector<int> group_size(num_active, 1);
+
     // Copy pointer arrays to device
-    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
     // Sync to ensure pointer arrays are ready
     cudaStreamSynchronize(stream);
@@ -112,14 +113,14 @@ ffi::Error GroupedGemmBf16Impl(
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
-        g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb_vec.data(),
+        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc_vec.data(),
+        num_active, group_size.data(), CUBLAS_COMPUTE_32F);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cuBLAS grouped GEMM fwd failed: %d (m=%ld, k=%ld, n=%ld, g_local=%ld)\n",
-                status, m, k, n, g_local);
+        fprintf(stderr, "cuBLAS grouped GEMM fwd failed: %d (m=%ld, k=%ld, n=%ld, num_active=%d)\n",
+                status, m, k, n, num_active);
         return ffi::Error(ffi::ErrorCode::kInternal, "cuBLAS grouped GEMM failed");
     }
 
@@ -162,42 +163,48 @@ ffi::Error GroupedGemmBf16TransImpl(
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
     int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
-    std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
-
-    std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
-    std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
-    std::vector<cublasOperation_t> transa(g_local, CUBLAS_OP_T);  // rhs transposed
-    std::vector<cublasOperation_t> transb(g_local, CUBLAS_OP_N);
-    std::vector<int> group_size(g_local, 1);
+    std::vector<int64_t> h_A_ptrs, h_B_ptrs, h_C_ptrs;
+    std::vector<int> Ms, Ns, Ks;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<cublasOperation_t> transa, transb;
 
     for (int i = 0; i < g_local; i++) {
         int64_t start = offsets[group_offset + i];
         int group_m = offsets[group_offset + i + 1] - start;
 
-        // d_lhs = dout @ rhs^T: [group_m, n] @ [n, k] -> [group_m, k]
-        h_A_ptrs[i] = reinterpret_cast<int64_t>(rhs_base + i * k * n * 2);
-        h_B_ptrs[i] = reinterpret_cast<int64_t>(dout_base + start * n * 2);
-        h_C_ptrs[i] = reinterpret_cast<int64_t>(dlhs_base + start * k * 2);
+        if (group_m == 0) continue;
 
-        Ms[i] = k; Ns[i] = group_m; Ks[i] = n;
-        lda[i] = n;  // rhs is [k, n], transposed access
-        ldb[i] = n;
-        ldc[i] = k;
+        // d_lhs = dout @ rhs^T: [group_m, n] @ [n, k] -> [group_m, k]
+        h_A_ptrs.push_back(reinterpret_cast<int64_t>(rhs_base + i * k * n * 2));
+        h_B_ptrs.push_back(reinterpret_cast<int64_t>(dout_base + start * n * 2));
+        h_C_ptrs.push_back(reinterpret_cast<int64_t>(dlhs_base + start * k * 2));
+
+        Ms.push_back(k); Ns.push_back(group_m); Ks.push_back(n);
+        lda_vec.push_back(n);  // rhs is [k, n], transposed access
+        ldb_vec.push_back(n);
+        ldc_vec.push_back(k);
+        transa.push_back(CUBLAS_OP_T);
+        transb.push_back(CUBLAS_OP_N);
     }
 
-    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    int num_active = h_A_ptrs.size();
+    if (num_active == 0) return ffi::Error::Success();
+
+    std::vector<int> group_size(num_active, 1);
+
+    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
     cudaStreamSynchronize(stream);
 
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
-        g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb_vec.data(),
+        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc_vec.data(),
+        num_active, group_size.data(), CUBLAS_COMPUTE_32F);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "cuBLAS grouped GEMM trans failed: %d\n", status);
@@ -244,42 +251,50 @@ ffi::Error GroupedGemmBf16DwImpl(
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
     int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
-    std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
-
-    std::vector<int> Ms(g_local), Ns(g_local), Ks(g_local);
-    std::vector<int> lda(g_local), ldb(g_local), ldc(g_local);
-    std::vector<cublasOperation_t> transa(g_local, CUBLAS_OP_N);
-    std::vector<cublasOperation_t> transb(g_local, CUBLAS_OP_T);  // lhs transposed
-    std::vector<int> group_size(g_local, 1);
+    std::vector<int64_t> h_A_ptrs, h_B_ptrs, h_C_ptrs;
+    std::vector<int> Ms, Ns, Ks;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<cublasOperation_t> transa, transb;
 
     for (int i = 0; i < g_local; i++) {
         int64_t start = offsets[group_offset + i];
         int group_m = offsets[group_offset + i + 1] - start;
 
-        // d_rhs = lhs^T @ dout: [k, group_m] @ [group_m, n] -> [k, n]
-        h_A_ptrs[i] = reinterpret_cast<int64_t>(dout_base + start * n * 2);
-        h_B_ptrs[i] = reinterpret_cast<int64_t>(lhs_base + start * k * 2);
-        h_C_ptrs[i] = reinterpret_cast<int64_t>(drhs_base + i * k * n * 2);
+        // For dw, we still need to write to d_rhs[i] even if group_m=0
+        // But with K=0, the result should be zeros (which we already set via memset)
+        if (group_m == 0) continue;
 
-        Ms[i] = n; Ns[i] = k; Ks[i] = group_m;
-        lda[i] = n;
-        ldb[i] = k;  // lhs is [group_m, k], transposed access
-        ldc[i] = n;
+        // d_rhs = lhs^T @ dout: [k, group_m] @ [group_m, n] -> [k, n]
+        h_A_ptrs.push_back(reinterpret_cast<int64_t>(dout_base + start * n * 2));
+        h_B_ptrs.push_back(reinterpret_cast<int64_t>(lhs_base + start * k * 2));
+        h_C_ptrs.push_back(reinterpret_cast<int64_t>(drhs_base + i * k * n * 2));
+
+        Ms.push_back(n); Ns.push_back(k); Ks.push_back(group_m);
+        lda_vec.push_back(n);
+        ldb_vec.push_back(k);  // lhs is [group_m, k], transposed access
+        ldc_vec.push_back(n);
+        transa.push_back(CUBLAS_OP_N);
+        transb.push_back(CUBLAS_OP_T);
     }
 
-    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    int num_active = h_A_ptrs.size();
+    if (num_active == 0) return ffi::Error::Success();
+
+    std::vector<int> group_size(num_active, 1);
+
+    cudaMemcpyAsync(d_A_ptrs, h_A_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), num_active * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
     cudaStreamSynchronize(stream);
 
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
-        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
-        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
-        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
-        g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+        reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb_vec.data(),
+        &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc_vec.data(),
+        num_active, group_size.data(), CUBLAS_COMPUTE_32F);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "cuBLAS grouped GEMM dw failed: %d\n", status);
