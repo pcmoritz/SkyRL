@@ -23,9 +23,9 @@ def _fwd_impl(lhs, rhs, group_sizes, group_offset):
     m, n = lhs.shape[0], rhs.shape[2]
     # Output shapes: A_ptrs, B_ptrs, C_ptrs (scratch), and result
     out_shapes = (
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # A_ptrs
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # B_ptrs
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # C_ptrs
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),      # A_ptrs
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),      # B_ptrs
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),      # C_ptrs
         jax.ShapeDtypeStruct((m, n), lhs.dtype),          # result
     )
     _, _, _, result = jax.ffi.ffi_call(
@@ -39,9 +39,9 @@ def _dlhs_impl(dout, rhs, group_sizes, group_offset):
     g_local = rhs.shape[0]
     m, k = dout.shape[0], rhs.shape[1]
     out_shapes = (
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
         jax.ShapeDtypeStruct((m, k), dout.dtype),
     )
     _, _, _, result = jax.ffi.ffi_call(
@@ -54,9 +54,9 @@ def _drhs_impl(lhs, dout, group_sizes, group_offset, g_local):
     """d_rhs[i] = lhs[group_i]^T @ dout[group_i]."""
     k, n = lhs.shape[1], dout.shape[1]
     out_shapes = (
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
-        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
+        jax.ShapeDtypeStruct((g_local,), jnp.int64),
         jax.ShapeDtypeStruct((g_local, k, n), lhs.dtype),
     )
     _, _, _, result = jax.ffi.ffi_call(
