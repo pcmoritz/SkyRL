@@ -33,6 +33,9 @@ class DLPackArray:
         self._arr = arr
 
     def __dlpack__(self, *, stream=None):
+        # stream=-1 means legacy default stream in DLPack, pass None to JAX
+        if stream is not None and stream < 0:
+            stream = None
         return self._arr.__dlpack__(stream=stream)
 
     def __dlpack_device__(self):
