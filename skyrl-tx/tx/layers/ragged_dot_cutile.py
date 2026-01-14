@@ -16,35 +16,14 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 import cuda.tile as ct
-from cuda import cudart
 
 ConstInt = ct.Constant[int]
 
 TILE_M = 128
 TILE_N = 128
 TILE_K = 128
-
-
-class CudaStream:
-    """Minimal CUDA stream wrapper for cutile compatibility."""
-
-    def __init__(self):
-        err, self._stream = cudart.cudaStreamCreate()
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"Failed to create CUDA stream: {err}")
-
-    @property
-    def ptr(self):
-        return int(self._stream)
-
-    def sync(self):
-        err, = cudart.cudaStreamSynchronize(self._stream)
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"Stream sync failed: {err}")
-
-
-_stream = CudaStream()
 
 
 class DLPackArray:
@@ -228,12 +207,12 @@ def gmm(
 
     tiles_n = (n + tn - 1) // tn
     ct.launch(
-        _stream,
+        torch.cuda.current_stream(),
         (tiles_n, num_tiles, 1),
         _gmm_kernel,
         (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tn, tk),
     )
-    _stream.sync()
+    torch.cuda.synchronize()
 
     # Zero rows outside local groups
     if num_local_groups < len(group_sizes_np):
@@ -281,12 +260,12 @@ def tgmm(
     tiles_n = (n + tn - 1) // tn
     tiles_k = (k + tk - 1) // tk
     ct.launch(
-        _stream,
+        torch.cuda.current_stream(),
         (tiles_n, tiles_k, num_tiles),
         _tgmm_kernel,
         (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tk, tn),
     )
-    _stream.sync()
+    torch.cuda.synchronize()
 
     return out
 

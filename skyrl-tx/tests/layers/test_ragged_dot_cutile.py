@@ -4,9 +4,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-# Skip all tests if cuda-tile or cudart is not available
+# Skip all tests if cuda-tile is not available
 pytest.importorskip("cuda.tile")
-pytest.importorskip("cuda.cudart")
 
 from tx.layers.ragged_dot_cutile import ragged_dot, gmm, tgmm
 
