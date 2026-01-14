@@ -21,36 +21,48 @@ def _fwd_impl(lhs, rhs, group_sizes, group_offset):
     """Forward: out = lhs @ rhs per group."""
     g_local = rhs.shape[0]
     m, n = lhs.shape[0], rhs.shape[2]
-    # Allocate SEPARATE int32 arrays with 2x length to hold 64-bit pointers
-    A_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    B_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    C_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    return jax.ffi.ffi_call(
-        "grouped_gemm_bf16", jax.ShapeDtypeStruct((m, n), lhs.dtype),
-    )(lhs, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), A_ptrs, B_ptrs, C_ptrs)
+    # Output shapes: A_ptrs, B_ptrs, C_ptrs (scratch), and result
+    out_shapes = (
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # A_ptrs
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # B_ptrs
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),  # C_ptrs
+        jax.ShapeDtypeStruct((m, n), lhs.dtype),          # result
+    )
+    _, _, _, result = jax.ffi.ffi_call(
+        "grouped_gemm_bf16", out_shapes,
+    )(lhs, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32))
+    return result
 
 
 def _dlhs_impl(dout, rhs, group_sizes, group_offset):
     """d_lhs = dout @ rhs^T per group."""
     g_local = rhs.shape[0]
     m, k = dout.shape[0], rhs.shape[1]
-    A_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    B_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    C_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    return jax.ffi.ffi_call(
-        "grouped_gemm_bf16_trans", jax.ShapeDtypeStruct((m, k), dout.dtype),
-    )(dout, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), A_ptrs, B_ptrs, C_ptrs)
+    out_shapes = (
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((m, k), dout.dtype),
+    )
+    _, _, _, result = jax.ffi.ffi_call(
+        "grouped_gemm_bf16_trans", out_shapes,
+    )(dout, rhs, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32))
+    return result
 
 
 def _drhs_impl(lhs, dout, group_sizes, group_offset, g_local):
     """d_rhs[i] = lhs[group_i]^T @ dout[group_i]."""
     k, n = lhs.shape[1], dout.shape[1]
-    A_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    B_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    C_ptrs = jnp.zeros(g_local * 2, jnp.int32)
-    return jax.ffi.ffi_call(
-        "grouped_gemm_bf16_dw", jax.ShapeDtypeStruct((g_local, k, n), lhs.dtype),
-    )(lhs, dout, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32), A_ptrs, B_ptrs, C_ptrs)
+    out_shapes = (
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local * 2,), jnp.int32),
+        jax.ShapeDtypeStruct((g_local, k, n), lhs.dtype),
+    )
+    _, _, _, result = jax.ffi.ffi_call(
+        "grouped_gemm_bf16_dw", out_shapes,
+    )(lhs, dout, group_sizes.astype(jnp.int32), group_offset.astype(jnp.int32))
+    return result
 
 
 @jax.custom_vjp

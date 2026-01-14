@@ -38,9 +38,9 @@ ffi::Error GroupedGemmBf16Impl(
     ffi::Buffer<ffi::BF16> rhs,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S32> A_ptrs_buf,  // [g_local * 2] - reinterpreted as int64
-    ffi::Buffer<ffi::S32> B_ptrs_buf,
-    ffi::Buffer<ffi::S32> C_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> A_ptrs_buf,  // mutable
+    ffi::ResultBuffer<ffi::S32> B_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> C_ptrs_buf,
     ffi::ResultBuffer<ffi::BF16> out
 ) {
     cublasSetStream(get_handle(), stream);
@@ -59,10 +59,10 @@ ffi::Error GroupedGemmBf16Impl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* out_base = reinterpret_cast<char*>(out->typed_data());
 
-    // Reinterpret int32 buffers as int64 (pointer) arrays - these are on device
-    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(A_ptrs_buf.typed_data()));
-    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(B_ptrs_buf.typed_data()));
-    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(C_ptrs_buf.typed_data()));
+    // Mutable device pointer arrays
+    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
+    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
+    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
     // Build pointer arrays on host, then copy to device
     std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
@@ -110,9 +110,9 @@ ffi::Error GroupedGemmBf16TransImpl(
     ffi::Buffer<ffi::BF16> rhs,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S32> A_ptrs_buf,
-    ffi::Buffer<ffi::S32> B_ptrs_buf,
-    ffi::Buffer<ffi::S32> C_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> A_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> B_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> C_ptrs_buf,
     ffi::ResultBuffer<ffi::BF16> d_lhs
 ) {
     cublasSetStream(get_handle(), stream);
@@ -131,9 +131,9 @@ ffi::Error GroupedGemmBf16TransImpl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* dlhs_base = reinterpret_cast<char*>(d_lhs->typed_data());
 
-    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(A_ptrs_buf.typed_data()));
-    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(B_ptrs_buf.typed_data()));
-    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(C_ptrs_buf.typed_data()));
+    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
+    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
+    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
     std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
 
@@ -181,9 +181,9 @@ ffi::Error GroupedGemmBf16DwImpl(
     ffi::Buffer<ffi::BF16> dout,
     ffi::Buffer<ffi::S32> group_sizes,
     ffi::Buffer<ffi::S32> group_offset_buf,
-    ffi::Buffer<ffi::S32> A_ptrs_buf,
-    ffi::Buffer<ffi::S32> B_ptrs_buf,
-    ffi::Buffer<ffi::S32> C_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> A_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> B_ptrs_buf,
+    ffi::ResultBuffer<ffi::S32> C_ptrs_buf,
     ffi::ResultBuffer<ffi::BF16> d_rhs
 ) {
     cublasSetStream(get_handle(), stream);
@@ -203,9 +203,9 @@ ffi::Error GroupedGemmBf16DwImpl(
     const char* dout_base = reinterpret_cast<const char*>(dout.typed_data());
     char* drhs_base = reinterpret_cast<char*>(d_rhs->typed_data());
 
-    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(A_ptrs_buf.typed_data()));
-    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(B_ptrs_buf.typed_data()));
-    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(const_cast<int32_t*>(C_ptrs_buf.typed_data()));
+    int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
+    int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
+    int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
 
     std::vector<int64_t> h_A_ptrs(g_local), h_B_ptrs(g_local), h_C_ptrs(g_local);
 
@@ -252,9 +252,9 @@ ffi::Error GroupedGemmBf16DwImpl(
         .Arg<ffi::Buffer<ffi::BF16>>() \
         .Arg<ffi::Buffer<ffi::S32>>() \
         .Arg<ffi::Buffer<ffi::S32>>() \
-        .Arg<ffi::Buffer<ffi::S32>>() \
-        .Arg<ffi::Buffer<ffi::S32>>() \
-        .Arg<ffi::Buffer<ffi::S32>>() \
+        .Ret<ffi::Buffer<ffi::S32>>() \
+        .Ret<ffi::Buffer<ffi::S32>>() \
+        .Ret<ffi::Buffer<ffi::S32>>() \
         .Ret<ffi::Buffer<ffi::BF16>>()
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedGemmBf16, GroupedGemmBf16Impl, BINDING);
