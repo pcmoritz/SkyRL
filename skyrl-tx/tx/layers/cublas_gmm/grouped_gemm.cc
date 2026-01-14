@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <vector>
+#include <cstdio>
 
 #include "xla/ffi/api/ffi.h"
 
@@ -11,7 +12,12 @@ namespace ffi = xla::ffi;
 static thread_local cublasHandle_t g_handle = nullptr;
 
 cublasHandle_t get_handle() {
-    if (!g_handle) cublasCreate(&g_handle);
+    if (!g_handle) {
+        cublasStatus_t status = cublasCreate(&g_handle);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "cuBLAS create failed: %d\n", status);
+        }
+    }
     return g_handle;
 }
 
@@ -59,6 +65,9 @@ ffi::Error GroupedGemmBf16Impl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* out_base = reinterpret_cast<char*>(out->typed_data());
 
+    // Zero-initialize output buffer (for tokens outside local groups)
+    cudaMemsetAsync(out_base, 0, m * n * 2, stream);
+
     // Mutable device pointer arrays
     int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
@@ -73,9 +82,15 @@ ffi::Error GroupedGemmBf16Impl(
     std::vector<cublasOperation_t> transb(g_local, CUBLAS_OP_N);
     std::vector<int> group_size(g_local, 1);
 
+    // Debug: print parameters
+    fprintf(stderr, "DEBUG fwd: m=%ld, k=%ld, n=%ld, g_local=%ld, group_offset=%d, num_groups=%d\n",
+            m, k, n, g_local, group_offset, num_groups);
+
     for (int i = 0; i < g_local; i++) {
         int64_t start = offsets[group_offset + i];
         int group_m = offsets[group_offset + i + 1] - start;
+
+        fprintf(stderr, "  group %d: start=%ld, group_m=%d\n", i, start, group_m);
 
         // Row-major: C = A @ B becomes C^T = B^T @ A^T in col-major
         h_A_ptrs[i] = reinterpret_cast<int64_t>(rhs_base + i * k * n * 2);
@@ -91,13 +106,22 @@ ffi::Error GroupedGemmBf16Impl(
     cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
+    // Sync to ensure pointer arrays are ready
+    cudaStreamSynchronize(stream);
+
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
+    cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
         reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
         reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
         &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cuBLAS grouped GEMM fwd failed: %d (m=%ld, k=%ld, n=%ld, g_local=%ld)\n",
+                status, m, k, n, g_local);
+        return ffi::Error(ffi::ErrorCode::kInternal, "cuBLAS grouped GEMM failed");
+    }
 
     return ffi::Error::Success();
 }
@@ -131,6 +155,9 @@ ffi::Error GroupedGemmBf16TransImpl(
     const char* rhs_base = reinterpret_cast<const char*>(rhs.typed_data());
     char* dlhs_base = reinterpret_cast<char*>(d_lhs->typed_data());
 
+    // Zero-initialize output buffer
+    cudaMemsetAsync(dlhs_base, 0, m * k * 2, stream);
+
     int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
     int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
@@ -162,13 +189,20 @@ ffi::Error GroupedGemmBf16TransImpl(
     cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
+    cudaStreamSynchronize(stream);
+
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
+    cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
         reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
         reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
         &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cuBLAS grouped GEMM trans failed: %d\n", status);
+        return ffi::Error(ffi::ErrorCode::kInternal, "cuBLAS grouped GEMM trans failed");
+    }
 
     return ffi::Error::Success();
 }
@@ -203,6 +237,9 @@ ffi::Error GroupedGemmBf16DwImpl(
     const char* dout_base = reinterpret_cast<const char*>(dout.typed_data());
     char* drhs_base = reinterpret_cast<char*>(d_rhs->typed_data());
 
+    // Zero-initialize output buffer
+    cudaMemsetAsync(drhs_base, 0, g_local * k * n * 2, stream);
+
     int64_t* d_A_ptrs = reinterpret_cast<int64_t*>(A_ptrs_buf->typed_data());
     int64_t* d_B_ptrs = reinterpret_cast<int64_t*>(B_ptrs_buf->typed_data());
     int64_t* d_C_ptrs = reinterpret_cast<int64_t*>(C_ptrs_buf->typed_data());
@@ -234,13 +271,20 @@ ffi::Error GroupedGemmBf16DwImpl(
     cudaMemcpyAsync(d_B_ptrs, h_B_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_C_ptrs, h_C_ptrs.data(), g_local * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
+    cudaStreamSynchronize(stream);
+
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
+    cublasStatus_t status = cublasGemmGroupedBatchedEx(get_handle(), transa.data(), transb.data(),
         Ms.data(), Ns.data(), Ks.data(), &alpha,
         reinterpret_cast<const void**>(d_A_ptrs), CUDA_R_16BF, lda.data(),
         reinterpret_cast<const void**>(d_B_ptrs), CUDA_R_16BF, ldb.data(),
         &beta, reinterpret_cast<void**>(d_C_ptrs), CUDA_R_16BF, ldc.data(),
         g_local, group_size.data(), CUBLAS_COMPUTE_32F);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cuBLAS grouped GEMM dw failed: %d\n", status);
+        return ffi::Error(ffi::ErrorCode::kInternal, "cuBLAS grouped GEMM dw failed");
+    }
 
     return ffi::Error::Success();
 }
