@@ -17,12 +17,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import cuda.tile as ct
+from cuda.core.experimental import Device
 
 ConstInt = ct.Constant[int]
 
 TILE_M = 128
 TILE_N = 128
 TILE_K = 128
+
+_device = Device()
+_device.set_current()
+_stream = _device.create_stream()
 
 
 class DLPackArray:
@@ -206,11 +211,12 @@ def gmm(
 
     tiles_n = (n + tn - 1) // tn
     ct.launch(
-        None,  # default stream
+        _stream,
         (tiles_n, num_tiles, 1),
         _gmm_kernel,
         (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tn, tk),
     )
+    _stream.sync()
 
     # Zero rows outside local groups
     if num_local_groups < len(group_sizes_np):
@@ -258,11 +264,12 @@ def tgmm(
     tiles_n = (n + tn - 1) // tn
     tiles_k = (k + tk - 1) // tk
     ct.launch(
-        None,
+        _stream,
         (tiles_n, tiles_k, num_tiles),
         _tgmm_kernel,
         (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tk, tn),
     )
+    _stream.sync()
 
     return out
 
