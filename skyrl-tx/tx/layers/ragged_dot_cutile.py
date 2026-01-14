@@ -26,28 +26,9 @@ TILE_N = 128
 TILE_K = 128
 
 
-class DLPackArray:
-    """Minimal wrapper to pass JAX arrays to cutile via DLPack protocol."""
-
-    def __init__(self, arr: jax.Array):
-        self._arr = arr
-
-    def __dlpack__(self, *, stream=None):
-        # stream=-1 means legacy default stream in DLPack, pass None to JAX
-        if stream is not None and stream < 0:
-            stream = None
-        return self._arr.__dlpack__(stream=stream)
-
-    def __dlpack_device__(self):
-        return self._arr.__dlpack_device__()
-
-    @property
-    def shape(self):
-        return self._arr.shape
-
-    @property
-    def dtype(self):
-        return self._arr.dtype
+def _jax_to_torch(arr: jax.Array) -> torch.Tensor:
+    """Convert JAX array to PyTorch tensor via DLPack."""
+    return torch.from_dlpack(arr)
 
 
 def _compute_tile_schedule(
@@ -171,6 +152,17 @@ def _tgmm_kernel(
     ct.atomic_add(out, index=(local_g, k_tile * tk, n_tile * tn), tile=contrib.to(ct.dtype(out)))
 
 
+def _torch_dtype(jax_dtype):
+    """Map JAX dtype to torch dtype."""
+    dtype_map = {
+        jnp.float32: torch.float32,
+        jnp.float16: torch.float16,
+        jnp.bfloat16: torch.bfloat16,
+        jnp.int32: torch.int32,
+    }
+    return dtype_map.get(jax_dtype, torch.float32)
+
+
 def gmm(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -193,25 +185,25 @@ def gmm(
     if num_tiles == 0:
         return jnp.zeros((m, n), dtype=preferred_element_type)
 
-    # Create output array
-    out = jnp.zeros((m, n), dtype=preferred_element_type)
-
-    # Wrap arrays for cutile
-    lhs_w = DLPackArray(lhs)
-    rhs_w = DLPackArray(rhs)
-    out_w = DLPackArray(out)
-    offsets_w = DLPackArray(jnp.asarray(group_offsets))
-    gids_w = DLPackArray(jnp.asarray(group_ids))
-    mids_w = DLPackArray(jnp.asarray(m_tile_ids))
+    # Convert to torch tensors (cutile requires __cuda_array_interface__)
+    lhs_t = _jax_to_torch(lhs)
+    rhs_t = _jax_to_torch(rhs)
+    out_t = torch.zeros((m, n), dtype=_torch_dtype(preferred_element_type), device="cuda")
+    offsets_t = torch.from_numpy(group_offsets).cuda()
+    gids_t = torch.from_numpy(group_ids).cuda()
+    mids_t = torch.from_numpy(m_tile_ids).cuda()
 
     tiles_n = (n + tn - 1) // tn
     ct.launch(
         torch.cuda.current_stream(),
         (tiles_n, num_tiles, 1),
         _gmm_kernel,
-        (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tn, tk),
+        (lhs_t, rhs_t, out_t, offsets_t, gids_t, mids_t, start_group, num_tiles, tm, tn, tk),
     )
     torch.cuda.synchronize()
+
+    # Convert back to JAX
+    out = jax.dlpack.from_dlpack(out_t)
 
     # Zero rows outside local groups
     if num_local_groups < len(group_sizes_np):
@@ -247,14 +239,13 @@ def tgmm(
     if num_tiles == 0:
         return jnp.zeros((num_actual_groups, k, n), dtype=preferred_element_type)
 
-    out = jnp.zeros((num_actual_groups, k, n), dtype=preferred_element_type)
-
-    lhs_w = DLPackArray(lhs)
-    rhs_w = DLPackArray(rhs)
-    out_w = DLPackArray(out)
-    offsets_w = DLPackArray(jnp.asarray(group_offsets))
-    gids_w = DLPackArray(jnp.asarray(group_ids))
-    mids_w = DLPackArray(jnp.asarray(m_tile_ids))
+    # Convert to torch tensors
+    lhs_t = _jax_to_torch(lhs)
+    rhs_t = _jax_to_torch(rhs)
+    out_t = torch.zeros((num_actual_groups, k, n), dtype=_torch_dtype(preferred_element_type), device="cuda")
+    offsets_t = torch.from_numpy(group_offsets).cuda()
+    gids_t = torch.from_numpy(group_ids).cuda()
+    mids_t = torch.from_numpy(m_tile_ids).cuda()
 
     tiles_n = (n + tn - 1) // tn
     tiles_k = (k + tk - 1) // tk
@@ -262,11 +253,11 @@ def tgmm(
         torch.cuda.current_stream(),
         (tiles_n, tiles_k, num_tiles),
         _tgmm_kernel,
-        (lhs_w, rhs_w, out_w, offsets_w, gids_w, mids_w, start_group, num_tiles, tm, tk, tn),
+        (lhs_t, rhs_t, out_t, offsets_t, gids_t, mids_t, start_group, num_tiles, tm, tk, tn),
     )
     torch.cuda.synchronize()
 
-    return out
+    return jax.dlpack.from_dlpack(out_t)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
