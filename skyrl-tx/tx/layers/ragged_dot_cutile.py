@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import cuda.tile as ct
-from cuda.core.experimental import Device
+from cuda import cudart
 
 ConstInt = ct.Constant[int]
 
@@ -25,9 +25,26 @@ TILE_M = 128
 TILE_N = 128
 TILE_K = 128
 
-_device = Device()
-_device.set_current()
-_stream = _device.create_stream()
+
+class CudaStream:
+    """Minimal CUDA stream wrapper for cutile compatibility."""
+
+    def __init__(self):
+        err, self._stream = cudart.cudaStreamCreate()
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"Failed to create CUDA stream: {err}")
+
+    @property
+    def ptr(self):
+        return int(self._stream)
+
+    def sync(self):
+        err, = cudart.cudaStreamSynchronize(self._stream)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"Stream sync failed: {err}")
+
+
+_stream = CudaStream()
 
 
 class DLPackArray:
