@@ -98,7 +98,11 @@ ffi::Error GroupedGemmBf16Impl(
     }
 
     int num_active = h_A_ptrs.size();
-    if (num_active == 0) return ffi::Error::Success();
+    if (num_active == 0) {
+        // Sync to ensure memset completes before returning
+        cudaStreamSynchronize(stream);
+        return ffi::Error::Success();
+    }
 
     std::vector<int> group_size(num_active, 1);
 
@@ -188,7 +192,10 @@ ffi::Error GroupedGemmBf16TransImpl(
     }
 
     int num_active = h_A_ptrs.size();
-    if (num_active == 0) return ffi::Error::Success();
+    if (num_active == 0) {
+        cudaStreamSynchronize(stream);
+        return ffi::Error::Success();
+    }
 
     std::vector<int> group_size(num_active, 1);
 
@@ -278,7 +285,10 @@ ffi::Error GroupedGemmBf16DwImpl(
     }
 
     int num_active = h_A_ptrs.size();
-    if (num_active == 0) return ffi::Error::Success();
+    if (num_active == 0) {
+        cudaStreamSynchronize(stream);
+        return ffi::Error::Success();
+    }
 
     std::vector<int> group_size(num_active, 1);
 
