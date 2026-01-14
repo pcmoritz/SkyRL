@@ -31,16 +31,12 @@ class DLPackArray:
 
     def __init__(self, arr: jax.Array):
         self._arr = arr
-        self._capsule = None
 
     def __dlpack__(self, *, stream=None):
-        if self._capsule is None:
-            self._capsule = jax.dlpack.to_dlpack(self._arr)
-        return self._capsule
+        return self._arr.__dlpack__(stream=stream)
 
     def __dlpack_device__(self):
-        # Return (device_type, device_id) - CUDA is type 2
-        return (2, 0)
+        return self._arr.__dlpack_device__()
 
     @property
     def shape(self):
