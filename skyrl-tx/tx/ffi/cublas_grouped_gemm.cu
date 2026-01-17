@@ -81,11 +81,27 @@ bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
 
 cublasHandle_t GetHandle() {
   thread_local cublasHandle_t handle = nullptr;
-  if (handle == nullptr) {
-    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
-      return nullptr;
-    }
+  thread_local int cached_device = -1;
+
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    return nullptr;
   }
+
+  if (handle != nullptr && cached_device == device) {
+    return handle;
+  }
+
+  if (handle != nullptr) {
+    cublasDestroy(handle);
+    handle = nullptr;
+  }
+
+  if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+    return nullptr;
+  }
+
+  cached_device = device;
   return handle;
 }
 
@@ -168,6 +184,9 @@ xla::ffi::Error CublasGroupedGemmImpl(
 
   std::vector<int64_t> offsets(num_groups + 1, 0);
   for (int64_t i = 0; i < num_groups; ++i) {
+    if (h_group_sizes[i] < 0) {
+      return xla::ffi::Error::InvalidArgument("group_sizes must be non-negative");
+    }
     offsets[i + 1] = offsets[i] + h_group_sizes[i];
   }
   if (offsets.back() != m) {
@@ -244,18 +263,29 @@ xla::ffi::Error CublasGroupedGemmImpl(
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "failed to set cublas pointer mode");
   }
+  if (dtype_info.data_type == CUDA_R_16F || dtype_info.data_type == CUDA_R_16BF) {
+    status = cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      return CublasError(status, "failed to set cublas math mode");
+    }
+  } else {
+    status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      return CublasError(status, "failed to set cublas math mode");
+    }
+  }
 
-  float alpha_f = 1.0f;
-  float beta_f = 0.0f;
-  double alpha_d = 1.0;
-  double beta_d = 0.0;
+  std::vector<float> alpha_f(group_count, 1.0f);
+  std::vector<float> beta_f(group_count, 0.0f);
+  std::vector<double> alpha_d(group_count, 1.0);
+  std::vector<double> beta_d(group_count, 0.0);
 
   const void* alpha = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
-                          ? static_cast<const void*>(&alpha_d)
-                          : static_cast<const void*>(&alpha_f);
+                          ? static_cast<const void*>(alpha_d.data())
+                          : static_cast<const void*>(alpha_f.data());
   const void* beta = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
-                         ? static_cast<const void*>(&beta_d)
-                         : static_cast<const void*>(&beta_f);
+                         ? static_cast<const void*>(beta_d.data())
+                         : static_cast<const void*>(beta_f.data());
 
   status = cublasGemmGroupedBatchedEx(
       handle, transa_array.data(), transb_array.data(), m_array.data(),
