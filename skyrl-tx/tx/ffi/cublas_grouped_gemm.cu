@@ -101,7 +101,11 @@ bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
       return true;
     case xla::ffi::DataType::BF16:
       info->data_type = CUDA_R_16BF;
+#ifdef CUBLAS_COMPUTE_32F_FAST_16BF
+      info->compute_type = CUBLAS_COMPUTE_32F_FAST_16BF;
+#else
       info->compute_type = CUBLAS_COMPUTE_32F;
+#endif
       info->elem_size = 2;
       return true;
     case xla::ffi::DataType::F32:
@@ -145,6 +149,23 @@ HandleSlot* GetHandleSlot(int device, xla::ffi::Error* err) {
   return slots[device].get();
 }
 
+bool EnsureHandleInitialized(int device, xla::ffi::Error* err) {
+  HandleSlot* slot = GetHandleSlot(device, err);
+  if (slot == nullptr) {
+    return false;
+  }
+  std::unique_lock<std::mutex> lock(slot->mu);
+  if (slot->handle != nullptr) {
+    return true;
+  }
+  cublasStatus_t create_status = cublasCreate(&slot->handle);
+  if (create_status != CUBLAS_STATUS_SUCCESS) {
+    *err = CublasError(create_status, "failed to create cublas handle");
+    return false;
+  }
+  return true;
+}
+
 xla::ffi::Error CublasGroupedGemmImpl(
     cudaStream_t stream, int32_t device_ordinal, xla::ffi::AnyBuffer lhs, xla::ffi::AnyBuffer rhs,
     xla::ffi::BufferR1<xla::ffi::DataType::S32> group_sizes,
@@ -153,6 +174,12 @@ xla::ffi::Error CublasGroupedGemmImpl(
   cudaError_t cuda_status = cudaSetDevice(device_ordinal);
   if (cuda_status != cudaSuccess) {
     return CudaError(cuda_status, "failed to set cuda device");
+  }
+
+  int cc_major = 0;
+  cuda_status = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_ordinal);
+  if (cuda_status != cudaSuccess) {
+    return CudaError(cuda_status, "failed to query compute capability");
   }
 
   auto lhs_dims = lhs.dimensions();
@@ -179,6 +206,9 @@ xla::ffi::Error CublasGroupedGemmImpl(
   DtypeInfo dtype_info;
   if (!GetDtypeInfo(lhs.element_type(), &dtype_info)) {
     return xla::ffi::Error::InvalidArgument("unsupported dtype for cublas grouped gemm");
+  }
+  if (lhs.element_type() == xla::ffi::DataType::BF16 && cc_major < 8) {
+    return xla::ffi::Error::InvalidArgument("bf16 requires sm80+ for grouped gemm");
   }
 
   const int64_t m = lhs_dims[0];
@@ -292,19 +322,11 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
 
   xla::ffi::Error err = xla::ffi::Error::Success();
-  HandleSlot* slot = GetHandleSlot(device_ordinal, &err);
-  if (slot == nullptr) {
+  if (!EnsureHandleInitialized(device_ordinal, &err)) {
     return err;
   }
-
+  HandleSlot* slot = GetHandleSlot(device_ordinal, &err);
   std::unique_lock<std::mutex> lock(slot->mu);
-  if (slot->handle == nullptr) {
-    cublasStatus_t create_status = cublasCreate(&slot->handle);
-    if (create_status != CUBLAS_STATUS_SUCCESS) {
-      return CublasError(create_status, "failed to create cublas handle");
-    }
-  }
-
   cublasHandle_t handle = slot->handle;
   cublasStatus_t status = cublasSetStream(handle, stream);
   if (status != CUBLAS_STATUS_SUCCESS) {
@@ -364,3 +386,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::BufferR1<xla::ffi::DataType::S32>>()
         .Arg<xla::ffi::BufferR1<xla::ffi::DataType::S32>>()
         .Ret<xla::ffi::AnyBuffer>());
+
+extern "C" bool cublas_gemm_grouped_batched_ex_init() {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+    return false;
+  }
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaSetDevice(device) != cudaSuccess) {
+      return false;
+    }
+    xla::ffi::Error err = xla::ffi::Error::Success();
+    if (!EnsureHandleInitialized(device, &err)) {
+      return false;
+    }
+  }
+  return true;
+}

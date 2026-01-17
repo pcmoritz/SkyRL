@@ -38,6 +38,17 @@ def register(path: str | None = None, *, platform: str | None = None) -> bool:
 
     ffi.register_ffi_target(_TARGET_NAME, ffi.pycapsule(fn), platform=platform, api_version=1)
     _REGISTERED = True
+
+    try:
+        init_fn = lib.cublas_gemm_grouped_batched_ex_init
+    except AttributeError:
+        init_fn = None
+    if init_fn is not None and os.environ.get("TX_CUBLAS_PREINIT"):
+        try:
+            init_fn()
+        except Exception:
+            pass
+
     return True
 
 
