@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -98,6 +99,11 @@ bool IsDebugEnabled() {
   return enabled;
 }
 
+bool IsVerboseEnabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_VERBOSE") != nullptr;
+  return enabled;
+}
+
 xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_host,
                                       const char* name) {
   if (ptr == nullptr) {
@@ -152,6 +158,13 @@ xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_ho
 #endif
   return xla::ffi::Error::InvalidArgument(
       std::string(name) + " pointer has unsupported memory type");
+}
+
+bool CheckRange(size_t offset_bytes, size_t bytes_needed, size_t total_bytes) {
+  if (offset_bytes > total_bytes) {
+    return false;
+  }
+  return bytes_needed <= (total_bytes - offset_bytes);
 }
 
 bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
@@ -338,10 +351,14 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
 
   std::vector<int64_t> offsets(num_groups + 1, 0);
+  int32_t min_group = std::numeric_limits<int32_t>::max();
+  int32_t max_group = std::numeric_limits<int32_t>::min();
   for (int64_t i = 0; i < num_groups; ++i) {
     if (h_group_sizes[i] < 0) {
       return xla::ffi::Error::InvalidArgument("group_sizes must be non-negative");
     }
+    min_group = std::min(min_group, h_group_sizes[i]);
+    max_group = std::max(max_group, h_group_sizes[i]);
     offsets[i + 1] = offsets[i] + h_group_sizes[i];
   }
   if (offsets.back() != m) {
@@ -357,7 +374,25 @@ xla::ffi::Error CublasGroupedGemmImpl(
       }
     }
   }
+  if (IsVerboseEnabled()) {
+    std::fprintf(stderr,
+                 "cublas_grouped_gemm: device=%d dtype=%d m=%lld k=%lld n=%lld "
+                 "num_groups=%lld g_local=%lld offset=%d min_group=%d max_group=%d\n",
+                 device, static_cast<int>(lhs.element_type()),
+                 static_cast<long long>(m), static_cast<long long>(k), static_cast<long long>(n),
+                 static_cast<long long>(num_groups), static_cast<long long>(g_local),
+                 offset, static_cast<int>(min_group), static_cast<int>(max_group));
+    std::fprintf(stderr, "group_sizes[0..7]:");
+    int64_t to_print = std::min<int64_t>(num_groups, 8);
+    for (int64_t i = 0; i < to_print; ++i) {
+      std::fprintf(stderr, " %d", h_group_sizes[i]);
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+  }
 
+  size_t lhs_bytes = lhs.size_bytes();
+  size_t rhs_bytes = rhs.size_bytes();
   size_t out_bytes = static_cast<size_t>(m) * static_cast<size_t>(n) * dtype_info.elem_size;
   cuda_status = cudaMemsetAsync((*out).untyped_data(), 0, out_bytes, stream);
   if (cuda_status != cudaSuccess) {
@@ -389,9 +424,33 @@ xla::ffi::Error CublasGroupedGemmImpl(
     }
 
     const int64_t row_start = offsets[global_group];
-    const void* a_ptr = rhs_base + g * k * n * dtype_info.elem_size;
-    const void* b_ptr = lhs_base + row_start * k * dtype_info.elem_size;
-    void* c_ptr = out_base + row_start * n * dtype_info.elem_size;
+    const size_t a_offset_bytes =
+        static_cast<size_t>(g) * static_cast<size_t>(k) * static_cast<size_t>(n) *
+        dtype_info.elem_size;
+    const size_t b_offset_bytes =
+        static_cast<size_t>(row_start) * static_cast<size_t>(k) * dtype_info.elem_size;
+    const size_t c_offset_bytes =
+        static_cast<size_t>(row_start) * static_cast<size_t>(n) * dtype_info.elem_size;
+    const size_t a_bytes =
+        static_cast<size_t>(k) * static_cast<size_t>(n) * dtype_info.elem_size;
+    const size_t b_bytes =
+        static_cast<size_t>(group_m) * static_cast<size_t>(k) * dtype_info.elem_size;
+    const size_t c_bytes =
+        static_cast<size_t>(group_m) * static_cast<size_t>(n) * dtype_info.elem_size;
+    if (IsDebugEnabled()) {
+      if (!CheckRange(a_offset_bytes, a_bytes, rhs_bytes)) {
+        return xla::ffi::Error::InvalidArgument("rhs pointer range out of bounds");
+      }
+      if (!CheckRange(b_offset_bytes, b_bytes, lhs_bytes)) {
+        return xla::ffi::Error::InvalidArgument("lhs pointer range out of bounds");
+      }
+      if (!CheckRange(c_offset_bytes, c_bytes, out_bytes)) {
+        return xla::ffi::Error::InvalidArgument("out pointer range out of bounds");
+      }
+    }
+    const void* a_ptr = rhs_base + a_offset_bytes;
+    const void* b_ptr = lhs_base + b_offset_bytes;
+    void* c_ptr = out_base + c_offset_bytes;
 
     if (group_m > std::numeric_limits<int>::max()) {
       return xla::ffi::Error::InvalidArgument("group size exceeds int32");
