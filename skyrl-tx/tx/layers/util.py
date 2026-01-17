@@ -53,8 +53,8 @@ def _ragged_dot_cublas(
         _CUBLAS_GROUPED_GEMM_TARGET,
         result_shape,
         vmap_method="sequential",
-        input_layouts=([1, 0], [2, 1, 0], [0], [0]),
-        output_layouts=[1, 0],
+        input_layouts=([0, 1], [0, 1, 2], [0], [0]),
+        output_layouts=[0, 1],
     )
     group_sizes_i32 = group_sizes if group_sizes.dtype == jnp.int32 else group_sizes.astype(jnp.int32)
     group_offset_i32 = group_offset if group_offset.dtype == jnp.int32 else group_offset.astype(jnp.int32)
