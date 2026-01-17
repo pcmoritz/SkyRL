@@ -119,6 +119,16 @@ bool IsSyncEnabled() {
   return enabled;
 }
 
+bool IsForceFp32Enabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_FORCE_FP32") != nullptr;
+  return enabled;
+}
+
+bool IsUseGemmExEnabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_USE_GEMM_EX") != nullptr;
+  return enabled;
+}
+
 xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_host,
                                       const char* name) {
   if (ptr == nullptr) {
@@ -173,6 +183,30 @@ xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_ho
 #endif
   return xla::ffi::Error::InvalidArgument(
       std::string(name) + " pointer has unsupported memory type");
+}
+
+const char* PointerTypeName(const cudaPointerAttributes& attrs) {
+#if CUDART_VERSION >= 10000
+  switch (attrs.type) {
+    case cudaMemoryTypeDevice:
+      return "device";
+    case cudaMemoryTypeHost:
+      return "host";
+    case cudaMemoryTypeManaged:
+      return "managed";
+    default:
+      return "unknown";
+  }
+#else
+  switch (attrs.memoryType) {
+    case cudaMemoryTypeDevice:
+      return "device";
+    case cudaMemoryTypeHost:
+      return "host";
+    default:
+      return "unknown";
+  }
+#endif
 }
 
 bool CheckRange(size_t offset_bytes, size_t bytes_needed, size_t total_bytes) {
@@ -325,6 +359,11 @@ xla::ffi::Error CublasGroupedGemmImpl(
   if (!GetDtypeInfo(lhs.element_type(), &dtype_info)) {
     return xla::ffi::Error::InvalidArgument("unsupported dtype for cublas grouped gemm");
   }
+  if ((lhs.element_type() == xla::ffi::DataType::F16 ||
+       lhs.element_type() == xla::ffi::DataType::BF16) &&
+      IsForceFp32Enabled()) {
+    dtype_info.compute_type = CUBLAS_COMPUTE_32F;
+  }
   if (lhs.element_type() == xla::ffi::DataType::BF16 && cc_major < 8) {
     return xla::ffi::Error::InvalidArgument("bf16 requires sm80+ for grouped gemm");
   }
@@ -409,6 +448,18 @@ xla::ffi::Error CublasGroupedGemmImpl(
       std::fprintf(stderr, " %d", h_group_sizes[i]);
     }
     std::fprintf(stderr, "\n");
+    cudaPointerAttributes lhs_attrs{};
+    cudaPointerAttributes rhs_attrs{};
+    cudaPointerAttributes out_attrs{};
+    if (cudaPointerGetAttributes(&lhs_attrs, lhs.untyped_data()) == cudaSuccess &&
+        cudaPointerGetAttributes(&rhs_attrs, rhs.untyped_data()) == cudaSuccess &&
+        cudaPointerGetAttributes(&out_attrs, (*out).untyped_data()) == cudaSuccess) {
+      std::fprintf(stderr,
+                   "lhs_ptr=%p (%s dev=%d) rhs_ptr=%p (%s dev=%d) out_ptr=%p (%s dev=%d)\n",
+                   lhs.untyped_data(), PointerTypeName(lhs_attrs), lhs_attrs.device,
+                   rhs.untyped_data(), PointerTypeName(rhs_attrs), rhs_attrs.device,
+                   (*out).untyped_data(), PointerTypeName(out_attrs), out_attrs.device);
+    }
     std::fflush(stderr);
   }
 
@@ -532,6 +583,36 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
 
   if (IsDryRunEnabled()) {
+    return xla::ffi::Error::Success();
+  }
+
+  if (IsUseGemmExEnabled()) {
+    float alpha_f = 1.0f;
+    float beta_f = 0.0f;
+    double alpha_d = 1.0;
+    double beta_d = 0.0;
+    const void* alpha = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
+                            ? static_cast<const void*>(&alpha_d)
+                            : static_cast<const void*>(&alpha_f);
+    const void* beta = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
+                           ? static_cast<const void*>(&beta_d)
+                           : static_cast<const void*>(&beta_f);
+    for (int i = 0; i < group_count; ++i) {
+      cublasStatus_t gemm_status = cublasGemmEx(
+          handle, transa_array[i], transb_array[i], m_array[i], n_array[i], k_array[i],
+          alpha, a_array[i], dtype_info.data_type, lda_array[i], b_array[i],
+          dtype_info.data_type, ldb_array[i], beta, c_array[i], dtype_info.data_type,
+          ldc_array[i], dtype_info.compute_type, CUBLAS_GEMM_DEFAULT);
+      if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+        return CublasError(gemm_status, "cublasGemmEx failed");
+      }
+    }
+    if (IsSyncEnabled()) {
+      cuda_status = cudaStreamSynchronize(stream);
+      if (cuda_status != cudaSuccess) {
+        return CudaError(cuda_status, "failed to sync stream after cublas gemm ex");
+      }
+    }
     return xla::ffi::Error::Success();
   }
 
