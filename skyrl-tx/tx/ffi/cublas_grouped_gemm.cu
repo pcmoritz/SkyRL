@@ -104,6 +104,21 @@ bool IsVerboseEnabled() {
   return enabled;
 }
 
+bool IsDryRunEnabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_DRYRUN") != nullptr;
+  return enabled;
+}
+
+bool IsTensorOpDisabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_NO_TENSOR_OP") != nullptr;
+  return enabled;
+}
+
+bool IsSyncEnabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_SYNC") != nullptr;
+  return enabled;
+}
+
 xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_host,
                                       const char* name) {
   if (ptr == nullptr) {
@@ -250,6 +265,12 @@ xla::ffi::Error CublasGroupedGemmImpl(
   cudaError_t cuda_status = cudaGetDevice(&device);
   if (cuda_status != cudaSuccess) {
     return CudaError(cuda_status, "failed to get cuda device");
+  }
+  if (IsDebugEnabled()) {
+    cudaError_t peek_status = cudaPeekAtLastError();
+    if (peek_status != cudaSuccess) {
+      return CudaError(peek_status, "previous CUDA error before cublas grouped gemm");
+    }
   }
 
   int cc_major = 0;
@@ -473,6 +494,16 @@ xla::ffi::Error CublasGroupedGemmImpl(
   if (group_count == 0) {
     return xla::ffi::Error::Success();
   }
+  if (IsVerboseEnabled()) {
+    std::fprintf(stderr, "group_count=%d\n", group_count);
+    if (!a_array.empty()) {
+      std::fprintf(stderr,
+                   "first_group: m=%d n=%d k=%d lda=%d ldb=%d ldc=%d a=%p b=%p c=%p\n",
+                   m_array[0], n_array[0], k_array[0], lda_array[0], ldb_array[0], ldc_array[0],
+                   a_array[0], b_array[0], c_array[0]);
+    }
+    std::fflush(stderr);
+  }
 
   xla::ffi::Error err = xla::ffi::Error::Success();
   if (!EnsureHandleInitialized(device, &err)) {
@@ -490,15 +521,18 @@ xla::ffi::Error CublasGroupedGemmImpl(
     return CublasError(status, "failed to set cublas pointer mode");
   }
   if (dtype_info.data_type == CUDA_R_16F || dtype_info.data_type == CUDA_R_16BF) {
-    status = cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-      return CublasError(status, "failed to set cublas math mode");
-    }
+    status = cublasSetMathMode(handle,
+                               IsTensorOpDisabled() ? CUBLAS_DEFAULT_MATH
+                                                    : CUBLAS_TENSOR_OP_MATH);
   } else {
     status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-      return CublasError(status, "failed to set cublas math mode");
-    }
+  }
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return CublasError(status, "failed to set cublas math mode");
+  }
+
+  if (IsDryRunEnabled()) {
+    return xla::ffi::Error::Success();
   }
 
   std::vector<float> alpha_f(group_count, 1.0f);
@@ -522,6 +556,12 @@ xla::ffi::Error CublasGroupedGemmImpl(
       group_size_array.data(), dtype_info.compute_type);
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "cublasGemmGroupedBatchedEx failed");
+  }
+  if (IsSyncEnabled()) {
+    cuda_status = cudaStreamSynchronize(stream);
+    if (cuda_status != cudaSuccess) {
+      return CudaError(cuda_status, "failed to sync stream after cublas grouped gemm");
+    }
   }
 
   return xla::ffi::Error::Success();
