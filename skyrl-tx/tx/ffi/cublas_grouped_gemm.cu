@@ -167,17 +167,18 @@ bool EnsureHandleInitialized(int device, xla::ffi::Error* err) {
 }
 
 xla::ffi::Error CublasGroupedGemmImpl(
-    cudaStream_t stream, int32_t device_ordinal, xla::ffi::AnyBuffer lhs, xla::ffi::AnyBuffer rhs,
+    cudaStream_t stream, xla::ffi::AnyBuffer lhs, xla::ffi::AnyBuffer rhs,
     xla::ffi::BufferR1<xla::ffi::DataType::S32> group_sizes,
     xla::ffi::BufferR1<xla::ffi::DataType::S32> group_offset,
     xla::ffi::Result<xla::ffi::AnyBuffer> out) {
-  cudaError_t cuda_status = cudaSetDevice(device_ordinal);
+  int device = -1;
+  cudaError_t cuda_status = cudaGetDevice(&device);
   if (cuda_status != cudaSuccess) {
-    return CudaError(cuda_status, "failed to set cuda device");
+    return CudaError(cuda_status, "failed to get cuda device");
   }
 
   int cc_major = 0;
-  cuda_status = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_ordinal);
+  cuda_status = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device);
   if (cuda_status != cudaSuccess) {
     return CudaError(cuda_status, "failed to query compute capability");
   }
@@ -322,10 +323,10 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
 
   xla::ffi::Error err = xla::ffi::Error::Success();
-  if (!EnsureHandleInitialized(device_ordinal, &err)) {
+  if (!EnsureHandleInitialized(device, &err)) {
     return err;
   }
-  HandleSlot* slot = GetHandleSlot(device_ordinal, &err);
+  HandleSlot* slot = GetHandleSlot(device, &err);
   std::unique_lock<std::mutex> lock(slot->mu);
   cublasHandle_t handle = slot->handle;
   cublasStatus_t status = cublasSetStream(handle, stream);
@@ -380,7 +381,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     cublas_gemm_grouped_batched_ex, CublasGroupedGemmImpl,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-        .Ctx<xla::ffi::DeviceOrdinal>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::BufferR1<xla::ffi::DataType::S32>>()
