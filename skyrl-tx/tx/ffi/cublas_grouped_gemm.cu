@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,67 @@ xla::ffi::Error CopyToHost(void* dst, const void* src, size_t bytes,
 
   std::memcpy(dst, src, bytes);
   return xla::ffi::Error::Success();
+}
+
+bool IsDebugEnabled() {
+  static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_DEBUG") != nullptr;
+  return enabled;
+}
+
+xla::ffi::Error ValidateDevicePointer(const void* ptr, int device, bool allow_host,
+                                      const char* name) {
+  if (ptr == nullptr) {
+    return xla::ffi::Error::InvalidArgument(std::string(name) + " pointer is null");
+  }
+
+  cudaPointerAttributes attrs{};
+  cudaError_t status = cudaPointerGetAttributes(&attrs, ptr);
+  if (status == cudaErrorInvalidValue) {
+    if (allow_host) {
+      return xla::ffi::Error::Success();
+    }
+    return xla::ffi::Error::InvalidArgument(
+        std::string(name) + " pointer is not a device allocation");
+  }
+  if (status != cudaSuccess) {
+    return CudaError(status, ("failed to query pointer attributes for " + std::string(name)).c_str());
+  }
+
+#if CUDART_VERSION >= 10000
+  if (attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged) {
+    if (attrs.device != device) {
+      return xla::ffi::Error::InvalidArgument(
+          std::string(name) + " pointer is on device " + std::to_string(attrs.device) +
+          ", expected device " + std::to_string(device));
+    }
+    return xla::ffi::Error::Success();
+  }
+  if (attrs.type == cudaMemoryTypeHost) {
+    if (allow_host) {
+      return xla::ffi::Error::Success();
+    }
+    return xla::ffi::Error::InvalidArgument(
+        std::string(name) + " pointer is host memory");
+  }
+#else
+  if (attrs.memoryType == cudaMemoryTypeDevice) {
+    if (attrs.device != device) {
+      return xla::ffi::Error::InvalidArgument(
+          std::string(name) + " pointer is on device " + std::to_string(attrs.device) +
+          ", expected device " + std::to_string(device));
+    }
+    return xla::ffi::Error::Success();
+  }
+  if (attrs.memoryType == cudaMemoryTypeHost) {
+    if (allow_host) {
+      return xla::ffi::Error::Success();
+    }
+    return xla::ffi::Error::InvalidArgument(
+        std::string(name) + " pointer is host memory");
+  }
+#endif
+  return xla::ffi::Error::InvalidArgument(
+      std::string(name) + " pointer has unsupported memory type");
 }
 
 bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
@@ -183,6 +245,27 @@ xla::ffi::Error CublasGroupedGemmImpl(
     return CudaError(cuda_status, "failed to query compute capability");
   }
 
+  xla::ffi::Error ptr_err = ValidateDevicePointer(lhs.untyped_data(), device, false, "lhs");
+  if (ptr_err.failure()) {
+    return ptr_err;
+  }
+  ptr_err = ValidateDevicePointer(rhs.untyped_data(), device, false, "rhs");
+  if (ptr_err.failure()) {
+    return ptr_err;
+  }
+  ptr_err = ValidateDevicePointer((*out).untyped_data(), device, false, "out");
+  if (ptr_err.failure()) {
+    return ptr_err;
+  }
+  ptr_err = ValidateDevicePointer(group_sizes.untyped_data(), device, true, "group_sizes");
+  if (ptr_err.failure()) {
+    return ptr_err;
+  }
+  ptr_err = ValidateDevicePointer(group_offset.untyped_data(), device, true, "group_offset");
+  if (ptr_err.failure()) {
+    return ptr_err;
+  }
+
   auto lhs_dims = lhs.dimensions();
   auto rhs_dims = rhs.dimensions();
   auto out_dims = (*out).dimensions();
@@ -263,6 +346,16 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
   if (offsets.back() != m) {
     return xla::ffi::Error::InvalidArgument("sum(group_sizes) must equal lhs rows");
+  }
+  if (IsDebugEnabled()) {
+    for (int64_t g = 0; g < g_local; ++g) {
+      const int64_t global_group = offset + g;
+      const int64_t row_start = offsets[global_group];
+      const int32_t group_m = h_group_sizes[global_group];
+      if (row_start < 0 || row_start + group_m > m) {
+        return xla::ffi::Error::InvalidArgument("group_sizes produce out-of-range rows");
+      }
+    }
   }
 
   size_t out_bytes = static_cast<size_t>(m) * static_cast<size_t>(n) * dtype_info.elem_size;
@@ -392,14 +485,22 @@ extern "C" bool cublas_gemm_grouped_batched_ex_init() {
   if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
     return false;
   }
+  int original_device = 0;
+  if (cudaGetDevice(&original_device) != cudaSuccess) {
+    return false;
+  }
   for (int device = 0; device < device_count; ++device) {
     if (cudaSetDevice(device) != cudaSuccess) {
       return false;
     }
     xla::ffi::Error err = xla::ffi::Error::Success();
     if (!EnsureHandleInitialized(device, &err)) {
+      (void)cudaSetDevice(original_device);
       return false;
     }
+  }
+  if (cudaSetDevice(original_device) != cudaSuccess) {
+    return false;
   }
   return true;
 }
