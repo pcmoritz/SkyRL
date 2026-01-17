@@ -4,6 +4,56 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec
 
+_CUBLAS_GROUPED_GEMM_TARGET = "cublas_gemm_grouped_batched_ex"
+_CUBLAS_GROUPED_GEMM_AVAILABLE: bool | None = None
+
+
+def _normalize_group_offset(group_offset: jax.Array | None) -> jax.Array | None:
+    if group_offset is None:
+        return None
+    group_offset = jnp.asarray(group_offset, dtype=jnp.int32)
+    if group_offset.shape == ():
+        return group_offset[None]
+    if group_offset.shape != (1,):
+        raise ValueError(f"group_offset must have shape () or (1,), got {group_offset.shape}.")
+    return group_offset
+
+
+def _cublas_grouped_gemm_available() -> bool:
+    global _CUBLAS_GROUPED_GEMM_AVAILABLE
+    if _CUBLAS_GROUPED_GEMM_AVAILABLE is not None:
+        return _CUBLAS_GROUPED_GEMM_AVAILABLE
+    try:
+        from tx.ffi import cublas_grouped_gemm
+    except Exception:
+        _CUBLAS_GROUPED_GEMM_AVAILABLE = False
+        return False
+    try:
+        _CUBLAS_GROUPED_GEMM_AVAILABLE = cublas_grouped_gemm.register()
+    except Exception:
+        _CUBLAS_GROUPED_GEMM_AVAILABLE = False
+    return _CUBLAS_GROUPED_GEMM_AVAILABLE
+
+
+def _ragged_dot_cublas(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    preferred_element_type,
+) -> jax.Array | None:
+    if jax.default_backend() != "gpu":
+        return None
+    if not _cublas_grouped_gemm_available():
+        return None
+
+    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
+    result_shape = jax.ShapeDtypeStruct((lhs.shape[0], rhs.shape[2]), out_dtype)
+    call = jax.ffi.ffi_call(_CUBLAS_GROUPED_GEMM_TARGET, result_shape, vmap_method="sequential")
+    group_sizes_i32 = group_sizes if group_sizes.dtype == jnp.int32 else group_sizes.astype(jnp.int32)
+    group_offset_i32 = group_offset if group_offset.dtype == jnp.int32 else group_offset.astype(jnp.int32)
+    return call(lhs, rhs, group_sizes_i32, group_offset_i32)
+
 
 def ragged_dot(
     lhs: jax.Array,
@@ -18,6 +68,7 @@ def ragged_dot(
     When group_offset is specified, rhs contains groups [offset, offset + g_local).
     Tokens outside this range are routed to boundary groups and masked to zero.
     """
+    group_offset = _normalize_group_offset(group_offset)
     if group_offset is None:
         return lax.ragged_dot(
             lhs,
@@ -27,12 +78,15 @@ def ragged_dot(
             preferred_element_type=preferred_element_type,
         )
 
-    assert group_offset.shape == (1,), "group_offset must have shape (1,)"
+    g_local = rhs.shape[0]
+    assert g_local > 0, "rhs must have at least one group"
+
+    cublas_out = _ragged_dot_cublas(lhs, rhs, group_sizes, group_offset, preferred_element_type)
+    if cublas_out is not None:
+        return cublas_out
+
     offset = group_offset[0]
     m = lhs.shape[0]
-    g_local = rhs.shape[0]
-
-    assert g_local > 0, "rhs must have at least one group"
 
     # Compute token boundaries for local groups
     cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
