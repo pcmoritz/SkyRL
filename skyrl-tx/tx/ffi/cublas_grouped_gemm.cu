@@ -317,7 +317,12 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
 
   int cc_major = 0;
+  int cc_minor = 0;
   cuda_status = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device);
+  if (cuda_status != cudaSuccess) {
+    return CudaError(cuda_status, "failed to query compute capability");
+  }
+  cuda_status = cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device);
   if (cuda_status != cudaSuccess) {
     return CudaError(cuda_status, "failed to query compute capability");
   }
@@ -373,6 +378,7 @@ xla::ffi::Error CublasGroupedGemmImpl(
       IsForceFp32Enabled()) {
     dtype_info.compute_type = CUBLAS_COMPUTE_32F;
   }
+  bool bf16_safe = false;
   if (lhs.element_type() == xla::ffi::DataType::BF16 && cc_major < 8) {
     return xla::ffi::Error::InvalidArgument("bf16 requires sm80+ for grouped gemm");
   }
@@ -397,6 +403,10 @@ xla::ffi::Error CublasGroupedGemmImpl(
   if (m > std::numeric_limits<int>::max() || n > std::numeric_limits<int>::max() ||
       k > std::numeric_limits<int>::max()) {
     return xla::ffi::Error::InvalidArgument("matrix dimensions exceed int32");
+  }
+  if (dtype_info.data_type == CUDA_R_16BF && n == 1) {
+    dtype_info.compute_type = CUBLAS_COMPUTE_32F;
+    bf16_safe = true;
   }
 
   std::vector<int32_t> h_group_sizes(num_groups);
@@ -446,11 +456,12 @@ xla::ffi::Error CublasGroupedGemmImpl(
   if (IsVerboseEnabled()) {
     std::fprintf(stderr,
                  "cublas_grouped_gemm: device=%d dtype=%d m=%lld k=%lld n=%lld "
-                 "num_groups=%lld g_local=%lld offset=%d min_group=%d max_group=%d\n",
+                 "num_groups=%lld g_local=%lld offset=%d min_group=%d max_group=%d cc=%d.%d\n",
                  device, static_cast<int>(lhs.element_type()),
                  static_cast<long long>(m), static_cast<long long>(k), static_cast<long long>(n),
                  static_cast<long long>(num_groups), static_cast<long long>(g_local),
-                 offset, static_cast<int>(min_group), static_cast<int>(max_group));
+                 offset, static_cast<int>(min_group), static_cast<int>(max_group),
+                 cc_major, cc_minor);
     std::fprintf(stderr, "group_sizes[0..7]:");
     int64_t to_print = std::min<int64_t>(num_groups, 8);
     for (int64_t i = 0; i < to_print; ++i) {
@@ -602,20 +613,33 @@ xla::ffi::Error CublasGroupedGemmImpl(
   }
   if (dtype_info.data_type == CUDA_R_16F || dtype_info.data_type == CUDA_R_16BF) {
     status = cublasSetMathMode(handle,
-                               IsTensorOpDisabled() ? CUBLAS_DEFAULT_MATH
-                                                    : CUBLAS_TENSOR_OP_MATH);
+                               (IsTensorOpDisabled() || bf16_safe)
+                                   ? CUBLAS_DEFAULT_MATH
+                                   : CUBLAS_TENSOR_OP_MATH);
   } else {
     status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
   }
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "failed to set cublas math mode");
   }
+  bool use_gemm_ex = IsUseGemmExEnabled();
+  if (IsVerboseEnabled()) {
+    std::fprintf(stderr,
+                 "compute_type=%d data_type=%d math_mode=%s path=%s fp32=%s bf16_safe=%s\n",
+                 static_cast<int>(dtype_info.compute_type),
+                 static_cast<int>(dtype_info.data_type),
+                 (IsTensorOpDisabled() || bf16_safe) ? "default" : "tensor",
+                 use_gemm_ex ? "gemm_ex" : "grouped",
+                 IsForceFp32Enabled() ? "true" : "false",
+                 bf16_safe ? "true" : "false");
+    std::fflush(stderr);
+  }
 
   if (IsDryRunEnabled()) {
     return xla::ffi::Error::Success();
   }
 
-  if (IsUseGemmExEnabled()) {
+  if (use_gemm_ex) {
     float alpha_f = 1.0f;
     float beta_f = 0.0f;
     double alpha_d = 1.0;
