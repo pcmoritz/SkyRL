@@ -119,6 +119,15 @@ bool IsSyncEnabled() {
   return enabled;
 }
 
+int GroupLogCount() {
+  const char* env = std::getenv("TX_CUBLAS_GROUPED_GEMM_LOG_GROUPS");
+  if (!env || env[0] == '\0') {
+    return 0;
+  }
+  int count = std::atoi(env);
+  return count < 0 ? 0 : count;
+}
+
 bool IsForceFp32Enabled() {
   static const bool enabled = std::getenv("TX_CUBLAS_GROUPED_GEMM_FORCE_FP32") != nullptr;
   return enabled;
@@ -451,6 +460,8 @@ xla::ffi::Error CublasGroupedGemmImpl(
     cudaPointerAttributes lhs_attrs{};
     cudaPointerAttributes rhs_attrs{};
     cudaPointerAttributes out_attrs{};
+    cudaPointerAttributes group_sizes_attrs{};
+    cudaPointerAttributes group_offset_attrs{};
     if (cudaPointerGetAttributes(&lhs_attrs, lhs.untyped_data()) == cudaSuccess &&
         cudaPointerGetAttributes(&rhs_attrs, rhs.untyped_data()) == cudaSuccess &&
         cudaPointerGetAttributes(&out_attrs, (*out).untyped_data()) == cudaSuccess) {
@@ -459,6 +470,13 @@ xla::ffi::Error CublasGroupedGemmImpl(
                    lhs.untyped_data(), PointerTypeName(lhs_attrs), lhs_attrs.device,
                    rhs.untyped_data(), PointerTypeName(rhs_attrs), rhs_attrs.device,
                    (*out).untyped_data(), PointerTypeName(out_attrs), out_attrs.device);
+    }
+    if (cudaPointerGetAttributes(&group_sizes_attrs, group_sizes.untyped_data()) == cudaSuccess &&
+        cudaPointerGetAttributes(&group_offset_attrs, group_offset.untyped_data()) == cudaSuccess) {
+      std::fprintf(stderr, "group_sizes_ptr=%p (%s dev=%d) group_offset_ptr=%p (%s dev=%d)\n",
+                   group_sizes.untyped_data(), PointerTypeName(group_sizes_attrs),
+                   group_sizes_attrs.device, group_offset.untyped_data(),
+                   PointerTypeName(group_offset_attrs), group_offset_attrs.device);
     }
     std::fflush(stderr);
   }
@@ -487,6 +505,8 @@ xla::ffi::Error CublasGroupedGemmImpl(
   const char* lhs_base = reinterpret_cast<const char*>(lhs.untyped_data());
   const char* rhs_base = reinterpret_cast<const char*>(rhs.untyped_data());
   char* out_base = reinterpret_cast<char*>((*out).untyped_data());
+  const int log_groups = GroupLogCount();
+  int logged = 0;
 
   for (int64_t g = 0; g < g_local; ++g) {
     const int64_t global_group = offset + g;
@@ -519,6 +539,15 @@ xla::ffi::Error CublasGroupedGemmImpl(
       if (!CheckRange(c_offset_bytes, c_bytes, out_bytes)) {
         return xla::ffi::Error::InvalidArgument("out pointer range out of bounds");
       }
+    }
+    if (log_groups > 0 && logged < log_groups) {
+      std::fprintf(stderr,
+                   "group[%lld] global=%lld group_m=%d row_start=%lld "
+                   "a_off=%zu b_off=%zu c_off=%zu\n",
+                   static_cast<long long>(g), static_cast<long long>(global_group),
+                   static_cast<int>(group_m), static_cast<long long>(row_start),
+                   a_offset_bytes, b_offset_bytes, c_offset_bytes);
+      ++logged;
     }
     const void* a_ptr = rhs_base + a_offset_bytes;
     const void* b_ptr = lhs_base + b_offset_bytes;
