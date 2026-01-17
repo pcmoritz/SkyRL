@@ -79,16 +79,14 @@ bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
   }
 }
 
-cublasHandle_t GetHandle() {
+cublasHandle_t GetHandle(int device, cublasStatus_t* status_out) {
   thread_local cublasHandle_t handle = nullptr;
   thread_local int cached_device = -1;
 
-  int device = -1;
-  if (cudaGetDevice(&device) != cudaSuccess) {
-    return nullptr;
-  }
-
   if (handle != nullptr && cached_device == device) {
+    if (status_out) {
+      *status_out = CUBLAS_STATUS_SUCCESS;
+    }
     return handle;
   }
 
@@ -97,19 +95,31 @@ cublasHandle_t GetHandle() {
     handle = nullptr;
   }
 
-  if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+  cublasStatus_t status = cublasCreate(&handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    if (status_out) {
+      *status_out = status;
+    }
     return nullptr;
   }
 
   cached_device = device;
+  if (status_out) {
+    *status_out = CUBLAS_STATUS_SUCCESS;
+  }
   return handle;
 }
 
 xla::ffi::Error CublasGroupedGemmImpl(
-    cudaStream_t stream, xla::ffi::AnyBuffer lhs, xla::ffi::AnyBuffer rhs,
+    cudaStream_t stream, int32_t device_ordinal, xla::ffi::AnyBuffer lhs, xla::ffi::AnyBuffer rhs,
     xla::ffi::BufferR1<xla::ffi::DataType::S32> group_sizes,
     xla::ffi::BufferR1<xla::ffi::DataType::S32> group_offset,
     xla::ffi::Result<xla::ffi::AnyBuffer> out) {
+  cudaError_t cuda_status = cudaSetDevice(device_ordinal);
+  if (cuda_status != cudaSuccess) {
+    return CudaError(cuda_status, "failed to set cuda device");
+  }
+
   auto lhs_dims = lhs.dimensions();
   auto rhs_dims = rhs.dimensions();
   auto out_dims = (*out).dimensions();
@@ -161,7 +171,7 @@ xla::ffi::Error CublasGroupedGemmImpl(
   std::vector<int32_t> h_group_sizes(num_groups);
   std::vector<int32_t> h_group_offset(1);
 
-  cudaError_t cuda_status = cudaMemcpyAsync(
+  cuda_status = cudaMemcpyAsync(
       h_group_sizes.data(), group_sizes.typed_data(),
       num_groups * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
   if (cuda_status != cudaSuccess) {
@@ -250,12 +260,13 @@ xla::ffi::Error CublasGroupedGemmImpl(
     return xla::ffi::Error::Success();
   }
 
-  cublasHandle_t handle = GetHandle();
+  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+  cublasHandle_t handle = GetHandle(device_ordinal, &status);
   if (handle == nullptr) {
-    return xla::ffi::Error::Internal("failed to create cublas handle");
+    return CublasError(status, "failed to create cublas handle");
   }
 
-  cublasStatus_t status = cublasSetStream(handle, stream);
+  status = cublasSetStream(handle, stream);
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "failed to set cublas stream");
   }
@@ -307,6 +318,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     cublas_gemm_grouped_batched_ex, CublasGroupedGemmImpl,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::DeviceOrdinal>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::BufferR1<xla::ffi::DataType::S32>>()
