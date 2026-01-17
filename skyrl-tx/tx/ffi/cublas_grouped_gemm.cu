@@ -188,7 +188,6 @@ xla::ffi::Error CublasGroupedGemmImpl(
   std::vector<int> ldc_array;
   std::vector<cublasOperation_t> transa_array;
   std::vector<cublasOperation_t> transb_array;
-  std::vector<int> group_size_array;
   std::vector<const void*> a_array;
   std::vector<const void*> b_array;
   std::vector<void*> c_array;
@@ -220,7 +219,6 @@ xla::ffi::Error CublasGroupedGemmImpl(
     ldc_array.push_back(static_cast<int>(n));
     transa_array.push_back(CUBLAS_OP_N);
     transb_array.push_back(CUBLAS_OP_N);
-    group_size_array.push_back(1);
     a_array.push_back(a_ptr);
     b_array.push_back(b_ptr);
     c_array.push_back(c_ptr);
@@ -245,17 +243,17 @@ xla::ffi::Error CublasGroupedGemmImpl(
     return CublasError(status, "failed to set cublas pointer mode");
   }
 
-  std::vector<float> alpha_f(group_count, 1.0f);
-  std::vector<float> beta_f(group_count, 0.0f);
-  std::vector<double> alpha_d(group_count, 1.0);
-  std::vector<double> beta_d(group_count, 0.0);
+  float alpha_f = 1.0f;
+  float beta_f = 0.0f;
+  double alpha_d = 1.0;
+  double beta_d = 0.0;
 
   const void* alpha = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
-                          ? static_cast<const void*>(alpha_d.data())
-                          : static_cast<const void*>(alpha_f.data());
+                          ? static_cast<const void*>(&alpha_d)
+                          : static_cast<const void*>(&alpha_f);
   const void* beta = (dtype_info.compute_type == CUBLAS_COMPUTE_64F)
-                         ? static_cast<const void*>(beta_d.data())
-                         : static_cast<const void*>(beta_f.data());
+                         ? static_cast<const void*>(&beta_d)
+                         : static_cast<const void*>(&beta_f);
 
   status = cublasGemmGroupedBatchedEx(
       handle, transa_array.data(), transb_array.data(), m_array.data(),
@@ -263,7 +261,7 @@ xla::ffi::Error CublasGroupedGemmImpl(
       dtype_info.data_type, lda_array.data(), b_array.data(),
       dtype_info.data_type, ldb_array.data(), beta, c_array.data(),
       dtype_info.data_type, ldc_array.data(), group_count,
-      group_size_array.data(), dtype_info.compute_type, CUBLAS_GEMM_DEFAULT);
+      dtype_info.compute_type, CUBLAS_GEMM_DEFAULT);
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "cublasGemmGroupedBatchedEx failed");
   }
