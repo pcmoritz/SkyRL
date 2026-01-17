@@ -55,13 +55,6 @@ def _ragged_dot_cublas(
     return call(lhs, rhs, group_sizes_i32, group_offset_i32)
 
 
-def _maybe_constrain_sharding(x: jax.Array, like: jax.Array) -> jax.Array:
-    sharding = getattr(like, "sharding", None)
-    if sharding is None:
-        return x
-    return jax.lax.with_sharding_constraint(x, sharding)
-
-
 def _ragged_dot_group_offset_jax(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -94,8 +87,7 @@ def _ragged_dot_group_offset_jax(
         preferred_element_type=preferred_element_type,
     )
 
-    result = jnp.where(valid_mask[:, None], result, 0)
-    return _maybe_constrain_sharding(result, lhs)
+    return jnp.where(valid_mask[:, None], result, 0)
 
 
 def _ragged_dot_group_offset_impl(
@@ -108,7 +100,7 @@ def _ragged_dot_group_offset_impl(
 ) -> jax.Array:
     cublas_out = _ragged_dot_cublas(lhs, rhs, group_sizes, group_offset, preferred_element_type)
     if cublas_out is not None:
-        return _maybe_constrain_sharding(cublas_out, lhs)
+        return cublas_out
     return _ragged_dot_group_offset_jax(
         lhs,
         rhs,
@@ -159,7 +151,6 @@ def _ragged_dot_group_offset_fwd(
 
 def _ragged_dot_group_offset_bwd(res, g):
     lhs, rhs, group_sizes, group_offset, precision, preferred_element_type = res
-    g = _maybe_constrain_sharding(g, lhs)
 
     def _pure(lhs_, rhs_):
         return _ragged_dot_group_offset_jax(
@@ -260,7 +251,13 @@ def shard_map_ep(module: nnx.Module, func, *args):
     )
     in_specs = (state_specs,) + (PartitionSpec(),) * len(args)
 
-    @jax.shard_map(mesh=get_abstract_mesh(), in_specs=in_specs, out_specs=PartitionSpec(), axis_names={"ep"})
+    @jax.shard_map(
+        mesh=get_abstract_mesh(),
+        in_specs=in_specs,
+        out_specs=PartitionSpec(),
+        axis_names={"ep"},
+        check_vma=False,
+    )
     def _body(state, *fn_args):
         module_shard = nnx.merge(graphdef, state)
         return func(module_shard, *fn_args)
