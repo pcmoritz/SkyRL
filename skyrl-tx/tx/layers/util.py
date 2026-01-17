@@ -55,6 +55,121 @@ def _ragged_dot_cublas(
     return call(lhs, rhs, group_sizes_i32, group_offset_i32)
 
 
+def _ragged_dot_group_offset_jax(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    precision=None,
+    preferred_element_type=None,
+) -> jax.Array:
+    offset = group_offset[0]
+    m = lhs.shape[0]
+    g_local = rhs.shape[0]
+
+    assert g_local > 0, "rhs must have at least one group"
+
+    cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    shard_start = cumsum[offset]
+    shard_end = cumsum[offset + g_local]
+
+    token_idx = jnp.arange(m)
+    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
+
+    local_group_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
+    adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
+
+    result = lax.ragged_dot(
+        lhs,
+        rhs,
+        adjusted_group_sizes,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+
+    return jnp.where(valid_mask[:, None], result, 0)
+
+
+def _ragged_dot_group_offset_impl(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    precision=None,
+    preferred_element_type=None,
+) -> jax.Array:
+    cublas_out = _ragged_dot_cublas(lhs, rhs, group_sizes, group_offset, preferred_element_type)
+    if cublas_out is not None:
+        return cublas_out
+    return _ragged_dot_group_offset_jax(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+
+
+@jax.custom_vjp
+def _ragged_dot_group_offset(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    precision=None,
+    preferred_element_type=None,
+) -> jax.Array:
+    return _ragged_dot_group_offset_impl(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+
+
+def _ragged_dot_group_offset_fwd(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    precision=None,
+    preferred_element_type=None,
+):
+    out = _ragged_dot_group_offset_impl(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+    return out, (lhs, rhs, group_sizes, group_offset, precision, preferred_element_type)
+
+
+def _ragged_dot_group_offset_bwd(res, g):
+    lhs, rhs, group_sizes, group_offset, precision, preferred_element_type = res
+
+    def _pure(lhs_, rhs_):
+        return _ragged_dot_group_offset_jax(
+            lhs_,
+            rhs_,
+            group_sizes,
+            group_offset,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+
+    _, vjp_fn = jax.vjp(_pure, lhs, rhs)
+    dlhs, drhs = vjp_fn(g)
+    return dlhs, drhs, None, None, None, None
+
+
+_ragged_dot_group_offset.defvjp(_ragged_dot_group_offset_fwd, _ragged_dot_group_offset_bwd)
+
+
 def ragged_dot(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -81,36 +196,14 @@ def ragged_dot(
     g_local = rhs.shape[0]
     assert g_local > 0, "rhs must have at least one group"
 
-    cublas_out = _ragged_dot_cublas(lhs, rhs, group_sizes, group_offset, preferred_element_type)
-    if cublas_out is not None:
-        return cublas_out
-
-    offset = group_offset[0]
-    m = lhs.shape[0]
-
-    # Compute token boundaries for local groups
-    cumsum = jnp.cumulative_sum(group_sizes, include_initial=True)
-    shard_start = cumsum[offset]
-    shard_end = cumsum[offset + g_local]
-
-    # Valid mask for tokens in local groups
-    token_idx = jnp.arange(m)
-    valid_mask = (token_idx >= shard_start) & (token_idx < shard_end)
-
-    # Adjust group sizes: absorb extra tokens at boundaries
-    local_group_sizes = lax.dynamic_slice_in_dim(group_sizes, offset, g_local, axis=0)
-    adjusted_group_sizes = local_group_sizes.at[0].add(shard_start).at[-1].add(m - shard_end)
-
-    # Call ragged_dot - extra tokens use boundary groups but get masked out
-    result = lax.ragged_dot(
+    return _ragged_dot_group_offset(
         lhs,
         rhs,
-        adjusted_group_sizes,
+        group_sizes,
+        group_offset,
         precision=precision,
         preferred_element_type=preferred_element_type,
     )
-
-    return jnp.where(valid_mask[:, None], result, 0)
 
 
 def Param(*shape: int, dtype: jnp.dtype, kernel_init: nnx.Initializer, rngs: nnx.Rngs):
