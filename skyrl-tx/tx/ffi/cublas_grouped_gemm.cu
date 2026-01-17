@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,6 +55,43 @@ xla::ffi::Error CublasError(cublasStatus_t status, const char* msg) {
                                    CublasStatusToString(status));
 }
 
+xla::ffi::Error CopyToHost(void* dst, const void* src, size_t bytes,
+                           cudaStream_t stream) {
+  if (bytes == 0) {
+    return xla::ffi::Error::Success();
+  }
+
+  cudaPointerAttributes attrs{};
+  cudaError_t attr_status = cudaPointerGetAttributes(&attrs, src);
+  if (attr_status == cudaErrorInvalidValue) {
+    std::memcpy(dst, src, bytes);
+    return xla::ffi::Error::Success();
+  }
+  if (attr_status != cudaSuccess) {
+    return CudaError(attr_status, "failed to query pointer attributes");
+  }
+
+#if CUDART_VERSION >= 10000
+  if (attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged) {
+#else
+  if (attrs.memoryType == cudaMemoryTypeDevice) {
+#endif
+    cudaError_t copy_status =
+        cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+    if (copy_status != cudaSuccess) {
+      return CudaError(copy_status, "failed to copy device memory to host");
+    }
+    cudaError_t sync_status = cudaStreamSynchronize(stream);
+    if (sync_status != cudaSuccess) {
+      return CudaError(sync_status, "failed to sync stream for host copy");
+    }
+    return xla::ffi::Error::Success();
+  }
+
+  std::memcpy(dst, src, bytes);
+  return xla::ffi::Error::Success();
+}
+
 bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
   switch (dtype) {
     case xla::ffi::DataType::F16:
@@ -79,35 +119,30 @@ bool GetDtypeInfo(xla::ffi::DataType dtype, DtypeInfo* info) {
   }
 }
 
-cublasHandle_t GetHandle(int device, cublasStatus_t* status_out) {
-  thread_local cublasHandle_t handle = nullptr;
-  thread_local int cached_device = -1;
+struct HandleSlot {
+  std::mutex mu;
+  cublasHandle_t handle = nullptr;
+};
 
-  if (handle != nullptr && cached_device == device) {
-    if (status_out) {
-      *status_out = CUBLAS_STATUS_SUCCESS;
+HandleSlot* GetHandleSlot(int device, xla::ffi::Error* err) {
+  static std::once_flag init_once;
+  static std::vector<std::unique_ptr<HandleSlot>> slots;
+  std::call_once(init_once, []() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+      return;
     }
-    return handle;
-  }
-
-  if (handle != nullptr) {
-    cublasDestroy(handle);
-    handle = nullptr;
-  }
-
-  cublasStatus_t status = cublasCreate(&handle);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    if (status_out) {
-      *status_out = status;
+    slots.reserve(count);
+    for (int i = 0; i < count; ++i) {
+      slots.emplace_back(std::make_unique<HandleSlot>());
     }
+  });
+
+  if (device < 0 || device >= static_cast<int>(slots.size())) {
+    *err = xla::ffi::Error::InvalidArgument("invalid device ordinal");
     return nullptr;
   }
-
-  cached_device = device;
-  if (status_out) {
-    *status_out = CUBLAS_STATUS_SUCCESS;
-  }
-  return handle;
+  return slots[device].get();
 }
 
 xla::ffi::Error CublasGroupedGemmImpl(
@@ -171,20 +206,16 @@ xla::ffi::Error CublasGroupedGemmImpl(
   std::vector<int32_t> h_group_sizes(num_groups);
   std::vector<int32_t> h_group_offset(1);
 
-  cuda_status = cudaMemcpyAsync(
-      h_group_sizes.data(), group_sizes.typed_data(),
-      num_groups * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-  if (cuda_status != cudaSuccess) {
-    return CudaError(cuda_status, "failed to copy group_sizes to host");
+  xla::ffi::Error copy_err =
+      CopyToHost(h_group_sizes.data(), group_sizes.typed_data(),
+                 num_groups * sizeof(int32_t), stream);
+  if (copy_err.failure()) {
+    return copy_err;
   }
-  cuda_status = cudaMemcpyAsync(h_group_offset.data(), group_offset.typed_data(),
-                                sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-  if (cuda_status != cudaSuccess) {
-    return CudaError(cuda_status, "failed to copy group_offset to host");
-  }
-  cuda_status = cudaStreamSynchronize(stream);
-  if (cuda_status != cudaSuccess) {
-    return CudaError(cuda_status, "failed to sync stream for group metadata");
+  copy_err = CopyToHost(h_group_offset.data(), group_offset.typed_data(),
+                        sizeof(int32_t), stream);
+  if (copy_err.failure()) {
+    return copy_err;
   }
 
   const int32_t offset = h_group_offset[0];
@@ -260,13 +291,22 @@ xla::ffi::Error CublasGroupedGemmImpl(
     return xla::ffi::Error::Success();
   }
 
-  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
-  cublasHandle_t handle = GetHandle(device_ordinal, &status);
-  if (handle == nullptr) {
-    return CublasError(status, "failed to create cublas handle");
+  xla::ffi::Error err = xla::ffi::Error::Success();
+  HandleSlot* slot = GetHandleSlot(device_ordinal, &err);
+  if (slot == nullptr) {
+    return err;
   }
 
-  status = cublasSetStream(handle, stream);
+  std::unique_lock<std::mutex> lock(slot->mu);
+  if (slot->handle == nullptr) {
+    cublasStatus_t create_status = cublasCreate(&slot->handle);
+    if (create_status != CUBLAS_STATUS_SUCCESS) {
+      return CublasError(create_status, "failed to create cublas handle");
+    }
+  }
+
+  cublasHandle_t handle = slot->handle;
+  cublasStatus_t status = cublasSetStream(handle, stream);
   if (status != CUBLAS_STATUS_SUCCESS) {
     return CublasError(status, "failed to set cublas stream");
   }
