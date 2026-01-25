@@ -278,7 +278,7 @@ class TensorBatch(dict, Generic[DictType]):
                 if isinstance(value, torch.Tensor):
                     cat_data[key] = torch.cat([shard[key] for shard in shards])
                 elif isinstance(value, float):
-                    cat_data[key] = torch.cat([shard[key] for shard in shards])
+                    cat_data[key] = torch.cat([torch.array(shard[key]) for shard in shards])
                 else:
                     raise ValueError(f"Unsupported type {type(value)} for key {key}")
             else:
