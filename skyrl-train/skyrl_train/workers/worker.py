@@ -769,8 +769,8 @@ class PolicyWorkerBase(Worker):
             loss = policy_loss
             self.strategy.backward(loss, self.model, self.optimizer)
             status = {
-                # "loss": loss.item(),
-                "loss": loss,
+                "loss": loss.item(),
+                # "loss": loss,
                 "response_length": num_actions,
                 "lr": self.scheduler.get_last_lr()[0],
             }
