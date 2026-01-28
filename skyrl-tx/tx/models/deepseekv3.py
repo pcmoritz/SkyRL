@@ -3,6 +3,7 @@ import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
+from tx.layers.attention import dot_product_attention
 from tx.layers.lora import LoRAEmbed, LoRAExpert, LoRALinear
 from tx.layers.rotary_embedding import get_rope
 from tx.layers.util import Param, prepare_routing
@@ -32,6 +33,10 @@ class DeepseekV3Attention(nnx.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
+        if self.v_head_dim > self.qk_head_dim:
+            raise ValueError(
+                f"v_head_dim ({self.v_head_dim}) must be <= qk_head_dim ({self.qk_head_dim}) for attention padding."
+            )
 
         if self.q_lora_rank is None:
             self.q_proj = LoRALinear(
@@ -161,13 +166,14 @@ class DeepseekV3Attention(nnx.Module):
         # Jax attention expects v to have the same shape as k
         v = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, self.qk_head_dim - self.v_head_dim)))
 
-        attn_output = jax.nn.dot_product_attention(
+        attn_output = dot_product_attention(
             q,
             k,
             v,
-            scale=self.scaling,
-            mask=attention_mask[:, None, None, :].astype(bool),
+            attention_mask,
             is_causal=kv_cache is None,
+            head_dim=self.qk_head_dim,
+            scale=self.scaling,
         )
 
         attn_output = attn_output[:, :, :, : self.v_head_dim].reshape(B, T, self.num_heads * self.v_head_dim)
@@ -329,6 +335,12 @@ class DeepseekV3MoE(nnx.Module):
     def __init__(self, config: DeepseekV3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
         self.n_group = config.n_group
+        if config.n_routed_experts % self.n_group != 0:
+            raise ValueError("n_routed_experts must be divisible by n_group for grouped routing.")
+        if config.topk_group > self.n_group:
+            raise ValueError("topk_group must be <= n_group.")
+        if config.num_experts_per_tok > config.n_routed_experts:
+            raise ValueError("num_experts_per_tok must be <= n_routed_experts.")
 
         self.gate = DeepseekV3TopkRouter(config, dtype=dtype, rngs=rngs)
         self.experts = DeepseekV3NaiveMoe(config, dtype=dtype, rngs=rngs)
@@ -510,7 +522,9 @@ class DeepseekV3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, Logits
         self.config = config
         self.model = DeepseekV3Model(config, dtype=dtype, rngs=rngs)
 
-        if not self.config.tie_word_embeddings:
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens.T
+        else:
             self.lm_head = LoRALinear(
                 config.hidden_size,
                 config.vocab_size,

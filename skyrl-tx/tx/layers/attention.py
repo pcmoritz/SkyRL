@@ -15,6 +15,8 @@ def dot_product_attention(
     attention_mask: jax.Array,
     is_causal: bool,
     head_dim: int,
+    *,
+    scale: float | jax.Array | None = None,
 ) -> jax.Array:
     """Compute dot-product attention with automatic backend selection.
 
@@ -32,7 +34,8 @@ def dot_product_attention(
     Returns:
         Attention output of shape [batch, q_len, num_heads, head_dim]
     """
-    scale = 1.0 / head_dim**0.5
+    if scale is None:
+        scale = 1.0 / head_dim**0.5
 
     if jax.default_backend() == "gpu" and q.dtype in _CUDNN_SUPPORTED_DTYPES:
         kv_seq_lengths = attention_mask.sum(axis=1).astype(jnp.int32)
