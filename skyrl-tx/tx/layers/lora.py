@@ -88,6 +88,14 @@ class LoRAMixin:
         if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
+        # Normalize 2D (token_dim, hidden_dim) to 3D (token_dim, 1, hidden_dim)
+        # Only for float inputs (Linear layers). Embed layers use integer indices
+        # where 2D (batch, seq_len) is the normal shape, not flattened.
+        original_shape = base_output.shape
+        if x.ndim == 2 and jnp.issubdtype(x.dtype, jnp.floating):
+            x = x[:, None, :]
+            base_output = base_output[:, None, :]
+
         (batch_size, seq_len, *dims) = x.shape
         assert adapter_indices.shape[0] == batch_size
 
@@ -106,7 +114,7 @@ class LoRAMixin:
         # Unsort, reshape, scale
         lora_output = lora_output_sorted[unsort_indices].reshape(batch_size, seq_len, -1)
         lora_output = lora_output * self.lora_scaling[...][adapter_indices, None, None]
-        return base_output + lora_output.reshape(base_output.shape)
+        return (base_output + lora_output).reshape(original_shape)
 
 
 class LoRAEmbed(LoRAMixin, nnx.Embed):
