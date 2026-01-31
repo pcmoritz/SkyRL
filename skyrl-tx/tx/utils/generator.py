@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import functools
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 from tokenizers.decoders import DecodeStream
@@ -231,6 +232,50 @@ def find_string_stop_position(
     return None
 
 
+def _decode_forward(
+    hidden_states: jax.Array,
+    layer_graphdef: nnx.GraphDef,
+    layer_state: nnx.State,
+    norm_fn,
+    *,
+    attention_mask: jax.Array,
+    positions: jax.Array,
+    adapter_indices: jax.Array | None,
+    kv_cache: "KVCache",
+) -> tuple[jax.Array, "KVCache"]:
+    """Decode-only forward pass through layers using pre-split state.
+
+    This is used inside the decode loop to avoid re-splitting the layers each step,
+    which would cause XLA to treat layer weights as loop-carried state.
+    """
+
+    def body_fn(hs, xs):
+        layer_params, layer_k, layer_v = xs
+        layer = nnx.merge(layer_graphdef, layer_params)
+
+        new_hs, (k, v) = layer(
+            hs,
+            attention_mask=attention_mask,
+            positions=positions,
+            adapter_indices=adapter_indices,
+            kv_cache=(layer_k, layer_v),
+        )
+        return new_hs, (k, v)
+
+    xs = (layer_state, kv_cache.keys, kv_cache.values)
+    final_hs, (all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
+
+    final_hs = norm_fn(final_hs)
+
+    new_kv_cache = KVCache(
+        keys=all_keys,
+        values=all_values,
+        cache_position=kv_cache.cache_position + positions.shape[1],
+    )
+
+    return final_hs, new_kv_cache
+
+
 class GeneratorMixin:
     """Adds autoregressive generation with KV caching to causal language models."""
 
@@ -283,6 +328,12 @@ class GeneratorMixin:
 
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
+        # Pre-split model components for the decode loop.
+        # This ensures layer weights are treated as constants by XLA, not loop-carried state.
+        embed_tokens = model.model.embed_tokens
+        layer_graphdef, layer_state = nnx.split(model.model.layers)
+        norm_fn = model.model.norm
+
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
             # Sample next token
@@ -313,20 +364,27 @@ class GeneratorMixin:
             batch_idx = jnp.arange(s.attention_mask.shape[0])
             next_attention_mask = s.attention_mask.at[batch_idx, s.kv_cache.cache_position].set(1)
 
-            outputs = model(
-                next_token,
+            # Decode forward: embed -> layers (using pre-split state) -> norm
+            positions = s.last_positions + 1
+            hidden_states = embed_tokens(next_token, adapter_indices=adapter_indices)
+            hidden_states, new_kv_cache = _decode_forward(
+                hidden_states,
+                layer_graphdef,
+                layer_state,
+                norm_fn,
                 attention_mask=next_attention_mask,
-                positions=s.last_positions + 1,
-                kv_cache=s.kv_cache,
+                positions=positions,
                 adapter_indices=adapter_indices,
+                kv_cache=s.kv_cache,
             )
+
             # Compute logits for the next token
-            next_logits = model.compute_logits(outputs.last_hidden_state, adapter_indices)[:, 0, :]
+            next_logits = model.compute_logits(hidden_states, adapter_indices)[:, 0, :]
             next_state = DecodeState(
-                kv_cache=outputs.kv_cache,
+                kv_cache=new_kv_cache,
                 rngs=rngs,
                 attention_mask=next_attention_mask,
-                last_positions=s.last_positions + 1,
+                last_positions=positions,
                 logits=next_logits,
                 stop_pos=stop_pos,
             )
