@@ -237,6 +237,7 @@ def _decode_forward(
     layer_graphdef: nnx.GraphDef,
     layer_state: nnx.State,
     norm_fn,
+    num_layers: int,
     *,
     attention_mask: jax.Array,
     positions: jax.Array,
@@ -245,35 +246,35 @@ def _decode_forward(
 ) -> tuple[jax.Array, "KVCache"]:
     """Decode-only forward pass through layers using pre-split state.
 
-    This is used inside the decode loop to avoid re-splitting the layers each step,
-    which would cause XLA to treat layer weights as loop-carried state.
+    Uses full unrolling to avoid nested scan issues - XLA treats unrolled layer
+    weights as constants rather than loop-carried state in the outer decode loop.
     """
+    all_keys = []
+    all_values = []
 
-    def body_fn(hs, xs):
-        layer_params, layer_k, layer_v = xs
+    for layer_idx in range(num_layers):
+        layer_params = jax.tree.map(lambda x, i=layer_idx: x[i], layer_state)
         layer = nnx.merge(layer_graphdef, layer_params)
 
-        new_hs, (k, v) = layer(
-            hs,
+        hidden_states, (k, v) = layer(
+            hidden_states,
             attention_mask=attention_mask,
             positions=positions,
             adapter_indices=adapter_indices,
-            kv_cache=(layer_k, layer_v),
+            kv_cache=(kv_cache.keys[layer_idx], kv_cache.values[layer_idx]),
         )
-        return new_hs, (k, v)
+        all_keys.append(k)
+        all_values.append(v)
 
-    xs = (layer_state, kv_cache.keys, kv_cache.values)
-    final_hs, (all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
-
-    final_hs = norm_fn(final_hs)
+    hidden_states = norm_fn(hidden_states)
 
     new_kv_cache = KVCache(
-        keys=all_keys,
-        values=all_values,
+        keys=jnp.stack(all_keys),
+        values=jnp.stack(all_values),
         cache_position=kv_cache.cache_position + positions.shape[1],
     )
 
-    return final_hs, new_kv_cache
+    return hidden_states, new_kv_cache
 
 
 class GeneratorMixin:
@@ -329,10 +330,11 @@ class GeneratorMixin:
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
         # Pre-split model components for the decode loop.
-        # This ensures layer weights are treated as constants by XLA, not loop-carried state.
+        # The decode forward uses Python unrolling for layers to avoid nested scan issues.
         embed_tokens = model.model.embed_tokens
         layer_graphdef, layer_state = nnx.split(model.model.layers)
         norm_fn = model.model.norm
+        num_layers = model.model.num_layers
 
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
@@ -372,6 +374,7 @@ class GeneratorMixin:
                 layer_graphdef,
                 layer_state,
                 norm_fn,
+                num_layers,
                 attention_mask=next_attention_mask,
                 positions=positions,
                 adapter_indices=adapter_indices,
