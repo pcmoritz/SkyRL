@@ -110,20 +110,8 @@ def forward_layers(
         if is_training:
             # Avoid accumulating large KV tensors for training.
             k = v = None
-        elif is_decode:
-            # Extract only the new K/V values at the current position, not the
-            # full updated cache. This avoids O(num_layers * batch * seq) memory
-            # allocation per decode step, which was causing severe perf regression.
-            # The layer returns the full cache after update_layer, but we only
-            # need the newly added slice at positions[:, 0].
-            def extract_at_pos(cache, pos):
-                # cache: (seq, heads, dim), pos: scalar
-                return jax.lax.dynamic_slice(
-                    cache, (pos, 0, 0), (1, cache.shape[1], cache.shape[2])
-                )
-
-            k = jax.vmap(extract_at_pos)(k, positions[:, 0])  # (batch, 1, heads, dim)
-            v = jax.vmap(extract_at_pos)(v, positions[:, 0])  # (batch, 1, heads, dim)
+        # Note: During decode, layers now return only the new K/V values
+        # (batch, 1, heads, dim) instead of the full cache, so no extraction needed.
 
         return new_hs, (hs_output, k, v)
 

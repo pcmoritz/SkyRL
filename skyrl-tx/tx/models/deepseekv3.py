@@ -159,11 +159,16 @@ class DeepseekV3Attention(nnx.Module):
         q = jnp.concatenate([q_pass, q_rot], axis=-1)
         k = jnp.concatenate([k_pass, k_rot], axis=-1)
 
-        # Handle KV cache
+        # Handle KV cache - keep new k,v separate for efficient return
+        k_new, v_new = k, v
         if kv_cache is not None:
+            # Update cache and use full cache for attention
             k, v = KVCache.update_layer(kv_cache, k, v, positions)
-
-        updated_cache = (k, v)
+            # Return only new values (not full cache) to avoid O(seq) memory per layer
+            return_cache = (k_new, v_new)
+        else:
+            # Prefill: return full k,v for building initial cache
+            return_cache = (k, v)
 
         # Jax attention expects v to have the same shape as k
         v = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, self.qk_head_dim - self.v_head_dim)))
@@ -178,7 +183,7 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         attn_output = attn_output[:, :, :, : self.v_head_dim].reshape(B, T, self.num_heads * self.v_head_dim)
-        return self.o_proj(attn_output, adapter_indices=adapter_indices), updated_cache
+        return self.o_proj(attn_output, adapter_indices=adapter_indices), return_cache
 
 
 class DeepseekV3MLP(nnx.Module):
