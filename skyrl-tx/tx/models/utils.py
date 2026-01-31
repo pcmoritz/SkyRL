@@ -145,27 +145,31 @@ def forward_layers(
     elif is_decode:
         # Decode mode: all_keys/all_values contain only the new K/V slices
         # with shape (num_layers, batch, 1, heads, dim). Update the original
-        # cache in a single batched operation instead of reconstructing it
-        # entirely, which avoids O(num_layers * batch * seq) memory per step.
-        def update_cache_batch(cache, new_vals, cache_positions):
+        # cache using scatter-style .at[].set() which avoids copies from moveaxis.
+        def update_cache_scatter(cache, new_vals, cache_positions):
             # cache: (num_layers, batch, seq, heads, dim)
             # new_vals: (num_layers, batch, 1, heads, dim)
             # cache_positions: (batch,)
-            def update_batch_item(c, n, p):
-                # c: (num_layers, seq, heads, dim)
-                # n: (num_layers, 1, heads, dim)
-                # p: scalar position
-                return jax.lax.dynamic_update_slice(c, n, (0, p, 0, 0))
+            num_layers, batch_size = cache.shape[0], cache.shape[1]
 
-            # vmap over batch dimension
-            cache_t = jnp.moveaxis(cache, 1, 0)  # (batch, num_layers, seq, heads, dim)
-            new_vals_t = jnp.moveaxis(new_vals, 1, 0)  # (batch, num_layers, 1, heads, dim)
-            updated = jax.vmap(update_batch_item)(cache_t, new_vals_t, cache_positions)
-            return jnp.moveaxis(updated, 0, 1)  # (num_layers, batch, seq, heads, dim)
+            # Create index arrays for scatter update
+            layer_idx = jnp.arange(num_layers)[:, None]  # (num_layers, 1)
+            batch_idx = jnp.arange(batch_size)[None, :]  # (1, batch)
+
+            # Broadcast to (num_layers, batch)
+            layer_idx = jnp.broadcast_to(layer_idx, (num_layers, batch_size))
+            batch_idx = jnp.broadcast_to(batch_idx, (num_layers, batch_size))
+            pos_idx = jnp.broadcast_to(cache_positions[None, :], (num_layers, batch_size))
+
+            # new_vals is (num_layers, batch, 1, heads, dim), squeeze the seq dim
+            new_vals_squeezed = new_vals[:, :, 0, :, :]  # (num_layers, batch, heads, dim)
+
+            # Scatter update - much more efficient than moveaxis + vmap
+            return cache.at[layer_idx, batch_idx, pos_idx].set(new_vals_squeezed)
 
         new_kv_cache = KVCache(
-            keys=update_cache_batch(kv_cache.keys, all_keys, kv_cache.cache_position),
-            values=update_cache_batch(kv_cache.values, all_values, kv_cache.cache_position),
+            keys=update_cache_scatter(kv_cache.keys, all_keys, kv_cache.cache_position),
+            values=update_cache_scatter(kv_cache.values, all_values, kv_cache.cache_position),
             cache_position=kv_cache.cache_position + positions.shape[1],
         )
     else:
