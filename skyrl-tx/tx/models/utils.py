@@ -21,11 +21,15 @@ def create_stacked_layers(
     create_layer_fn: Callable[[nnx.Rngs], nnx.Module],
     num_layers: int,
     rngs: nnx.Rngs,
-) -> nnx.Module:
-    """Create stacked decoder layers using nnx.vmap.
+) -> tuple[nnx.Module, nnx.GraphDef]:
+    """Create stacked decoder layers using nnx.vmap and a template GraphDef.
 
     This creates a single module object where all parameters have shape (num_layers, ...).
     This enables efficient scanning over layers without runtime stacking.
+
+    Also creates a template GraphDef from a single unstacked layer. This template is used
+    inside the scan loop to avoid metadata mismatches between the stacked GraphDef and
+    unstacked parameters, which would otherwise slow down XLA compilation.
 
     Args:
         create_layer_fn: Function that takes rngs and returns a single layer module.
@@ -33,12 +37,14 @@ def create_stacked_layers(
         rngs: Random number generators for initialization.
 
     Returns:
-        A single module with stacked parameters.
+        A tuple of (stacked_layers, template_graphdef) where:
+        - stacked_layers: A single module with stacked parameters.
+        - template_graphdef: A clean, unstacked GraphDef for use in scan loops.
 
     Example:
         >>> def create_layer(rngs):
         ...     return Llama3DecoderLayer(config, dtype=dtype, rngs=rngs)
-        >>> layers = create_stacked_layers(create_layer, config.num_hidden_layers, rngs)
+        >>> layers, graphdef = create_stacked_layers(create_layer, config.num_hidden_layers, rngs)
         >>> # layers.self_attn.q_proj.kernel.shape == (num_layers, hidden, head_dim*num_heads)
     """
 
@@ -47,11 +53,19 @@ def create_stacked_layers(
     def vmapped_create(rngs: nnx.Rngs):
         return create_layer_fn(rngs)
 
-    return vmapped_create(rngs)
+    stacked_layers = vmapped_create(rngs)
+
+    # Create a dummy single layer to get a clean, unstacked GraphDef.
+    # We use a throwaway RNG since we only need the graph structure (static metadata).
+    template_layer = create_layer_fn(nnx.Rngs(0))
+    template_graphdef, _ = nnx.split(template_layer)
+
+    return stacked_layers, template_graphdef
 
 
 def forward_layers(
     layers: nnx.Module,
+    layer_graphdef: nnx.GraphDef,
     hidden_states: jax.Array,
     num_layers: int,
     *,
@@ -67,6 +81,7 @@ def forward_layers(
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
+        layer_graphdef: Template GraphDef for a single unstacked layer (from create_stacked_layers).
         hidden_states: Input hidden states of shape (batch, seq, hidden).
         num_layers: Number of decoder layers.
         attention_mask: Attention mask of shape (batch, seq).
@@ -83,7 +98,7 @@ def forward_layers(
     """
     assert num_layers > 0, "num_layers must be positive"
 
-    layer_graphdef, layer_state = nnx.split(layers)
+    _, layer_state = nnx.split(layers)
     is_decode = kv_cache is not None
 
     def body_fn(hs, xs):
@@ -95,7 +110,8 @@ def forward_layers(
             layer_params = xs
             layer_kv = None
 
-        # Merge using the sliced params directly - no manual gather needed
+        # Merge with template GraphDef (unstacked) - this creates a module that
+        # genuinely looks like a single layer to XLA, avoiding metadata mismatches
         layer = nnx.merge(layer_graphdef, layer_params)
         new_hs, (k, v) = layer(
             hs,

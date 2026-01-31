@@ -217,7 +217,7 @@ class Llama3Model(nnx.Module):
         def create_layer(rngs: nnx.Rngs) -> Llama3DecoderLayer:
             return Llama3DecoderLayer(config, dtype=dtype, rngs=rngs)
 
-        self.layers = create_stacked_layers(create_layer, config.num_hidden_layers, rngs)
+        self.layers, self.layer_graphdef = create_stacked_layers(create_layer, config.num_hidden_layers, rngs)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
 
     def __call__(
@@ -239,6 +239,7 @@ class Llama3Model(nnx.Module):
 
         hidden_states, all_hidden_states, new_kv_cache = forward_layers(
             self.layers,
+            self.layer_graphdef,
             hidden_states,
             self.num_layers,
             attention_mask=attention_mask,

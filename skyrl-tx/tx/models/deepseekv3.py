@@ -489,9 +489,12 @@ class DeepseekV3Model(nnx.Module):
             def create_dense_layer(rngs: nnx.Rngs) -> DeepseekV3DecoderLayer:
                 return DeepseekV3DecoderLayer(config, mlp_cls=DeepseekV3MLP, dtype=dtype, rngs=rngs)
 
-            self.dense_layers = create_stacked_layers(create_dense_layer, self.num_dense_layers, rngs)
+            self.dense_layers, self.dense_graphdef = create_stacked_layers(
+                create_dense_layer, self.num_dense_layers, rngs
+            )
         else:
             self.dense_layers = None
+            self.dense_graphdef = None
 
         # Create stacked MoE layers (layers first_k_dense_replace to num_hidden_layers - 1)
         if self.num_moe_layers > 0:
@@ -499,9 +502,10 @@ class DeepseekV3Model(nnx.Module):
             def create_moe_layer(rngs: nnx.Rngs) -> DeepseekV3DecoderLayer:
                 return DeepseekV3DecoderLayer(config, mlp_cls=DeepseekV3MoE, dtype=dtype, rngs=rngs)
 
-            self.moe_layers = create_stacked_layers(create_moe_layer, self.num_moe_layers, rngs)
+            self.moe_layers, self.moe_graphdef = create_stacked_layers(create_moe_layer, self.num_moe_layers, rngs)
         else:
             self.moe_layers = None
+            self.moe_graphdef = None
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
 
@@ -534,6 +538,7 @@ class DeepseekV3Model(nnx.Module):
         if self.dense_layers is not None:
             hidden_states, dense_hidden_states, dense_kv_result = forward_layers(
                 self.dense_layers,
+                self.dense_graphdef,
                 hidden_states,
                 self.num_dense_layers,
                 attention_mask=attention_mask,
@@ -551,6 +556,7 @@ class DeepseekV3Model(nnx.Module):
         if self.moe_layers is not None:
             hidden_states, moe_hidden_states, moe_kv_result = forward_layers(
                 self.moe_layers,
+                self.moe_graphdef,
                 hidden_states,
                 self.num_moe_layers,
                 attention_mask=attention_mask,
