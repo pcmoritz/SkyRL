@@ -13,6 +13,7 @@ from typing import Callable
 
 from flax import nnx
 import jax
+import jax.numpy as jnp
 
 from tx.utils.generator import KVCache
 
@@ -109,6 +110,21 @@ def forward_layers(
         if is_training:
             # Avoid accumulating large KV tensors for training.
             k = v = None
+        elif is_decode:
+            # Extract only the new K/V values at the current position, not the
+            # full updated cache. This avoids O(num_layers * batch * seq) memory
+            # allocation per decode step, which was causing severe perf regression.
+            # The layer returns the full cache after update_layer, but we only
+            # need the newly added slice at positions[:, 0].
+            def extract_at_pos(cache, pos):
+                # cache: (seq, heads, dim), pos: scalar
+                return jax.lax.dynamic_slice(
+                    cache, (pos, 0, 0), (1, cache.shape[1], cache.shape[2])
+                )
+
+            k = jax.vmap(extract_at_pos)(k, positions[:, 0])  # (batch, 1, heads, dim)
+            v = jax.vmap(extract_at_pos)(v, positions[:, 0])  # (batch, 1, heads, dim)
+
         return new_hs, (hs_output, k, v)
 
     if gradient_checkpointing:
@@ -127,10 +143,29 @@ def forward_layers(
     if is_training:
         new_kv_cache = None
     elif is_decode:
-        # Decode mode: scan stacked the per-layer updated caches into (num_layers, ...)
+        # Decode mode: all_keys/all_values contain only the new K/V slices
+        # with shape (num_layers, batch, 1, heads, dim). Update the original
+        # cache in a single batched operation instead of reconstructing it
+        # entirely, which avoids O(num_layers * batch * seq) memory per step.
+        def update_cache_batch(cache, new_vals, cache_positions):
+            # cache: (num_layers, batch, seq, heads, dim)
+            # new_vals: (num_layers, batch, 1, heads, dim)
+            # cache_positions: (batch,)
+            def update_batch_item(c, n, p):
+                # c: (num_layers, seq, heads, dim)
+                # n: (num_layers, 1, heads, dim)
+                # p: scalar position
+                return jax.lax.dynamic_update_slice(c, n, (0, p, 0, 0))
+
+            # vmap over batch dimension
+            cache_t = jnp.moveaxis(cache, 1, 0)  # (batch, num_layers, seq, heads, dim)
+            new_vals_t = jnp.moveaxis(new_vals, 1, 0)  # (batch, num_layers, 1, heads, dim)
+            updated = jax.vmap(update_batch_item)(cache_t, new_vals_t, cache_positions)
+            return jnp.moveaxis(updated, 0, 1)  # (num_layers, batch, seq, heads, dim)
+
         new_kv_cache = KVCache(
-            keys=all_keys,
-            values=all_values,
+            keys=update_cache_batch(kv_cache.keys, all_keys, kv_cache.cache_position),
+            values=update_cache_batch(kv_cache.values, all_values, kv_cache.cache_position),
             cache_position=kv_cache.cache_position + positions.shape[1],
         )
     else:
