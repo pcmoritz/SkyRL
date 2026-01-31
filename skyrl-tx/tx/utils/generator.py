@@ -179,6 +179,9 @@ class DecodeState:
     last_positions: jax.Array
     logits: jax.Array
     stop_pos: jax.Array  # Position where stop token was found
+    step: jax.Array  # Current decode step
+    tokens: jax.Array  # Accumulated tokens [max_new_tokens, batch, 1]
+    logprobs: jax.Array  # Accumulated logprobs [max_new_tokens, batch, 1]
 
 
 @dataclass
@@ -237,7 +240,6 @@ def _decode_forward(
     layer_graphdef: nnx.GraphDef,
     layer_state: nnx.State,
     norm_fn,
-    num_layers: int,
     *,
     attention_mask: jax.Array,
     positions: jax.Array,
@@ -246,35 +248,35 @@ def _decode_forward(
 ) -> tuple[jax.Array, "KVCache"]:
     """Decode-only forward pass through layers using pre-split state.
 
-    Uses full unrolling to avoid nested scan issues - XLA treats unrolled layer
-    weights as constants rather than loop-carried state in the outer decode loop.
+    Uses scan for layers. When used with while_loop for the outer decode loop,
+    layer weights should be treated as constants by XLA.
     """
-    all_keys = []
-    all_values = []
 
-    for layer_idx in range(num_layers):
-        layer_params = jax.tree.map(lambda x, i=layer_idx: x[i], layer_state)
+    def body_fn(hs, xs):
+        layer_params, layer_k, layer_v = xs
         layer = nnx.merge(layer_graphdef, layer_params)
 
-        hidden_states, (k, v) = layer(
-            hidden_states,
+        new_hs, (k, v) = layer(
+            hs,
             attention_mask=attention_mask,
             positions=positions,
             adapter_indices=adapter_indices,
-            kv_cache=(kv_cache.keys[layer_idx], kv_cache.values[layer_idx]),
+            kv_cache=(layer_k, layer_v),
         )
-        all_keys.append(k)
-        all_values.append(v)
+        return new_hs, (k, v)
 
-    hidden_states = norm_fn(hidden_states)
+    xs = (layer_state, kv_cache.keys, kv_cache.values)
+    final_hs, (all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
+
+    final_hs = norm_fn(final_hs)
 
     new_kv_cache = KVCache(
-        keys=jnp.stack(all_keys),
-        values=jnp.stack(all_values),
+        keys=all_keys,
+        values=all_values,
         cache_position=kv_cache.cache_position + positions.shape[1],
     )
 
-    return hidden_states, new_kv_cache
+    return final_hs, new_kv_cache
 
 
 class GeneratorMixin:
@@ -330,14 +332,19 @@ class GeneratorMixin:
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
         # Pre-split model components for the decode loop.
-        # The decode forward uses Python unrolling for layers to avoid nested scan issues.
+        # Using while_loop instead of scan so captured layer weights are treated as constants.
         embed_tokens = model.model.embed_tokens
         layer_graphdef, layer_state = nnx.split(model.model.layers)
         norm_fn = model.model.norm
-        num_layers = model.model.num_layers
 
-        def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
-            """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
+        batch_size = input_ids.shape[0]
+
+        def decode_cond(s: DecodeState) -> jax.Array:
+            """Continue while step < max_new_tokens."""
+            return s.step < max_new_tokens
+
+        def decode_body(s: DecodeState) -> DecodeState:
+            """Decode one token step."""
             # Sample next token
             split_keys = jax.vmap(jax.random.split)(s.rngs)
             rngs, sample_keys = split_keys[:, 0], split_keys[:, 1]
@@ -358,9 +365,13 @@ class GeneratorMixin:
             next_token = jnp.where(zero_temp_mask[:, None], greedy[:, None], sampled[:, None])
             sampled_logprob = model.logits_to_logprobs(s.logits, next_token[:, 0])[:, None]
 
+            # Accumulate tokens and logprobs
+            tokens = s.tokens.at[s.step].set(next_token)
+            logprobs = s.logprobs.at[s.step].set(sampled_logprob)
+
             # Track first stop token position (-1 means not stopped yet)
             is_stop = jnp.any(next_token == stop_tokens, axis=1)
-            stop_pos = jnp.where((s.stop_pos == -1) & is_stop, step + 1, s.stop_pos)
+            stop_pos = jnp.where((s.stop_pos == -1) & is_stop, s.step + 1, s.stop_pos)
 
             # Update attention mask at per-sequence positions (for left-aligned sequences)
             batch_idx = jnp.arange(s.attention_mask.shape[0])
@@ -374,7 +385,6 @@ class GeneratorMixin:
                 layer_graphdef,
                 layer_state,
                 norm_fn,
-                num_layers,
                 attention_mask=next_attention_mask,
                 positions=positions,
                 adapter_indices=adapter_indices,
@@ -383,15 +393,17 @@ class GeneratorMixin:
 
             # Compute logits for the next token
             next_logits = model.compute_logits(hidden_states, adapter_indices)[:, 0, :]
-            next_state = DecodeState(
+            return DecodeState(
                 kv_cache=new_kv_cache,
                 rngs=rngs,
                 attention_mask=next_attention_mask,
                 last_positions=positions,
                 logits=next_logits,
                 stop_pos=stop_pos,
+                step=s.step + 1,
+                tokens=tokens,
+                logprobs=logprobs,
             )
-            return next_state, (next_token, sampled_logprob)
 
         initial_state = DecodeState(
             kv_cache=kv_cache,
@@ -399,16 +411,17 @@ class GeneratorMixin:
             attention_mask=decode_attention_mask,
             last_positions=last_token_idx[:, None],
             logits=last_logits,
-            stop_pos=jnp.full((input_ids.shape[0],), -1),
+            stop_pos=jnp.full((batch_size,), -1),
+            step=jnp.array(0),
+            tokens=jnp.zeros((max_new_tokens, batch_size, 1), dtype=jnp.int32),
+            logprobs=jnp.zeros((max_new_tokens, batch_size, 1), dtype=jnp.float32),
         )
 
-        final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(
-            decode_fn, initial_state, xs=jnp.arange(max_new_tokens)
-        )
+        final_state = jax.lax.while_loop(decode_cond, decode_body, initial_state)
 
-        # Post-process: transpose scan outputs from [Steps, Batch, 1] to [Batch, Steps]
-        new_tokens = jnp.swapaxes(tokens_stacked, 0, 1).squeeze(-1)
-        new_logprobs = jnp.swapaxes(logprobs_stacked, 0, 1).squeeze(-1)
+        # Post-process: transpose from [Steps, Batch, 1] to [Batch, Steps]
+        new_tokens = jnp.swapaxes(final_state.tokens, 0, 1).squeeze(-1)
+        new_logprobs = jnp.swapaxes(final_state.logprobs, 0, 1).squeeze(-1)
 
         return new_tokens, new_logprobs, final_state.stop_pos, prompt_logprobs_array
 
