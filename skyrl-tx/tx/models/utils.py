@@ -87,6 +87,22 @@ def forward_layers(
     layer_graphdef, layer_state = nnx.split(layers)
     is_decode = kv_cache is not None
 
+    # For decode mode without gradient checkpointing, use a Python loop instead
+    # of scan. This allows XLA to optimize memory reuse between layer calls,
+    # avoiding the memory overhead of scan's output collection.
+    if is_decode and not gradient_checkpointing:
+        return _forward_layers_decode_loop(
+            layer_graphdef,
+            layer_state,
+            hidden_states,
+            num_layers,
+            attention_mask=attention_mask,
+            positions=positions,
+            adapter_indices=adapter_indices,
+            kv_cache=kv_cache,
+            output_hidden_states=output_hidden_states,
+        )
+
     def body_fn(hs, xs):
         # Unpack xs: scan automatically slices the leading dimension of layer_state
         if is_decode:
@@ -165,3 +181,66 @@ def forward_layers(
         new_kv_cache = KVCache.from_layer_outputs(all_keys, all_values, attention_mask)
 
     return final_hs, all_hidden_states, new_kv_cache
+
+
+def _forward_layers_decode_loop(
+    layer_graphdef: nnx.GraphDef,
+    layer_state: nnx.State,
+    hidden_states: jax.Array,
+    num_layers: int,
+    *,
+    attention_mask: jax.Array,
+    positions: jax.Array,
+    adapter_indices: jax.Array | None,
+    kv_cache: KVCache,
+    output_hidden_states: bool,
+) -> tuple[jax.Array, list[jax.Array], KVCache]:
+    """Decode using a Python loop instead of scan.
+
+    This is more efficient for decode because:
+    1. Each layer call is a separate XLA operation
+    2. XLA can reuse memory between layer calls
+    3. No scan overhead for output collection
+    """
+    hs = hidden_states
+    all_hidden_states = [hidden_states] if output_hidden_states else []
+    cache_keys = kv_cache.keys
+    cache_values = kv_cache.values
+    cache_pos = kv_cache.cache_position
+
+    # Create batch indices for scatter update (cache_pos is per-batch)
+    batch_size = hidden_states.shape[0]
+    batch_idx = jnp.arange(batch_size)
+
+    for i in range(num_layers):
+        # Get layer i's parameters by indexing into stacked state
+        layer_params_i = jax.tree.map(lambda x: x[i], layer_state)
+        layer = nnx.merge(layer_graphdef, layer_params_i)
+
+        # Get layer i's cache slice
+        layer_kv = (cache_keys[i], cache_values[i])
+
+        # Forward through layer
+        hs, (k_new, v_new) = layer(
+            hs,
+            attention_mask=attention_mask,
+            positions=positions,
+            adapter_indices=adapter_indices,
+            kv_cache=layer_kv,
+        )
+
+        # Update cache for this layer using scatter with per-batch positions
+        # k_new, v_new are (batch, 1, heads, dim)
+        cache_keys = cache_keys.at[i, batch_idx, cache_pos].set(k_new[:, 0, :, :])
+        cache_values = cache_values.at[i, batch_idx, cache_pos].set(v_new[:, 0, :, :])
+
+        if output_hidden_states and i < num_layers - 1:
+            all_hidden_states.append(hs)
+
+    new_kv_cache = KVCache(
+        keys=cache_keys,
+        values=cache_values,
+        cache_position=cache_pos + positions.shape[1],
+    )
+
+    return hs, all_hidden_states, new_kv_cache
