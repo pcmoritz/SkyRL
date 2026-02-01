@@ -62,6 +62,7 @@ def forward_layers(
     output_hidden_states: bool,
     gradient_checkpointing: bool,
     is_training: bool = False,
+    scan_unroll: int = 4,
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
     """Unified forward pass through stacked decoder layers using scan.
 
@@ -78,6 +79,8 @@ def forward_layers(
         output_hidden_states: Whether to return intermediate hidden states.
         gradient_checkpointing: Whether to use gradient checkpointing (training only).
         is_training: Whether in training mode. Skips KV cache to save memory.
+        scan_unroll: Number of scan iterations to unroll. Higher values may improve
+            runtime performance at the cost of longer compilation time.
 
     Returns:
         Tuple of (final_hidden_states, all_hidden_states, kv_cache).
@@ -116,7 +119,9 @@ def forward_layers(
 
     # Pass layer_state (and KV cache for decode) as xs for efficient native slicing
     xs = (layer_state, kv_cache.keys, kv_cache.values) if is_decode else layer_state
-    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
+    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(
+        body_fn, hidden_states, xs, unroll=scan_unroll
+    )
 
     # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
     all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
