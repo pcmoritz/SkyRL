@@ -119,7 +119,7 @@ def forward_layers(
     # which causes slow XLA compilation with jax.checkpoint.
     xs = (layer_state, kv_cache.keys, kv_cache.values) if is_decode else layer_state
 
-    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
+    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs, unroll=8)
 
     # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
     all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
