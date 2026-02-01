@@ -195,33 +195,37 @@ def _forward_layers_decode_loop(
     kv_cache: KVCache,
     output_hidden_states: bool,
 ) -> tuple[jax.Array, list[jax.Array], KVCache]:
-    """Decode using a Python loop instead of scan.
+    """Decode using fori_loop with cache accessed via closure.
 
-    This is more efficient for decode because:
-    1. Each layer call is a separate XLA operation
-    2. XLA can reuse memory between layer calls
-    3. No scan overhead for output collection
+    Key optimization: The large KV cache is NOT passed through the loop carry.
+    Instead, we only pass small accumulators for the new k/v values.
+    The cache is read from closure (read-only during the loop).
     """
-    hs = hidden_states
-    all_hidden_states = [hidden_states] if output_hidden_states else []
-    cache_keys = kv_cache.keys
-    cache_values = kv_cache.values
     cache_pos = kv_cache.cache_position
-
-    # Create batch indices for scatter update (cache_pos is per-batch)
     batch_size = hidden_states.shape[0]
     batch_idx = jnp.arange(batch_size)
 
-    for i in range(num_layers):
-        # Get layer i's parameters by indexing into stacked state
+    # Get cache shape info for initializing accumulators
+    # kv_cache.keys shape: (num_layers, batch, seq, heads, dim)
+    _, _, _, num_heads, head_dim = kv_cache.keys.shape
+
+    # Initialize small accumulators for new k/v values only
+    # Shape: (num_layers, batch, heads, dim) - no seq dimension
+    new_keys_accum = jnp.zeros((num_layers, batch_size, num_heads, head_dim), dtype=kv_cache.keys.dtype)
+    new_values_accum = jnp.zeros((num_layers, batch_size, num_heads, head_dim), dtype=kv_cache.values.dtype)
+
+    def body_fn(i, carry):
+        hs, new_k_acc, new_v_acc = carry
+
+        # Get layer i's parameters by dynamic indexing
         layer_params_i = jax.tree.map(lambda x: x[i], layer_state)
         layer = nnx.merge(layer_graphdef, layer_params_i)
 
-        # Get layer i's cache slice
-        layer_kv = (cache_keys[i], cache_values[i])
+        # Read layer i's cache from closure (NOT in carry)
+        layer_kv = (kv_cache.keys[i], kv_cache.values[i])
 
         # Forward through layer
-        hs, (k_new, v_new) = layer(
+        new_hs, (k_new, v_new) = layer(
             hs,
             attention_mask=attention_mask,
             positions=positions,
@@ -229,18 +233,33 @@ def _forward_layers_decode_loop(
             kv_cache=layer_kv,
         )
 
-        # Update cache for this layer using scatter with per-batch positions
+        # Accumulate new k/v values (small tensors only)
         # k_new, v_new are (batch, 1, heads, dim)
-        cache_keys = cache_keys.at[i, batch_idx, cache_pos].set(k_new[:, 0, :, :])
-        cache_values = cache_values.at[i, batch_idx, cache_pos].set(v_new[:, 0, :, :])
+        new_k_acc = new_k_acc.at[i].set(k_new[:, 0, :, :])
+        new_v_acc = new_v_acc.at[i].set(v_new[:, 0, :, :])
 
-        if output_hidden_states and i < num_layers - 1:
-            all_hidden_states.append(hs)
+        return (new_hs, new_k_acc, new_v_acc)
+
+    init_carry = (hidden_states, new_keys_accum, new_values_accum)
+    final_hs, all_new_keys, all_new_values = jax.lax.fori_loop(
+        0, num_layers, body_fn, init_carry
+    )
+
+    # Update the original cache with all new k/v values in one batched operation
+    # all_new_keys shape: (num_layers, batch, heads, dim)
+    layer_idx = jnp.arange(num_layers)[:, None]
+    batch_idx_2d = jnp.arange(batch_size)[None, :]
+    layer_idx = jnp.broadcast_to(layer_idx, (num_layers, batch_size))
+    batch_idx_2d = jnp.broadcast_to(batch_idx_2d, (num_layers, batch_size))
+    pos_idx = jnp.broadcast_to(cache_pos[None, :], (num_layers, batch_size))
 
     new_kv_cache = KVCache(
-        keys=cache_keys,
-        values=cache_values,
+        keys=kv_cache.keys.at[layer_idx, batch_idx_2d, pos_idx].set(all_new_keys),
+        values=kv_cache.values.at[layer_idx, batch_idx_2d, pos_idx].set(all_new_values),
         cache_position=cache_pos + positions.shape[1],
     )
 
-    return hs, all_hidden_states, new_kv_cache
+    # output_hidden_states not supported with fori_loop (would require scan)
+    all_hidden_states = []
+
+    return final_hs, all_hidden_states, new_kv_cache
