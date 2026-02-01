@@ -14,16 +14,16 @@ from tx.tinker import types
 @jax.tree_util.register_dataclass
 @dataclass
 class KVCache:
-    """Key-value cache for all layers.
+    """Key-value cache for all layers in stacked format.
 
     Attributes:
-        keys: List of key caches, one per layer, each of shape (batch, seq, num_kv_heads, head_dim).
-        values: List of value caches, one per layer, each of shape (batch, seq, num_kv_heads, head_dim).
+        keys: Stacked key cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
+        values: Stacked value cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
         cache_position: Per-sequence positions of shape (batch,) for left-aligned decoding.
     """
 
-    keys: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim) per layer
-    values: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim) per layer
+    keys: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
+    values: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
     cache_position: jax.Array  # (batch,)
 
     @staticmethod
@@ -42,12 +42,8 @@ class KVCache:
         Returns:
             New KVCache with computed cache_position.
         """
-        # Prefill: next position is the sequence length (number of real tokens)
         cache_position = attention_mask.sum(axis=1).astype(jnp.int32)
-        # Unstack into per-layer lists
-        keys_list = [keys[i] for i in range(keys.shape[0])]
-        values_list = [values[i] for i in range(values.shape[0])]
-        return KVCache(keys=keys_list, values=values_list, cache_position=cache_position)
+        return KVCache(keys=keys, values=values, cache_position=cache_position)
 
     @staticmethod
     def update_layer(
@@ -86,29 +82,32 @@ class KVCache:
         Returns:
             New KVCache with padded keys and values.
         """
-        # k and v have shape (batch, seq, num_heads, head_dim)
-        cache_pad_length = max_length - self.keys[0].shape[1]
-        pad_spec = ((0, 0), (0, cache_pad_length), (0, 0), (0, 0))
+        current_length = self.keys.shape[2]  # (num_layers, batch, seq, heads, dim)
+        if current_length >= max_length:
+            return self
+
+        pad_length = max_length - current_length
+        pad_spec = ((0, 0), (0, 0), (0, pad_length), (0, 0), (0, 0))
         return KVCache(
-            keys=[jnp.pad(k, pad_spec) for k in self.keys],
-            values=[jnp.pad(v, pad_spec) for v in self.values],
+            keys=jnp.pad(self.keys, pad_spec),
+            values=jnp.pad(self.values, pad_spec),
             cache_position=self.cache_position,
         )
 
     @property
     def num_layers(self) -> int:
         """Number of layers in the cache."""
-        return len(self.keys)
+        return self.keys.shape[0]
 
     @property
     def batch_size(self) -> int:
         """Batch size."""
-        return self.keys[0].shape[0]
+        return self.keys.shape[1]
 
     @property
     def seq_len(self) -> int:
         """Current sequence length."""
-        return self.keys[0].shape[1]
+        return self.keys.shape[2]
 
     def split(self, layer_idx: int) -> tuple[KVCache | None, KVCache | None]:
         """Split the cache at a layer index.
@@ -157,8 +156,8 @@ class KVCache:
         if second is None:
             return first
         return KVCache(
-            keys=first.keys + second.keys,
-            values=first.values + second.values,
+            keys=jnp.concatenate([first.keys, second.keys], axis=0),
+            values=jnp.concatenate([first.values, second.values], axis=0),
             cache_position=second.cache_position,
         )
 

@@ -2,7 +2,7 @@
 
 This module provides:
 - create_stacked_layers: Create decoder layers with stacked weights using nnx.vmap
-- forward_layers: Unified forward pass using scan for prefill/training, Python loop for decode
+- forward_layers: Unified forward pass using scan for prefill/training, fori_loop for decode
 
 Prerequisites:
 - Layers must be created with nnx.vmap (stacked weights)
@@ -12,6 +12,7 @@ from typing import Callable
 
 from flax import nnx
 import jax
+import jax.numpy as jnp
 
 from tx.utils.generator import KVCache
 
@@ -64,7 +65,7 @@ def forward_layers(
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
     """Unified forward pass through stacked decoder layers.
 
-    Uses scan for prefill/training, Python loop for decode to avoid KV cache stacking.
+    Uses scan for prefill/training, fori_loop for decode with dynamic indexing.
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
@@ -88,36 +89,59 @@ def forward_layers(
     is_decode = kv_cache is not None
 
     if is_decode:
-        # Decode mode: use Python loop to avoid KV cache stacking overhead
-        all_hidden_states: list[jax.Array] = []
-        updated_keys: list[jax.Array] = []
-        updated_values: list[jax.Array] = []
+        # Decode mode: use fori_loop with dynamic indexing to avoid scan's slice/stack overhead
+        # Pre-allocate hidden states collection if needed
+        if output_hidden_states:
+            all_hs_array = jnp.zeros((num_layers,) + hidden_states.shape, dtype=hidden_states.dtype)
+        else:
+            all_hs_array = None
 
-        for layer_idx in range(num_layers):
-            if output_hidden_states:
-                all_hidden_states.append(hidden_states)
+        def decode_body_fn(i, carry):
+            hs, keys, values, all_hs = carry
 
-            # Get per-layer parameters by indexing into stacked state
-            layer_params = jax.tree.map(lambda x: x[layer_idx], layer_state)
+            # Get per-layer parameters using dynamic indexing
+            layer_params = jax.tree.map(
+                lambda x: jax.lax.dynamic_index_in_dim(x, i, axis=0, keepdims=False),
+                layer_state,
+            )
             layer = nnx.merge(layer_graphdef, layer_params)
-            layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx])
 
-            hidden_states, (k, v) = layer(
-                hidden_states,
+            # Get per-layer KV cache using dynamic indexing
+            layer_k = jax.lax.dynamic_index_in_dim(keys, i, axis=0, keepdims=False)
+            layer_v = jax.lax.dynamic_index_in_dim(values, i, axis=0, keepdims=False)
+
+            # Run layer
+            new_hs, (k, v) = layer(
+                hs,
                 attention_mask=attention_mask,
                 positions=positions,
                 adapter_indices=adapter_indices,
-                kv_cache=layer_kv,
+                kv_cache=(layer_k, layer_v),
             )
-            updated_keys.append(k)
-            updated_values.append(v)
+
+            # Update KV cache in place using dynamic update
+            keys = jax.lax.dynamic_update_index_in_dim(keys, k, i, axis=0)
+            values = jax.lax.dynamic_update_index_in_dim(values, v, i, axis=0)
+
+            # Collect hidden states if needed
+            if output_hidden_states:
+                all_hs = jax.lax.dynamic_update_index_in_dim(all_hs, hs, i, axis=0)
+
+            return (new_hs, keys, values, all_hs)
+
+        init_carry = (hidden_states, kv_cache.keys, kv_cache.values, all_hs_array)
+        final_hs, final_keys, final_values, all_hs_array = jax.lax.fori_loop(
+            0, num_layers, decode_body_fn, init_carry
+        )
 
         new_kv_cache = KVCache(
-            keys=updated_keys,
-            values=updated_values,
+            keys=final_keys,
+            values=final_values,
             cache_position=kv_cache.cache_position + positions.shape[1],
         )
-        return hidden_states, all_hidden_states, new_kv_cache
+
+        all_hidden_states = list(all_hs_array) if output_hidden_states else []
+        return final_hs, all_hidden_states, new_kv_cache
 
     # Prefill/training mode: use scan for efficiency with gradient checkpointing
     def body_fn(hs, layer_params):
