@@ -63,10 +63,9 @@ def forward_layers(
     gradient_checkpointing: bool,
     is_training: bool = False,
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
-    """Unified forward pass through stacked decoder layers.
+    """Unified forward pass through stacked decoder layers using scan.
 
-    Uses scan for both prefill and decode. For decode, KV cache is kept in the carry
-    with dynamic indexing to avoid scan's slice/restack overhead on the cache.
+    For decode, layer_state and KV cache are passed as xs for native slicing.
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
@@ -89,77 +88,48 @@ def forward_layers(
     layer_graphdef, layer_state = nnx.split(layers)
     is_decode = kv_cache is not None
 
-    if is_decode:
-        # Decode mode: use scan with layer_state as xs (efficient native slicing)
-        # KV cache stays in carry with dynamic indexing (avoids scan's slice/restack for cache)
-        def decode_body_fn(carry, layer_params):
-            hs, keys, values, idx = carry
+    # Unified scan body for both prefill and decode
+    def body_fn(hs, xs):
+        if is_decode:
+            layer_params, layer_k, layer_v = xs
+            layer_kv = (layer_k, layer_v)
+        else:
+            layer_params = xs
+            layer_kv = None
 
-            # layer_params already sliced by scan - no closure capture overhead
-            layer = nnx.merge(layer_graphdef, layer_params)
-
-            # Dynamic indexing only for KV cache (much smaller than layer_state)
-            layer_k = jax.lax.dynamic_index_in_dim(keys, idx, axis=0, keepdims=False)
-            layer_v = jax.lax.dynamic_index_in_dim(values, idx, axis=0, keepdims=False)
-
-            new_hs, (k, v) = layer(
-                hs,
-                attention_mask=attention_mask,
-                positions=positions,
-                adapter_indices=adapter_indices,
-                kv_cache=(layer_k, layer_v),
-            )
-
-            # Update KV cache in place
-            keys = jax.lax.dynamic_update_index_in_dim(keys, k, idx, axis=0)
-            values = jax.lax.dynamic_update_index_in_dim(values, v, idx, axis=0)
-
-            hs_output = hs if output_hidden_states else None
-            return (new_hs, keys, values, idx + 1), hs_output
-
-        init_carry = (hidden_states, kv_cache.keys, kv_cache.values, jnp.int32(0))
-        (final_hs, final_keys, final_values, _), all_hs = jax.lax.scan(
-            decode_body_fn, init_carry, layer_state
-        )
-
-        new_kv_cache = KVCache(
-            keys=final_keys,
-            values=final_values,
-            cache_position=kv_cache.cache_position + positions.shape[1],
-        )
-        all_hidden_states = list(all_hs) if output_hidden_states else []
-        return final_hs, all_hidden_states, new_kv_cache
-
-    # Prefill/training mode: use scan for efficiency with gradient checkpointing
-    def body_fn(hs, layer_params):
         layer = nnx.merge(layer_graphdef, layer_params)
         new_hs, (k, v) = layer(
             hs,
             attention_mask=attention_mask,
             positions=positions,
             adapter_indices=adapter_indices,
-            kv_cache=None,
+            kv_cache=layer_kv,
         )
         hs_output = new_hs if output_hidden_states else None
 
         if is_training:
-            # Avoid accumulating large KV tensors for training.
             k = v = None
         return new_hs, (hs_output, k, v)
 
     if gradient_checkpointing:
         body_fn = jax.checkpoint(body_fn)
 
-    # Pass layer_state as xs so scan handles the slicing automatically.
-    # This avoids capturing layer_state as a closure and manually gathering,
-    # which causes slow XLA compilation with jax.checkpoint.
-    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, layer_state)
+    # Pass layer_state (and KV cache for decode) as xs for efficient native slicing
+    xs = (layer_state, kv_cache.keys, kv_cache.values) if is_decode else layer_state
+    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
 
     # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
     all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
 
     if is_training:
         new_kv_cache = None
+    elif is_decode:
+        # Decode mode: scan already stacked the updated caches
+        new_kv_cache = KVCache(
+            keys=all_keys,
+            values=all_values,
+            cache_position=kv_cache.cache_position + positions.shape[1],
+        )
     else:
         # Prefill mode: build cache from collected k,v outputs
         new_kv_cache = KVCache.from_layer_outputs(all_keys, all_values, attention_mask)
