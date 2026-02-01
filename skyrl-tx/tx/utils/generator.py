@@ -70,11 +70,15 @@ class KVCache:
         """
         k_cache, v_cache = kv_cache
 
-        def update_at_pos(cache_slice, new_val_slice, pos):
-            return jax.lax.dynamic_update_slice(cache_slice, new_val_slice, (pos, 0, 0))
+        # Use .at[].set() with advanced indexing instead of vmap + dynamic_update_slice
+        # This is more efficient as it avoids vmap overhead
+        batch_idx = jnp.arange(k_cache.shape[0])
+        pos = positions[:, 0]
 
-        k = jax.vmap(update_at_pos)(k_cache, k, positions[:, 0])
-        v = jax.vmap(update_at_pos)(v_cache, v, positions[:, 0])
+        # k, v have shape (batch, seq_len, heads, dim) where seq_len=1 for decode
+        # Insert at the specified positions
+        k = k_cache.at[batch_idx, pos].set(k[:, 0])
+        v = v_cache.at[batch_idx, pos].set(v[:, 0])
         return k, v
 
     def pad_to_length(self, max_length: int) -> KVCache:
