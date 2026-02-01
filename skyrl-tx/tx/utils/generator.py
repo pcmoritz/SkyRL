@@ -1,4 +1,4 @@
-"""Generator mixin for autoregressive text generation with stacked KV caching."""
+"""Generator mixin for autoregressive text generation with KV caching."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -14,16 +14,16 @@ from tx.tinker import types
 @jax.tree_util.register_dataclass
 @dataclass
 class KVCache:
-    """Key-value cache for all layers in stacked format.
+    """Key-value cache for all layers.
 
     Attributes:
-        keys: Stacked key cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
-        values: Stacked value cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
+        keys: List of key caches, one per layer, each of shape (batch, seq, num_kv_heads, head_dim).
+        values: List of value caches, one per layer, each of shape (batch, seq, num_kv_heads, head_dim).
         cache_position: Per-sequence positions of shape (batch,) for left-aligned decoding.
     """
 
-    keys: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
-    values: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
+    keys: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim) per layer
+    values: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim) per layer
     cache_position: jax.Array  # (batch,)
 
     @staticmethod
@@ -44,7 +44,10 @@ class KVCache:
         """
         # Prefill: next position is the sequence length (number of real tokens)
         cache_position = attention_mask.sum(axis=1).astype(jnp.int32)
-        return KVCache(keys=keys, values=values, cache_position=cache_position)
+        # Unstack into per-layer lists
+        keys_list = [keys[i] for i in range(keys.shape[0])]
+        values_list = [values[i] for i in range(values.shape[0])]
+        return KVCache(keys=keys_list, values=values_list, cache_position=cache_position)
 
     @staticmethod
     def update_layer(
@@ -54,9 +57,6 @@ class KVCache:
         positions: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         """Update a single layer's KV cache at the given positions.
-
-        This is called from within the scan body to update a single layer's cache.
-        The layer index is handled by the caller (indexing into stacked cache).
 
         Args:
             kv_cache: Tuple of (k_cache, v_cache) for this layer.
@@ -86,33 +86,29 @@ class KVCache:
         Returns:
             New KVCache with padded keys and values.
         """
-        current_length = self.keys.shape[2]  # (num_layers, batch, seq, heads, dim)
-        if current_length >= max_length:
-            return self
-
-        pad_length = max_length - current_length
-        # Pad only the sequence dimension (axis 2)
-        pad_spec = ((0, 0), (0, 0), (0, pad_length), (0, 0), (0, 0))
+        # k and v have shape (batch, seq, num_heads, head_dim)
+        cache_pad_length = max_length - self.keys[0].shape[1]
+        pad_spec = ((0, 0), (0, cache_pad_length), (0, 0), (0, 0))
         return KVCache(
-            keys=jnp.pad(self.keys, pad_spec),
-            values=jnp.pad(self.values, pad_spec),
+            keys=[jnp.pad(k, pad_spec) for k in self.keys],
+            values=[jnp.pad(v, pad_spec) for v in self.values],
             cache_position=self.cache_position,
         )
 
     @property
     def num_layers(self) -> int:
         """Number of layers in the cache."""
-        return self.keys.shape[0]
+        return len(self.keys)
 
     @property
     def batch_size(self) -> int:
         """Batch size."""
-        return self.keys.shape[1]
+        return self.keys[0].shape[0]
 
     @property
     def seq_len(self) -> int:
         """Current sequence length."""
-        return self.keys.shape[2]
+        return self.keys[0].shape[1]
 
     def split(self, layer_idx: int) -> tuple[KVCache | None, KVCache | None]:
         """Split the cache at a layer index.
@@ -161,8 +157,8 @@ class KVCache:
         if second is None:
             return first
         return KVCache(
-            keys=jnp.concatenate([first.keys, second.keys], axis=0),
-            values=jnp.concatenate([first.values, second.values], axis=0),
+            keys=first.keys + second.keys,
+            values=first.values + second.values,
             cache_position=second.cache_position,
         )
 
