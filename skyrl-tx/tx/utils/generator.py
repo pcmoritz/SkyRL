@@ -231,7 +231,8 @@ class GeneratorMixin:
 
     @staticmethod
     @functools.partial(
-        jax.jit, static_argnames=("max_length", "max_new_tokens", "max_top_k", "use_top_p", "prompt_logprobs")
+        jax.jit,
+        static_argnames=("max_length", "max_new_tokens", "max_top_k", "use_top_p", "prompt_logprobs", "decode_unroll"),
     )
     def _prefill_and_decode(
         model,
@@ -248,6 +249,7 @@ class GeneratorMixin:
         max_top_k: int,
         use_top_p: bool,
         prompt_logprobs: bool = False,
+        decode_unroll: int = 1,
     ):
         """JIT-compiled prefill + decode loop. Fuses everything for maximum efficiency."""
         # Prefill: process full prompt (left-aligned, so positions start at 0)
@@ -337,7 +339,7 @@ class GeneratorMixin:
         )
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(
-            decode_fn, initial_state, xs=jnp.arange(max_new_tokens)
+            decode_fn, initial_state, xs=jnp.arange(max_new_tokens), unroll=decode_unroll
         )
 
         # Post-process: transpose scan outputs from [Steps, Batch, 1] to [Batch, Steps]
@@ -355,12 +357,15 @@ class GeneratorMixin:
         adapter_indices: jax.Array | None = None,
         prompt_logprobs: bool = False,
         tokenizer=None,
+        decode_unroll: int = 4,
     ) -> GenerateOutput:
         """Generate text autoregressively with KV caching.
 
         Args:
             tokenizer: Optional tokenizer for string stop sequence detection.
                 Required if any sampling_params has stop_strings set.
+            decode_unroll: Number of decode loop iterations to unroll. Higher values
+                may improve runtime performance at the cost of longer compilation.
 
         Returns:
             GenerateOutput containing generated_ids, stop_reasons, and optionally logprobs.
@@ -407,6 +412,7 @@ class GeneratorMixin:
             max_top_k,
             use_top_p,
             prompt_logprobs=prompt_logprobs,
+            decode_unroll=decode_unroll,
         )
 
         max_tokens = jnp.array([sp.max_tokens for sp in sampling_params])
