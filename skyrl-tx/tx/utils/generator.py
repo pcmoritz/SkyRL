@@ -1,4 +1,4 @@
-"""Generator mixin for autoregressive text generation with stacked KV caching."""
+"""Generator mixin for autoregressive text generation with unstacked KV caching."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -14,29 +14,32 @@ from tx.tinker import types
 @jax.tree_util.register_dataclass
 @dataclass
 class KVCache:
-    """Key-value cache for all layers in stacked format.
+    """Key-value cache for all layers in unstacked format (list of per-layer caches).
+
+    Using unstacked format is faster for decode because each layer's cache can be
+    updated independently without touching a large stacked tensor.
 
     Attributes:
-        keys: Stacked key cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
-        values: Stacked value cache of shape (num_layers, batch, seq, num_kv_heads, head_dim).
+        keys: List of key caches, each of shape (batch, seq, num_kv_heads, head_dim).
+        values: List of value caches, each of shape (batch, seq, num_kv_heads, head_dim).
         cache_position: Per-sequence positions of shape (batch,) for left-aligned decoding.
     """
 
-    keys: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
-    values: jax.Array  # (num_layers, batch, seq, num_kv_heads, head_dim)
+    keys: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim)
+    values: list[jax.Array]  # List of (batch, seq, num_kv_heads, head_dim)
     cache_position: jax.Array  # (batch,)
 
     @staticmethod
     def from_layer_outputs(
-        keys: jax.Array,
-        values: jax.Array,
+        keys: list[jax.Array],
+        values: list[jax.Array],
         attention_mask: jax.Array,
     ) -> KVCache:
-        """Create KVCache from stacked layer outputs after prefill.
+        """Create KVCache from layer outputs after prefill.
 
         Args:
-            keys: Stacked keys of shape (num_layers, batch, seq, num_kv_heads, head_dim).
-            values: Stacked values of shape (num_layers, batch, seq, num_kv_heads, head_dim).
+            keys: List of keys, each of shape (batch, seq, num_kv_heads, head_dim).
+            values: List of values, each of shape (batch, seq, num_kv_heads, head_dim).
             attention_mask: Attention mask of shape (batch, seq).
 
         Returns:
@@ -55,9 +58,6 @@ class KVCache:
     ) -> tuple[jax.Array, jax.Array]:
         """Update a single layer's KV cache at the given positions.
 
-        This is called from within the scan body to update a single layer's cache.
-        The layer index is handled by the caller (indexing into stacked cache).
-
         Args:
             kv_cache: Tuple of (k_cache, v_cache) for this layer.
                       Each has shape (batch, seq, num_kv_heads, head_dim).
@@ -70,8 +70,7 @@ class KVCache:
         """
         k_cache, v_cache = kv_cache
 
-        # Use .at[].set() with advanced indexing instead of vmap + dynamic_update_slice
-        # This is more efficient as it avoids vmap overhead
+        # Use .at[].set() with advanced indexing
         batch_idx = jnp.arange(k_cache.shape[0])
         pos = positions[:, 0]
 
@@ -90,33 +89,33 @@ class KVCache:
         Returns:
             New KVCache with padded keys and values.
         """
-        current_length = self.keys.shape[2]  # (num_layers, batch, seq, heads, dim)
+        current_length = self.keys[0].shape[1]  # (batch, seq, heads, dim)
         if current_length >= max_length:
             return self
 
         pad_length = max_length - current_length
-        # Pad only the sequence dimension (axis 2)
-        pad_spec = ((0, 0), (0, 0), (0, pad_length), (0, 0), (0, 0))
+        # Pad only the sequence dimension (axis 1 for unstacked)
+        pad_spec = ((0, 0), (0, pad_length), (0, 0), (0, 0))
         return KVCache(
-            keys=jnp.pad(self.keys, pad_spec),
-            values=jnp.pad(self.values, pad_spec),
+            keys=[jnp.pad(k, pad_spec) for k in self.keys],
+            values=[jnp.pad(v, pad_spec) for v in self.values],
             cache_position=self.cache_position,
         )
 
     @property
     def num_layers(self) -> int:
         """Number of layers in the cache."""
-        return self.keys.shape[0]
+        return len(self.keys)
 
     @property
     def batch_size(self) -> int:
         """Batch size."""
-        return self.keys.shape[1]
+        return self.keys[0].shape[0]
 
     @property
     def seq_len(self) -> int:
         """Current sequence length."""
-        return self.keys.shape[2]
+        return self.keys[0].shape[1]
 
     def split(self, layer_idx: int) -> tuple[KVCache | None, KVCache | None]:
         """Split the cache at a layer index.
@@ -165,8 +164,8 @@ class KVCache:
         if second is None:
             return first
         return KVCache(
-            keys=jnp.concatenate([first.keys, second.keys], axis=0),
-            values=jnp.concatenate([first.values, second.values], axis=0),
+            keys=first.keys + second.keys,
+            values=first.values + second.values,
             cache_position=second.cache_position,
         )
 

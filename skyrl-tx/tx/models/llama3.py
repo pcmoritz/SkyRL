@@ -101,22 +101,17 @@ class Llama3Attention(nnx.Module):
         q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
         k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
 
-        # Handle KV cache - keep new k,v separate for efficient return
-        k_new, v_new = k, v
+        # Handle KV cache
         if kv_cache is not None:
-            # Update cache and use full cache for attention
             k, v = KVCache.update_layer(kv_cache, k, v, positions)
-            # Return only new values (not full cache) to avoid O(seq) memory per layer
-            return_cache = (k_new, v_new)
-        else:
-            # Prefill: return full k,v for building initial cache
-            return_cache = (k, v)
+
+        updated_cache = (k, v)
 
         is_causal = kv_cache is None
         attn_output = dot_product_attention(q, k, v, attention_mask, is_causal, self.head_dim)
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(output, adapter_indices=adapter_indices), return_cache
+        return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
 
 
 class Llama3MLP(nnx.Module):
