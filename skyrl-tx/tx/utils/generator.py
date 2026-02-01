@@ -342,7 +342,7 @@ class GeneratorMixin:
         )
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(
-            decode_fn, initial_state, xs=jnp.arange(max_new_tokens), unroll=8
+            decode_fn, initial_state, xs=jnp.arange(max_new_tokens)
         )
 
         # Post-process: transpose scan outputs from [Steps, Batch, 1] to [Batch, Steps]
