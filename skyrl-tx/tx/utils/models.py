@@ -356,13 +356,21 @@ def extract_adapter_state(adapter_index: int, lora_params: nnx.GraphState, rank:
 
     def extract_state(path: tuple, p: jnp.ndarray):
         key = path[-2].key
-        if key not in {"lora_A", "lora_B"}:
-            return p
-        assert p.ndim in {3, 4, 5}, f"LoRA parameters must have 3-5 dimensions, got shape {p.shape}"
-        idx = get_adapter_idx(path, adapter_index)
-        if key == "lora_A":
-            return p[idx + (..., slice(None, rank))]
-        return p[idx + (..., slice(None, rank), slice(None))]
+
+        if key in {"lora_A", "lora_B"}:
+            assert p.ndim in {3, 4, 5}, f"LoRA parameters must have 3-5 dimensions, got shape {p.shape}"
+            idx = get_adapter_idx(path, adapter_index)
+            if key == "lora_A":
+                return p[idx + (..., slice(None, rank))]
+            return p[idx + (..., slice(None, rank), slice(None))]
+
+        if key in {"lora_ranks", "lora_scaling"}:
+            # Slice out just this adapter's ranks/scaling
+            idx = get_adapter_idx(path, adapter_index)
+            return p[idx]
+
+        # Don't export other leaves - return None to prevent clobbering
+        return None
 
     return jax.tree.map_with_path(extract_state, lora_params)
 
@@ -374,15 +382,30 @@ def insert_adapter_state(
 ) -> None:
     "Helper function to insert the adapter parameters for a specific adapter index (inverse of extract_adapter_state)."
 
-    def insert_state(path: tuple, p: jax.Array, new: jax.Array):
+    def insert_state(path: tuple, p: jax.Array, new: jax.Array | None):
+        # If new is None (from extract returning None), keep existing value
+        if new is None:
+            return p
+
         key = path[-2].key
-        if key not in {"lora_A", "lora_B"}:
-            return new
-        assert p.ndim in {3, 4, 5}, f"LoRA parameters must have 3-5 dimensions, got shape {p.shape}"
-        idx = get_adapter_idx(path, adapter_index)
+
+        if key in {"lora_ranks", "lora_scaling"}:
+            # Only update this adapter's ranks/scaling, not all adapters
+            idx = get_adapter_idx(path, adapter_index)
+            return p.at[idx].set(new)
+
         if key == "lora_A":
+            assert p.ndim in {3, 4, 5}, f"LoRA parameters must have 3-5 dimensions, got shape {p.shape}"
+            idx = get_adapter_idx(path, adapter_index)
             return p.at[idx + (..., slice(None, rank))].set(new)
-        return p.at[idx + (..., slice(None, rank), slice(None))].set(new)
+
+        if key == "lora_B":
+            assert p.ndim in {3, 4, 5}, f"LoRA parameters must have 3-5 dimensions, got shape {p.shape}"
+            idx = get_adapter_idx(path, adapter_index)
+            return p.at[idx + (..., slice(None, rank), slice(None))].set(new)
+
+        # Keep existing value for any other leaves
+        return p
 
     updated = jax.tree.map_with_path(insert_state, lora_params, new_params)
     nnx.update(lora_params, updated)
