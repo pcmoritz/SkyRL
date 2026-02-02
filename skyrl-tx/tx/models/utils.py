@@ -2,7 +2,7 @@
 
 This module provides:
 - create_stacked_layers: Create decoder layers with stacked weights using nnx.vmap
-- forward_layers: Unified forward pass (scan for training, loop for inference)
+- forward_layers: Unified forward pass using scan for prefill/training, Python loop for decode
 
 Prerequisites:
 - Layers must be created with nnx.vmap (stacked weights)
@@ -65,8 +65,8 @@ def forward_layers(
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
     """Unified forward pass through stacked decoder layers.
 
-    Uses scan for training (efficient, no KV cache needed) and a Python loop
-    for inference (supports list-based KV cache).
+    Uses scan for prefill/training (efficient), Python loop for decode
+    (to support list-based KV cache indexing).
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
@@ -87,29 +87,10 @@ def forward_layers(
     assert num_layers > 0, "num_layers must be positive"
 
     layer_graphdef, layer_state = nnx.split(layers)
+    is_decode = kv_cache is not None
 
-    if is_training:
-        # Training path: use scan for efficiency (no KV cache needed)
-        def body_fn(hs, layer_params):
-            layer = nnx.merge(layer_graphdef, layer_params)
-            new_hs, (k, v) = layer(
-                hs,
-                attention_mask=attention_mask,
-                positions=positions,
-                adapter_indices=adapter_indices,
-                kv_cache=None,
-            )
-            hs_output = new_hs if output_hidden_states else None
-            return new_hs, hs_output
-
-        if gradient_checkpointing:
-            body_fn = jax.checkpoint(body_fn)
-
-        final_hs, all_hs = jax.lax.scan(body_fn, hidden_states, layer_state)
-        all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
-        return final_hs, all_hidden_states, None
-    else:
-        # Inference path: use Python loop to support list-based KV cache
+    if is_decode:
+        # Decode mode: use Python loop to index into list-based KV cache
         all_hidden_states: list[jax.Array] = []
         updated_keys: list[jax.Array] = []
         updated_values: list[jax.Array] = []
@@ -118,11 +99,11 @@ def forward_layers(
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
-            # Get the layer params for this layer by indexing into stacked state
+            # Get per-layer parameters by indexing into stacked state
             layer_params = jax.tree.map(lambda x: x[layer_idx], layer_state)
-            layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if kv_cache else None
-
             layer = nnx.merge(layer_graphdef, layer_params)
+            layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx])
+
             hidden_states, (k, v) = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -133,5 +114,44 @@ def forward_layers(
             updated_keys.append(k)
             updated_values.append(v)
 
-        new_kv_cache = KVCache.update(kv_cache, updated_keys, updated_values, positions, attention_mask)
+        new_kv_cache = KVCache(
+            keys=updated_keys,
+            values=updated_values,
+            cache_position=kv_cache.cache_position + positions.shape[1],
+        )
         return hidden_states, all_hidden_states, new_kv_cache
+
+    # Prefill/training mode: use scan for efficiency with gradient checkpointing
+    def body_fn(hs, layer_params):
+        layer = nnx.merge(layer_graphdef, layer_params)
+        new_hs, (k, v) = layer(
+            hs,
+            attention_mask=attention_mask,
+            positions=positions,
+            adapter_indices=adapter_indices,
+            kv_cache=None,
+        )
+        hs_output = new_hs if output_hidden_states else None
+
+        if is_training:
+            # Avoid accumulating large KV tensors for training.
+            k = v = None
+        return new_hs, (hs_output, k, v)
+
+    if gradient_checkpointing:
+        body_fn = jax.checkpoint(body_fn)
+
+    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, layer_state)
+
+    all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
+
+    if is_training:
+        new_kv_cache = None
+    else:
+        # Prefill mode: convert stacked scan outputs to list format
+        cache_position = attention_mask.sum(axis=1)
+        keys_list = [all_keys[i] for i in range(num_layers)]
+        values_list = [all_values[i] for i in range(num_layers)]
+        new_kv_cache = KVCache(keys=keys_list, values=values_list, cache_position=cache_position)
+
+    return final_hs, all_hidden_states, new_kv_cache
