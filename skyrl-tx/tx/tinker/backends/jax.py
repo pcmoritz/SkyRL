@@ -825,6 +825,9 @@ class JaxBackendImpl(AbstractBackend):
         if checkpoint is None:
             raise FileNotFoundError(f"Training checkpoint not found in {checkpoint_path}")
 
+        # Convert any orbax ValueMetadataEntry objects to actual arrays
+        checkpoint = jax.tree.map(lambda x: x.value if hasattr(x, "value") else x, checkpoint)
+
         self._insert_checkpoint_data(model_id, checkpoint)
         logger.info(f"Loaded training checkpoint from {checkpoint_path}")
 
