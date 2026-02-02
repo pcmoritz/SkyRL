@@ -2,11 +2,11 @@
 
 This module provides:
 - create_stacked_layers: Create decoder layers with stacked weights using nnx.vmap
-- forward_layers: Unified forward pass using scan (skips KV cache during training)
+- forward_layers: Forward pass using scan for training/prefill and loops for decode
 
 Prerequisites:
 - Layers must be created with nnx.vmap (stacked weights)
-- KVCache must use stacked format: (num_layers, batch, seq, heads, dim)
+- KVCache uses list format: list of (batch, seq, heads, dim) arrays per layer
 """
 
 from typing import Callable
@@ -63,7 +63,9 @@ def forward_layers(
     gradient_checkpointing: bool,
     is_training: bool = False,
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
-    """Unified forward pass through stacked decoder layers using scan.
+    """Forward pass through stacked decoder layers.
+
+    Uses jax.lax.scan for training and prefill, Python loops for decode.
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
@@ -86,15 +88,44 @@ def forward_layers(
     layer_graphdef, layer_state = nnx.split(layers)
     is_decode = kv_cache is not None
 
-    def body_fn(hs, xs):
-        # Unpack xs: scan automatically slices the leading dimension of layer_state
-        if is_decode:
-            layer_params, layer_k, layer_v = xs
-            layer_kv = (layer_k, layer_v)
-        else:
-            layer_params = xs
-            layer_kv = None
+    if is_decode:
+        # Decode mode: use Python loop for layer-by-layer processing
+        all_hidden_states = [hidden_states] if output_hidden_states else []
+        new_keys = []
+        new_values = []
 
+        for i in range(num_layers):
+            # Get the layer params for this layer by indexing into the stacked state
+            layer_params = jax.tree.map(lambda x, i=i: x[i], layer_state)
+            layer = nnx.merge(layer_graphdef, layer_params)
+
+            # Get the KV cache for this layer
+            layer_kv = (kv_cache.keys[i], kv_cache.values[i])
+
+            hidden_states, (k, v) = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                positions=positions,
+                adapter_indices=adapter_indices,
+                kv_cache=layer_kv,
+            )
+
+            new_keys.append(k)
+            new_values.append(v)
+
+            if output_hidden_states and i < num_layers - 1:
+                all_hidden_states.append(hidden_states)
+
+        new_kv_cache = KVCache(
+            keys=new_keys,
+            values=new_values,
+            cache_position=kv_cache.cache_position + positions.shape[1],
+        )
+
+        return hidden_states, all_hidden_states, new_kv_cache
+
+    # Training or prefill mode: use scan
+    def body_fn(hs, layer_params):
         # Merge using the sliced params directly - no manual gather needed
         layer = nnx.merge(layer_graphdef, layer_params)
         new_hs, (k, v) = layer(
@@ -102,7 +133,7 @@ def forward_layers(
             attention_mask=attention_mask,
             positions=positions,
             adapter_indices=adapter_indices,
-            kv_cache=layer_kv,
+            kv_cache=None,
         )
         hs_output = new_hs if output_hidden_states else None
 
@@ -117,24 +148,17 @@ def forward_layers(
     # Pass layer_state as xs so scan handles the slicing automatically.
     # This avoids capturing layer_state as a closure and manually gathering,
     # which causes slow XLA compilation with jax.checkpoint.
-    xs = (layer_state, kv_cache.keys, kv_cache.values) if is_decode else layer_state
-
-    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, xs)
+    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, layer_state)
 
     # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
     all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
 
     if is_training:
         new_kv_cache = None
-    elif is_decode:
-        # Decode mode: scan stacked the per-layer updated caches into (num_layers, ...)
-        new_kv_cache = KVCache(
-            keys=all_keys,
-            values=all_values,
-            cache_position=kv_cache.cache_position + positions.shape[1],
-        )
     else:
-        # Prefill mode: build cache from collected k,v outputs
-        new_kv_cache = KVCache.from_layer_outputs(all_keys, all_values, attention_mask)
+        # Prefill mode: build cache from collected k,v outputs (convert stacked to list)
+        keys_list = [all_keys[i] for i in range(num_layers)]
+        values_list = [all_values[i] for i in range(num_layers)]
+        new_kv_cache = KVCache.from_layer_outputs(keys_list, values_list, attention_mask)
 
     return final_hs, all_hidden_states, new_kv_cache
