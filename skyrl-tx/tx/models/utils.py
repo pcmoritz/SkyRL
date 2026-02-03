@@ -61,6 +61,15 @@ def create_stacked_layers(
 
     stacked_state = jax.vmap(init_layer_state)(keys)
 
+    # Update sharding_names metadata to add leading None for the layer dimension
+    # jax.vmap stacks arrays correctly but doesn't update the metadata
+    def update_sharding_names(var):
+        if hasattr(var, 'sharding_names') and var.sharding_names is not None:
+            return var.replace(sharding_names=(None,) + tuple(var.sharding_names))
+        return var
+
+    stacked_state = jax.tree.map(update_sharding_names, stacked_state)
+
     # Merge back into a module with the shared graphdef
     return nnx.merge(graphdef, stacked_state)
 
