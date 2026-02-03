@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from tokenizers.decoders import DecodeStream
 import tx.utils.models
+from tx.models.utils import extract_layer_params
 from tx.tinker import types
 
 
@@ -177,6 +178,7 @@ class DecodeState:
     last_positions: jax.Array
     logits: jax.Array
     stop_pos: jax.Array  # Position where stop token was found
+    pre_extracted_layers: tuple  # (layer_graphdef, all_layer_params) for efficient decode
 
 
 @dataclass
@@ -282,6 +284,9 @@ class GeneratorMixin:
 
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
+        # Pre-extract layer params once before the decode loop (avoid re-extracting each iteration)
+        pre_extracted_layers = extract_layer_params(model.model.layers, model.config.num_hidden_layers)
+
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
             # Sample next token
@@ -318,6 +323,7 @@ class GeneratorMixin:
                 positions=s.last_positions + 1,
                 kv_cache=s.kv_cache,
                 adapter_indices=adapter_indices,
+                pre_extracted_layers=s.pre_extracted_layers,
             )
             # Compute logits for the next token
             next_logits = model.compute_logits(outputs.last_hidden_state, adapter_indices)[:, 0, :]
@@ -328,6 +334,7 @@ class GeneratorMixin:
                 last_positions=s.last_positions + 1,
                 logits=next_logits,
                 stop_pos=stop_pos,
+                pre_extracted_layers=s.pre_extracted_layers,
             )
             return next_state, (next_token, sampled_logprob)
 
@@ -338,6 +345,7 @@ class GeneratorMixin:
             last_positions=last_token_idx[:, None],
             logits=last_logits,
             stop_pos=jnp.full((input_ids.shape[0],), -1),
+            pre_extracted_layers=pre_extracted_layers,
         )
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(

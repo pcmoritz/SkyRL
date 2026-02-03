@@ -348,6 +348,7 @@ class Qwen3Model(nnx.Module):
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
         is_training: bool = False,
+        pre_extracted_layers: tuple | None = None,
     ) -> ModelOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -366,6 +367,7 @@ class Qwen3Model(nnx.Module):
             output_hidden_states=output_hidden_states,
             gradient_checkpointing=self.config.gradient_checkpointing,
             is_training=is_training,
+            pre_extracted_layers=pre_extracted_layers,
         )
 
         hidden_states = self.norm(hidden_states)
@@ -420,6 +422,7 @@ class Qwen3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProce
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
         is_training: bool = False,
+        pre_extracted_layers: tuple | None = None,
     ) -> CausalLMOutput:
         if positions is None:
             positions = jnp.arange(attention_mask.shape[1])[None, :]
@@ -432,6 +435,7 @@ class Qwen3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProce
             adapter_indices=adapter_indices,
             kv_cache=kv_cache,
             is_training=is_training,
+            pre_extracted_layers=pre_extracted_layers,
         )
 
         return CausalLMOutput(

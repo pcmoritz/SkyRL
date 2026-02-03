@@ -17,6 +17,27 @@ import jax
 from tx.utils.generator import KVCache
 
 
+def extract_layer_params(layers: nnx.Module, num_layers: int) -> tuple:
+    """Pre-extract layer params from stacked layers for efficient decode.
+
+    This extracts all per-layer params once, so they don't need to be
+    re-extracted on each decode iteration.
+
+    Args:
+        layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
+        num_layers: Number of decoder layers.
+
+    Returns:
+        Tuple of (layer_graphdef, all_layer_params) where all_layer_params is a list
+        of per-layer params that can be passed to forward_layers via pre_extracted_layers.
+    """
+    layer_graphdef, layer_state = nnx.split(layers)
+    all_layer_params = [
+        jax.tree.map(lambda x, i=i: x[i], layer_state) for i in range(num_layers)
+    ]
+    return (layer_graphdef, all_layer_params)
+
+
 def create_stacked_layers(
     create_layer_fn: Callable[[nnx.Rngs], nnx.Module],
     num_layers: int,
@@ -62,6 +83,7 @@ def forward_layers(
     output_hidden_states: bool,
     gradient_checkpointing: bool,
     is_training: bool = False,
+    pre_extracted_layers: tuple | None = None,
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
     """Forward pass through stacked decoder layers.
 
@@ -78,6 +100,9 @@ def forward_layers(
         output_hidden_states: Whether to return intermediate hidden states.
         gradient_checkpointing: Whether to use gradient checkpointing (training only).
         is_training: Whether in training mode. Skips KV cache to save memory.
+        pre_extracted_layers: Optional pre-extracted layer params for decode mode.
+            Tuple of (layer_graphdef, all_layer_params) where all_layer_params is a list
+            of per-layer params. When provided, avoids re-extracting params on each decode step.
 
     Returns:
         Tuple of (final_hidden_states, all_hidden_states, kv_cache).
@@ -85,8 +110,15 @@ def forward_layers(
     """
     assert num_layers > 0, "num_layers must be positive"
 
-    layer_graphdef, layer_state = nnx.split(layers)
     is_decode = kv_cache is not None
+
+    # Use pre-extracted layers if provided (for decode), otherwise split here
+    if pre_extracted_layers is not None:
+        layer_graphdef, all_layer_params = pre_extracted_layers
+        layer_state = None  # Not needed when pre-extracted
+    else:
+        layer_graphdef, layer_state = nnx.split(layers)
+        all_layer_params = None
 
     if is_decode:
         # Decode mode: use Python loop for layer-by-layer processing
@@ -94,10 +126,14 @@ def forward_layers(
         new_keys = []
         new_values = []
 
+        # Use pre-extracted params if available, otherwise extract from layer_state
+        if all_layer_params is None:
+            all_layer_params = [
+                jax.tree.map(lambda x, i=i: x[i], layer_state) for i in range(num_layers)
+            ]
+
         for i in range(num_layers):
-            # Get the layer params for this layer by indexing into the stacked state
-            layer_params = jax.tree.map(lambda x, i=i: x[i], layer_state)
-            layer = nnx.merge(layer_graphdef, layer_params)
+            layer = nnx.merge(layer_graphdef, all_layer_params[i])
 
             # Get the KV cache for this layer
             layer_kv = (kv_cache.keys[i], kv_cache.values[i])
