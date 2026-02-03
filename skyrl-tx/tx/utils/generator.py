@@ -4,11 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import functools
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 from tokenizers.decoders import DecodeStream
 import tx.utils.models
-from tx.models.utils import extract_layer_params
 from tx.tinker import types
 
 
@@ -285,7 +285,12 @@ class GeneratorMixin:
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
 
         # Pre-extract layer params once before the decode loop (avoid re-extracting each iteration)
-        pre_extracted_layers = extract_layer_params(model.model.layers, model.config.num_hidden_layers)
+        layer_graphdef, layer_state = nnx.split(model.model.layers)
+        num_layers = model.config.num_hidden_layers
+        all_layer_params = [
+            jax.tree.map(lambda x, i=i: x[i], layer_state) for i in range(num_layers)
+        ]
+        pre_extracted_layers = (layer_graphdef, all_layer_params)
 
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
