@@ -2,7 +2,7 @@
 
 This module provides:
 - create_stacked_layers: Create decoder layers with stacked weights using nnx.vmap
-- forward_layers: Forward pass using scan for training/prefill and loops for decode
+- forward_layers: Forward pass using scan for training and loops for prefill/decode
 
 Prerequisites:
 - Layers must be created with nnx.vmap (stacked weights)
@@ -65,7 +65,7 @@ def forward_layers(
 ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
     """Forward pass through stacked decoder layers.
 
-    Uses jax.lax.scan for training and prefill, Python loops for decode.
+    Uses jax.lax.scan for training and Python loops for prefill/decode.
 
     Args:
         layers: Stacked decoder layers (created with create_stacked_layers/nnx.vmap).
@@ -124,41 +124,60 @@ def forward_layers(
 
         return hidden_states, all_hidden_states, new_kv_cache
 
-    # Training or prefill mode: use scan
-    def body_fn(hs, layer_params):
-        # Merge using the sliced params directly - no manual gather needed
+    if is_training:
+        # Training mode: use scan for efficiency with gradient checkpointing
+        def body_fn(hs, layer_params):
+            # Merge using the sliced params directly - no manual gather needed
+            layer = nnx.merge(layer_graphdef, layer_params)
+            new_hs, (k, v) = layer(
+                hs,
+                attention_mask=attention_mask,
+                positions=positions,
+                adapter_indices=adapter_indices,
+                kv_cache=None,
+            )
+            hs_output = new_hs if output_hidden_states else None
+            # Avoid accumulating large KV tensors for training.
+            return new_hs, (hs_output, None, None)
+
+        if gradient_checkpointing:
+            body_fn = jax.checkpoint(body_fn)
+
+        # Pass layer_state as xs so scan handles the slicing automatically.
+        # This avoids capturing layer_state as a closure and manually gathering,
+        # which causes slow XLA compilation with jax.checkpoint.
+        final_hs, (all_hs, _, _) = jax.lax.scan(body_fn, hidden_states, layer_state)
+
+        # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
+        all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
+
+        return final_hs, all_hidden_states, None
+
+    # Prefill mode (sampling): use Python loop with unstacked KV cache
+    all_hidden_states = [hidden_states] if output_hidden_states else []
+    new_keys = []
+    new_values = []
+
+    for i in range(num_layers):
+        # Get the layer params for this layer by indexing into the stacked state
+        layer_params = jax.tree.map(lambda x, i=i: x[i], layer_state)
         layer = nnx.merge(layer_graphdef, layer_params)
-        new_hs, (k, v) = layer(
-            hs,
+
+        hidden_states, (k, v) = layer(
+            hidden_states,
             attention_mask=attention_mask,
             positions=positions,
             adapter_indices=adapter_indices,
             kv_cache=None,
         )
-        hs_output = new_hs if output_hidden_states else None
 
-        if is_training:
-            # Avoid accumulating large KV tensors for training.
-            k = v = None
-        return new_hs, (hs_output, k, v)
+        new_keys.append(k)
+        new_values.append(v)
 
-    if gradient_checkpointing:
-        body_fn = jax.checkpoint(body_fn)
+        if output_hidden_states and i < num_layers - 1:
+            all_hidden_states.append(hidden_states)
 
-    # Pass layer_state as xs so scan handles the slicing automatically.
-    # This avoids capturing layer_state as a closure and manually gathering,
-    # which causes slow XLA compilation with jax.checkpoint.
-    final_hs, (all_hs, all_keys, all_values) = jax.lax.scan(body_fn, hidden_states, layer_state)
+    # Prefill mode: build cache from collected k,v outputs
+    new_kv_cache = KVCache.from_layer_outputs(new_keys, new_values, attention_mask)
 
-    # [embed, layer0_out, ..., layer(N-2)_out]; final layer output gets normed by caller
-    all_hidden_states = [hidden_states] + list(all_hs[:-1]) if output_hidden_states else []
-
-    if is_training:
-        new_kv_cache = None
-    else:
-        # Prefill mode: build cache from collected k,v outputs (convert stacked to list)
-        keys_list = [all_keys[i] for i in range(num_layers)]
-        values_list = [all_values[i] for i in range(num_layers)]
-        new_kv_cache = KVCache.from_layer_outputs(keys_list, values_list, attention_mask)
-
-    return final_hs, all_hidden_states, new_kv_cache
+    return hidden_states, all_hidden_states, new_kv_cache
