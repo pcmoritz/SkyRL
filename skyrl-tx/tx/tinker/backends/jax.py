@@ -152,7 +152,7 @@ class JaxBackendImpl(AbstractBackend):
     - Supports both FORWARD and FORWARD_BACKWARD request types
     """
 
-    _AUTO_BATCH_MEMORY_UTILIZATION = 0.90
+    _AUTO_BATCH_MEMORY_UTILIZATION = 0.85
     _AUTO_BATCH_RESERVED_BYTES = 512 * 1024 * 1024
 
     def __init__(self, base_model: str, config: JaxBackendConfig):
@@ -256,12 +256,15 @@ class JaxBackendImpl(AbstractBackend):
 
     @staticmethod
     def _xla_total_bytes(memory_analysis: Any) -> int | None:
+        """Estimate peak runtime memory from XLA compiled memory analysis.
+
+        Uses component-based calculation (args + temp + outputs - alias) rather
+        than ``total_allocation_size`` which sums ALL individual buffer
+        allocations without accounting for buffer reuse at runtime and therefore
+        vastly overestimates actual peak memory.
+        """
         if memory_analysis is None:
             return None
-        for attr in ("total_allocation_size", "total_size_in_bytes", "total_size"):
-            value = getattr(memory_analysis, attr, None)
-            if value is not None:
-                return int(value)
         temp = int(getattr(memory_analysis, "temp_size_in_bytes", 0) or 0)
         args = int(getattr(memory_analysis, "argument_size_in_bytes", 0) or 0)
         outputs = int(getattr(memory_analysis, "output_size_in_bytes", 0) or 0)
@@ -278,9 +281,26 @@ class JaxBackendImpl(AbstractBackend):
             compiled = compile_fn()
         except Exception:
             return None
-        total_bytes = self._xla_total_bytes(compiled.memory_analysis())
+        ma = compiled.memory_analysis()
+        total_bytes = self._xla_total_bytes(ma)
         if total_bytes is None:
             return None
+        # Log detailed breakdown for debugging batch-size selection.
+        if ma is not None:
+            parts = {
+                attr: getattr(ma, attr, None)
+                for attr in (
+                    "temp_size_in_bytes",
+                    "argument_size_in_bytes",
+                    "output_size_in_bytes",
+                    "alias_size_in_bytes",
+                    "host_temp_size_in_bytes",
+                    "total_allocation_size",
+                )
+                if getattr(ma, attr, None) is not None
+            }
+            details = ", ".join(f"{k}={v / 1e9:.2f}GB" for k, v in parts.items())
+            logger.info(f"XLA memory for {key}: peak={total_bytes / 1e9:.2f}GB ({details})")
         self._xla_memory_cache[key] = total_bytes
         return total_bytes
 
@@ -350,6 +370,16 @@ class JaxBackendImpl(AbstractBackend):
             ).compile(),
         )
 
+    # Reference batch size for the second compilation point.  Must be large
+    # enough that batch-dependent memory (KV cache, activations) dominates over
+    # XLA optimisation noise, but small enough to compile quickly.
+    _AUTO_BATCH_REFERENCE_BS = 16
+    # Safety multiplier applied to the XLA-estimated per-sample cost.  XLA
+    # static analysis underestimates actual runtime memory because it does not
+    # account for NCCL communication buffers, BFC allocator fragmentation, or
+    # runtime memory that lives outside the compiled HLO.
+    _AUTO_BATCH_PER_SAMPLE_SAFETY = 1.5
+
     def _max_fitting_batch_size(
         self,
         *,
@@ -362,25 +392,49 @@ class JaxBackendImpl(AbstractBackend):
             logger.warning(f"Falling back to single-item {mode} batching: device memory limits are unavailable")
             return 1
 
-        low = 1
-        high = max(1, total)
-        best = 1
-        found = False
-        while low <= high:
-            mid = (low + high) // 2
-            needed = estimate_bytes_fn(mid)
-            if needed is None:
-                high = mid - 1
-                continue
-            found = True
-            if needed <= capacity:
-                best = mid
-                low = mid + 1
-            else:
-                high = mid - 1
-        if not found:
+        # Compile at bs=1 to get baseline memory usage.
+        bytes_1 = estimate_bytes_fn(1)
+        if bytes_1 is None:
             logger.warning(f"Falling back to single-item {mode} batching: XLA memory analysis failed")
             return 1
+        if bytes_1 > capacity:
+            logger.warning(f"Even batch_size=1 exceeds memory capacity for {mode}")
+            return 1
+        if total <= 1:
+            return 1
+
+        # Compile at a well-separated reference batch size so that
+        # batch-dependent memory (KV cache, activations) dominates over
+        # noise from different XLA optimisation choices at small batch sizes.
+        ref_bs = min(total, self._AUTO_BATCH_REFERENCE_BS)
+        bytes_ref = estimate_bytes_fn(ref_bs) if ref_bs > 1 else None
+
+        per_sample: float | None = None
+        if bytes_ref is not None and bytes_ref > bytes_1 and ref_bs > 1:
+            per_sample = (bytes_ref - bytes_1) / (ref_bs - 1) * self._AUTO_BATCH_PER_SAMPLE_SAFETY
+            best = 1 + int((capacity - bytes_1) / per_sample)
+        else:
+            # Memory didn't grow from bs=1 → bs=ref_bs.  This happens when the
+            # XLA compiler applies different optimisations at different batch
+            # sizes, making temp buffers shrink or stay flat.  In this regime
+            # the per-sample cost is very low relative to capacity.
+            #
+            # Heuristic: we know ref_bs samples fit in `base` bytes of XLA
+            # memory.  Scale proportionally with a 2× safety margin for runtime
+            # overhead not captured by XLA static analysis.
+            base = max(bytes_1, bytes_ref or bytes_1)
+            best = max(ref_bs, ref_bs * int(capacity / (2 * base))) if base > 0 else total
+            per_sample = None
+
+        best = max(1, min(best, total))
+        logger.info(
+            f"Auto-selected {mode} max batch size: {best} "
+            f"(capacity: {capacity / 1e9:.2f} GB, "
+            f"bs=1: {bytes_1 / 1e9:.2f} GB, "
+            f"bs={ref_bs}: {(bytes_ref or 0) / 1e9:.2f} GB"
+            + (f", per_sample: {per_sample / 1e9:.2f} GB" if per_sample else ", per_sample: indeterminate")
+            + ")"
+        )
         return best
 
     @contextmanager
