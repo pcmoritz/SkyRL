@@ -68,11 +68,11 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     )
     train_micro_batch_size: int = Field(
         default=0,
-        description="Micro-batch size (measured in number of sequences) for gradient accumulation; 0 means disabled (use full batch)",
+        description="Micro-batch size (measured in number of sequences) for gradient accumulation; 0 means auto-select",
     )
     sample_max_num_sequences: int = Field(
         default=0,
-        description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means disabled (use full batch)",
+        description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means auto-select",
     )
     enforce_eager: bool = Field(default=False, description="Disable JAX JIT compilation")
     shard_attention_heads: bool = Field(
@@ -152,11 +152,28 @@ class JaxBackendImpl(AbstractBackend):
     - Supports both FORWARD and FORWARD_BACKWARD request types
     """
 
+    _AUTO_BATCH_MEMORY_UTILIZATION = 0.90
+    _AUTO_BATCH_RESERVED_BYTES = 512 * 1024 * 1024
+
     def __init__(self, base_model: str, config: JaxBackendConfig):
         """Initialize JAX LoRA backend."""
         self.base_model = base_model
         self.config = config
         self.metrics = types.EngineMetrics()
+        self._xla_memory_cache: dict[tuple, int] = {}
+
+        # Auto batch-size calibration state (to avoid compiling many probe shapes)
+        self._auto_train_micro_bs: int | None = None
+        self._auto_train_seq_len: int = 0
+        self._auto_sample_bs: int | None = None
+        self._auto_sample_effective_len: int = 0
+        self._auto_sample_max_new_tokens: int = 0
+        self._auto_sample_max_stop_tokens: int = 0
+        self._auto_sample_prompt_logprobs: bool = False
+        self._auto_sample_max_top_k: int = 0
+        self._auto_sample_use_top_p: bool = False
+        self._auto_train_warned = False
+        self._auto_sample_warned = False
 
         # Initialize the shared base model with LoRA config
         checkpoint_path = resolve_model_path(base_model)
@@ -208,26 +225,262 @@ class JaxBackendImpl(AbstractBackend):
         )
 
         if config.train_micro_batch_size <= 0:
-            logger.warning(
-                '"train_micro_batch_size" is not set. This can lead to OOMs. '
-                'Consider setting "train_micro_batch_size" via --backend-config to limit memory usage during training. '
-                "In the future, we plan to add a heuristic to set this automatically: "
-                "https://github.com/NovaSky-AI/SkyRL/issues/1048"
-            )
+            logger.info('"train_micro_batch_size" is set to 0; auto-selecting via XLA memory analysis.')
         if config.sample_max_num_sequences <= 0:
-            logger.warning(
-                '"sample_max_num_sequences" is not set. This can lead to OOMs. '
-                'Consider setting "sample_max_num_sequences" via --backend-config to limit memory usage during sampling. '
-                "In the future, we plan to add a heuristic to set this automatically: "
-                "https://github.com/NovaSky-AI/SkyRL/issues/1048"
-            )
+            logger.info('"sample_max_num_sequences" is set to 0; auto-selecting via XLA memory analysis.')
 
         self._create_loss_and_grad_fn()
 
-    def _micro_batch_size(self, total: int) -> int:
-        """Return effective micro-batch size; 0/absent => disabled (use full fused batch)."""
+    def _micro_batch_size(self, total: int, seq_len: int | None = None, model_pass_fn: Callable | None = None) -> int:
+        """Return effective micro-batch size."""
         mb = self.config.train_micro_batch_size
-        return total if mb <= 0 else max(1, min(mb, total))
+        if mb > 0:
+            return max(1, min(mb, total))
+        if seq_len is None or model_pass_fn is None:
+            return total
+
+        seq_len = round_up_seq_len(max(1, seq_len))
+        if self._auto_train_micro_bs is None or seq_len > self._auto_train_seq_len:
+            calibrated = self._calibrate_train_micro_batch_size(seq_len, model_pass_fn)
+            if calibrated is not None:
+                self._auto_train_micro_bs = calibrated
+                self._auto_train_seq_len = seq_len
+                logger.info(
+                    f"Auto-calibrated train micro-batch size={calibrated} at seq_len={seq_len}; reusing this size for shorter sequences"
+                )
+            else:
+                self._log_auto_fallback_once("train", "XLA memory analysis unavailable")
+                self._auto_train_micro_bs = 1
+                self._auto_train_seq_len = seq_len
+
+        return max(1, min(self._auto_train_micro_bs, total))
+
+    def _sample_batch_size(
+        self,
+        total: int,
+        *,
+        model: nnx.Module,
+        max_prompt_len: int,
+        max_new_tokens: int,
+        max_stop_tokens: int,
+        prompt_logprobs: bool,
+        max_top_k: int,
+        use_top_p: bool,
+    ) -> int:
+        if self.config.sample_max_num_sequences > 0:
+            return max(1, min(self.config.sample_max_num_sequences, total))
+
+        effective_len = round_up_seq_len(max(1, max_prompt_len + max_new_tokens))
+        needs_recalibration = (
+            self._auto_sample_bs is None
+            or effective_len > self._auto_sample_effective_len
+            or max_new_tokens > self._auto_sample_max_new_tokens
+            or max_stop_tokens > self._auto_sample_max_stop_tokens
+            or (prompt_logprobs and not self._auto_sample_prompt_logprobs)
+            or max_top_k > self._auto_sample_max_top_k
+            or (use_top_p and not self._auto_sample_use_top_p)
+        )
+        if needs_recalibration:
+            calibrated = self._calibrate_sample_batch_size(
+                model=model,
+                max_prompt_len=max_prompt_len,
+                max_new_tokens=max_new_tokens,
+                max_stop_tokens=max_stop_tokens,
+                prompt_logprobs=prompt_logprobs,
+                max_top_k=max_top_k,
+                use_top_p=use_top_p,
+            )
+            if calibrated is not None:
+                self._auto_sample_bs = calibrated
+                self._auto_sample_effective_len = effective_len
+                self._auto_sample_max_new_tokens = max_new_tokens
+                self._auto_sample_max_stop_tokens = max_stop_tokens
+                self._auto_sample_prompt_logprobs = prompt_logprobs or self._auto_sample_prompt_logprobs
+                self._auto_sample_max_top_k = max_top_k
+                self._auto_sample_use_top_p = use_top_p or self._auto_sample_use_top_p
+                logger.info(
+                    f"Auto-calibrated sample batch size={calibrated} at effective_seq_len={effective_len}; reusing this size for smaller workloads"
+                )
+            else:
+                self._log_auto_fallback_once("sample", "XLA memory analysis unavailable")
+                self._auto_sample_bs = 1
+
+        return max(1, min(self._auto_sample_bs, total))
+
+    def _log_auto_fallback_once(self, mode: str, reason: str) -> None:
+        attr = "_auto_train_warned" if mode == "train" else "_auto_sample_warned"
+        if not getattr(self, attr):
+            logger.warning(f"Falling back to single-item {mode} batching: {reason}")
+            setattr(self, attr, True)
+
+    def _xla_capacity_bytes(self) -> int | None:
+        limits = []
+        for device in jax.local_devices():
+            stats_fn = getattr(device, "memory_stats", None)
+            if stats_fn is None:
+                continue
+            stats = stats_fn()
+            if not stats:
+                continue
+            bytes_limit = stats.get("bytes_limit")
+            if bytes_limit is not None:
+                limits.append(int(bytes_limit))
+        if not limits:
+            return None
+        budget = int(min(limits) * self._AUTO_BATCH_MEMORY_UTILIZATION) - self._AUTO_BATCH_RESERVED_BYTES
+        return max(1, budget)
+
+    @staticmethod
+    def _batch_ceil_to_fsdp(batch_size: int, fsdp_size: int) -> int:
+        if fsdp_size <= 1:
+            return batch_size
+        return ((batch_size + fsdp_size - 1) // fsdp_size) * fsdp_size
+
+    @staticmethod
+    def _xla_total_bytes(memory_analysis: Any) -> int | None:
+        if memory_analysis is None:
+            return None
+        for attr in ("total_allocation_size", "total_size_in_bytes", "total_size"):
+            value = getattr(memory_analysis, attr, None)
+            if value is not None:
+                return int(value)
+        temp = int(getattr(memory_analysis, "temp_size_in_bytes", 0) or 0)
+        args = int(getattr(memory_analysis, "argument_size_in_bytes", 0) or 0)
+        outputs = int(getattr(memory_analysis, "output_size_in_bytes", 0) or 0)
+        alias = int(getattr(memory_analysis, "alias_size_in_bytes", 0) or 0)
+        host_temp = int(getattr(memory_analysis, "host_temp_size_in_bytes", 0) or 0)
+        total = temp + args + outputs + host_temp - alias
+        return total if total > 0 else None
+
+    def _compile_memory_bytes(self, key: tuple, compile_fn: Callable[[], Any]) -> int | None:
+        cached = self._xla_memory_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            compiled = compile_fn()
+        except Exception:
+            return None
+        total_bytes = self._xla_total_bytes(compiled.memory_analysis())
+        if total_bytes is None:
+            return None
+        self._xla_memory_cache[key] = total_bytes
+        return total_bytes
+
+    def _estimate_train_memory_bytes(self, batch_size: int, seq_len: int, model_pass_fn: Callable) -> int | None:
+        if self.config.enforce_eager or not hasattr(model_pass_fn, "lower"):
+            return None
+        fsdp_size = max(1, int(self.mesh.shape["fsdp"]))
+        padded_bs = self._batch_ceil_to_fsdp(batch_size, fsdp_size)
+        mode = "forward_backward" if model_pass_fn is self._forward_backward_and_accumulate else "forward"
+        key = ("train", mode, padded_bs, seq_len)
+        shape_2d = (padded_bs, seq_len)
+        shape_1d = (padded_bs,)
+        return self._compile_memory_bytes(
+            key,
+            lambda: model_pass_fn.lower(
+                self.accumulated_grads,
+                self.lora_params,
+                self.non_lora_params,
+                jax.ShapeDtypeStruct(shape_2d, np.int32),
+                jax.ShapeDtypeStruct(shape_2d, np.int32),
+                jax.ShapeDtypeStruct(shape_1d, np.int32),
+                jax.ShapeDtypeStruct(shape_2d, np.int32),
+                jax.ShapeDtypeStruct(shape_2d, np.float32),
+                jax.ShapeDtypeStruct(shape_1d, np.int32),
+                jax.ShapeDtypeStruct(shape_2d, np.float32),
+                jax.ShapeDtypeStruct(shape_2d, np.float32),
+            ).compile(),
+        )
+
+    def _calibrate_train_micro_batch_size(self, seq_len: int, model_pass_fn: Callable) -> int | None:
+        capacity = self._xla_capacity_bytes()
+        if capacity is None:
+            return None
+        fsdp_size = max(1, int(self.mesh.shape["fsdp"]))
+        probe_bs = fsdp_size
+        needed = self._estimate_train_memory_bytes(probe_bs, seq_len, model_pass_fn)
+        if needed is None or needed <= 0:
+            return None
+        per_seq = needed / probe_bs
+        return max(1, int(capacity / max(per_seq, 1.0)))
+
+    def _estimate_sample_memory_bytes(
+        self,
+        model: nnx.Module,
+        *,
+        batch_size: int,
+        max_prompt_len: int,
+        max_new_tokens: int,
+        max_stop_tokens: int,
+        prompt_logprobs: bool,
+        max_top_k: int,
+        use_top_p: bool,
+    ) -> int | None:
+        if self.config.enforce_eager or not hasattr(model._prefill_and_decode, "lower"):
+            return None
+        prompt_len = round_up_seq_len(max(1, max_prompt_len))
+        max_new_tokens = max(1, max_new_tokens)
+        max_stop_tokens = max(1, max_stop_tokens)
+        max_length = round_up_seq_len(prompt_len + max_new_tokens)
+        key = (
+            "sample",
+            batch_size,
+            prompt_len,
+            max_new_tokens,
+            max_stop_tokens,
+            prompt_logprobs,
+            max_top_k,
+            use_top_p,
+        )
+        return self._compile_memory_bytes(
+            key,
+            lambda: model._prefill_and_decode.lower(
+                model,
+                jax.ShapeDtypeStruct((batch_size, prompt_len), np.int32),
+                jax.ShapeDtypeStruct((batch_size, prompt_len), np.int32),
+                max_length,
+                max_new_tokens,
+                jax.ShapeDtypeStruct((batch_size,), np.int32),
+                jax.ShapeDtypeStruct((batch_size,), np.float32),
+                jax.ShapeDtypeStruct((batch_size, 2), np.uint32),
+                jax.ShapeDtypeStruct((batch_size, max_stop_tokens), np.int32),
+                jax.ShapeDtypeStruct((batch_size,), np.int32),
+                jax.ShapeDtypeStruct((batch_size,), np.float32),
+                max_top_k,
+                use_top_p,
+                prompt_logprobs,
+            ).compile(),
+        )
+
+    def _calibrate_sample_batch_size(
+        self,
+        *,
+        model: nnx.Module,
+        max_prompt_len: int,
+        max_new_tokens: int,
+        max_stop_tokens: int,
+        prompt_logprobs: bool,
+        max_top_k: int,
+        use_top_p: bool,
+    ) -> int | None:
+        capacity = self._xla_capacity_bytes()
+        if capacity is None:
+            return None
+        probe_bs = 1
+        needed = self._estimate_sample_memory_bytes(
+            model,
+            batch_size=probe_bs,
+            max_prompt_len=max_prompt_len,
+            max_new_tokens=max_new_tokens,
+            max_stop_tokens=max_stop_tokens,
+            prompt_logprobs=prompt_logprobs,
+            max_top_k=max_top_k,
+            use_top_p=use_top_p,
+        )
+        if needed is None or needed <= 0:
+            return None
+        per_seq = needed / probe_bs
+        return max(1, int(capacity / max(per_seq, 1.0)))
 
     @contextmanager
     def _jit_timing_context(self, seq_len: int, mode: str):
@@ -546,7 +799,7 @@ class JaxBackendImpl(AbstractBackend):
         advantages = pad_batch(all_advantages, max_len, np.float32)
 
         total_bs = int(input_ids.shape[0])
-        micro_bs = self._micro_batch_size(total_bs)
+        micro_bs = self._micro_batch_size(total_bs, seq_len=max_len, model_pass_fn=model_pass_fn)
         seq_lens = [len(seq) for seq in all_input_ids]
 
         # Collect full padded arrays on device, slice after transfer
@@ -724,9 +977,18 @@ class JaxBackendImpl(AbstractBackend):
         all_adapter_indices = self.load_sampler_weights(prepared_batch)
 
         total_batch_size = len(all_prompts)
-        max_batch_size = (
-            self.config.sample_max_num_sequences if self.config.sample_max_num_sequences > 0 else total_batch_size
-        )
+        with jax.set_mesh(self.mesh):
+            model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
+            max_batch_size = self._sample_batch_size(
+                total_batch_size,
+                model=model,
+                max_prompt_len=max((len(prompt) for prompt in all_prompts), default=1),
+                max_new_tokens=max((sp.max_tokens for sp in all_sampling_params), default=1),
+                max_stop_tokens=max((len(sp.stop_tokens) if sp.stop_tokens else 0 for sp in all_sampling_params), default=0),
+                prompt_logprobs=needs_prompt_logprobs,
+                max_top_k=max((sp.top_k for sp in all_sampling_params if sp.top_k > 0), default=0),
+                use_top_p=any(sp.top_p < 1.0 for sp in all_sampling_params),
+            )
         # Collect generated sequences and prompt logprobs across batches
         all_sequences: list[types.GeneratedSequence] = []
         all_prompt_logprobs: list[list[float]] = []
@@ -736,7 +998,6 @@ class JaxBackendImpl(AbstractBackend):
         sharding_1d = jax.NamedSharding(self.mesh, jax.P("fsdp"))
 
         with jax.set_mesh(self.mesh):
-            model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
             for batch_start in range(0, total_batch_size, max_batch_size):
                 batch_end = min(batch_start + max_batch_size, total_batch_size)
                 batch_prompts = pad(all_prompts[batch_start:batch_end], max_batch_size, fill=[])
