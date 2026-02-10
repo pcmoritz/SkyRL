@@ -435,6 +435,66 @@ def test_sample_max_num_sequences():
             ), f"Request {request_id}: {len(tokens)} tokens but {len(seq.logprobs)} logprobs"
 
 
+def test_batch_size_caching():
+    """Test that _max_fitting_batch_size caches results per (mode, seq_len)."""
+    config = JaxBackendConfig(max_lora_adapters=2, max_lora_rank=32)
+    backend = JaxBackend(BASE_MODEL, config)
+
+    base_overhead = 1_000_000_000  # 1 GB
+    per_token = 10_000  # 10 KB per token per sample
+
+    def make_estimate_fn(sl):
+        def estimate(bs):
+            return base_overhead + bs * sl * per_token
+        return estimate
+
+    # First call at seq_len=4096: should probe and cache.
+    bs1 = backend._max_fitting_batch_size(
+        total=1000, mode="test_cache", seq_len=4096,
+        estimate_bytes_fn=make_estimate_fn(4096),
+    )
+    assert bs1 > 1
+    assert ("test_cache", 4096) in backend._auto_batch_cache
+
+    # Second call at same seq_len=4096: should use cache, not probe.
+    probe_called = []
+
+    def tracking_estimate_fn(bs):
+        probe_called.append(bs)
+        return make_estimate_fn(4096)(bs)
+
+    bs1_again = backend._max_fitting_batch_size(
+        total=1000, mode="test_cache", seq_len=4096,
+        estimate_bytes_fn=tracking_estimate_fn,
+    )
+    assert len(probe_called) == 0, "estimate_bytes_fn should not be called for cached seq_len"
+    assert bs1_again == bs1, "Same seq_len should give same batch size"
+
+    # Third call at different seq_len=2048: should probe (different cache key).
+    probe_called.clear()
+
+    def tracking_estimate_fn_2048(bs):
+        probe_called.append(bs)
+        return make_estimate_fn(2048)(bs)
+
+    bs2 = backend._max_fitting_batch_size(
+        total=1000, mode="test_cache", seq_len=2048,
+        estimate_bytes_fn=tracking_estimate_fn_2048,
+    )
+    assert len(probe_called) > 0, "Should probe for new seq_len"
+    assert bs2 > bs1, "Smaller seq_len should allow larger batch size"
+    assert ("test_cache", 2048) in backend._auto_batch_cache
+
+    # Fourth call at seq_len=2048 with different total: should use cache.
+    probe_called.clear()
+    bs2_small = backend._max_fitting_batch_size(
+        total=10, mode="test_cache", seq_len=2048,
+        estimate_bytes_fn=tracking_estimate_fn_2048,
+    )
+    assert len(probe_called) == 0, "Should use cache for same seq_len"
+    assert bs2_small == 10, "Should be clamped to total"
+
+
 def test_sample_with_prompt_logprobs():
     """Test correct handling of prompt_logprobs in sampling requests."""
     config = JaxBackendConfig(max_lora_adapters=2, max_lora_rank=32)

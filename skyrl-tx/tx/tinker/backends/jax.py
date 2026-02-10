@@ -161,6 +161,10 @@ class JaxBackendImpl(AbstractBackend):
         self.config = config
         self.metrics = types.EngineMetrics()
         self._xla_memory_cache: dict[tuple, int] = {}
+        # Per (mode, seq_len) cache for auto batch sizing.
+        # Stores (bytes_1, per_sample_raw) from the two-point probe so we can
+        # recompute the max batch size for any `total` without re-probing.
+        self._auto_batch_cache: dict[tuple[str, int], tuple[float, float]] = {}
 
         # Initialize the shared base model with LoRA config
         checkpoint_path = resolve_model_path(base_model)
@@ -225,9 +229,12 @@ class JaxBackendImpl(AbstractBackend):
             return max(1, min(mb, total))
         if seq_len is None or model_pass_fn is None:
             return total
+        rounded_sl = round_up_seq_len(max(1, seq_len))
+        mode = "train_fb" if model_pass_fn is self._forward_backward_and_accumulate else "train_fwd"
         return self._max_fitting_batch_size(
             total=total,
-            mode="train",
+            mode=mode,
+            seq_len=rounded_sl,
             estimate_bytes_fn=lambda bs: self._estimate_train_memory_bytes(bs, seq_len, model_pass_fn),
         )
 
@@ -385,14 +392,48 @@ class JaxBackendImpl(AbstractBackend):
         *,
         total: int,
         mode: str,
+        seq_len: int,
         estimate_bytes_fn: Callable[[int], int | None],
     ) -> int:
+        """Return the maximum batch size that fits in device memory.
+
+        Uses a two-point linear probe: compile at bs=1 and bs=ref_bs to measure
+        XLA memory, then extrapolate to find the largest batch size that fits
+        within ``capacity``.  Results are cached per ``(mode, seq_len)`` so that
+        repeated calls (e.g. batch 1+ where XLA memory cache is warm) skip the
+        probe entirely.
+        """
         capacity = self._xla_capacity_bytes()
         if capacity is None:
             logger.warning(f"Falling back to single-item {mode} batching: device memory limits are unavailable")
             return 1
 
-        # Compile at bs=1 to get baseline memory usage.
+        if total <= 1:
+            return 1
+
+        # ------------------------------------------------------------------
+        # Fast path: reuse a previously cached result for this (mode, seq_len).
+        # ------------------------------------------------------------------
+        cache_key = (mode, seq_len)
+        cached = self._auto_batch_cache.get(cache_key)
+        if cached is not None:
+            bytes_1, per_sample_raw = cached
+            if per_sample_raw > 0:
+                per_sample = per_sample_raw * self._AUTO_BATCH_PER_SAMPLE_SAFETY
+                best = 1 + int((capacity - bytes_1) / per_sample)
+            else:
+                best = total
+            best = max(1, min(best, total))
+            logger.info(
+                f"Auto-selected {mode} max batch size: {best} "
+                f"(cached, seq_len={seq_len}, "
+                f"per_sample: {per_sample_raw * self._AUTO_BATCH_PER_SAMPLE_SAFETY / 1e9:.2f} GB)"
+            )
+            return best
+
+        # ------------------------------------------------------------------
+        # Probe: compile at bs=1 and bs=ref_bs to measure memory.
+        # ------------------------------------------------------------------
         bytes_1 = estimate_bytes_fn(1)
         if bytes_1 is None:
             logger.warning(f"Falling back to single-item {mode} batching: XLA memory analysis failed")
@@ -400,28 +441,25 @@ class JaxBackendImpl(AbstractBackend):
         if bytes_1 > capacity:
             logger.warning(f"Even batch_size=1 exceeds memory capacity for {mode}")
             return 1
-        if total <= 1:
-            return 1
 
-        # Compile at a well-separated reference batch size so that
-        # batch-dependent memory (KV cache, activations) dominates over
-        # noise from different XLA optimisation choices at small batch sizes.
-        ref_bs = min(total, self._AUTO_BATCH_REFERENCE_BS)
+        # Always probe at the full reference batch size (not min(total, ...))
+        # so we get a reliable per-sample estimate that can be cached.
+        ref_bs = self._AUTO_BATCH_REFERENCE_BS
         bytes_ref = estimate_bytes_fn(ref_bs) if ref_bs > 1 else None
 
         per_sample: float | None = None
         if bytes_ref is not None and bytes_ref > bytes_1 and ref_bs > 1:
-            per_sample = (bytes_ref - bytes_1) / (ref_bs - 1) * self._AUTO_BATCH_PER_SAMPLE_SAFETY
+            per_sample_raw = (bytes_ref - bytes_1) / (ref_bs - 1)
+            per_sample = per_sample_raw * self._AUTO_BATCH_PER_SAMPLE_SAFETY
             best = 1 + int((capacity - bytes_1) / per_sample)
+
+            # Cache for reuse at this exact (mode, seq_len).
+            self._auto_batch_cache[cache_key] = (bytes_1, per_sample_raw)
         else:
             # Memory didn't grow from bs=1 → bs=ref_bs.  This happens when the
             # XLA compiler applies different optimisations at different batch
             # sizes, making temp buffers shrink or stay flat.  In this regime
             # the per-sample cost is very low relative to capacity.
-            #
-            # Heuristic: we know ref_bs samples fit in `base` bytes of XLA
-            # memory.  Scale proportionally with a 2× safety margin for runtime
-            # overhead not captured by XLA static analysis.
             base = max(bytes_1, bytes_ref or bytes_1)
             best = max(ref_bs, ref_bs * int(capacity / (2 * base))) if base > 0 else total
             per_sample = None
@@ -947,12 +985,15 @@ class JaxBackendImpl(AbstractBackend):
             max_stop_tokens = max((len(sp.stop_tokens) if sp.stop_tokens else 0 for sp in all_sampling_params), default=0)
             max_top_k = max((sp.top_k for sp in all_sampling_params if sp.top_k > 0), default=0)
             use_top_p = any(sp.top_p < 1.0 for sp in all_sampling_params)
+            # max_length is the memory-relevant dimension (KV cache + activations).
+            max_length = round_up_seq_len(round_up_seq_len(max(1, max_prompt_len)) + max(1, max_new_tokens))
             max_batch_size = (
                 max(1, min(self.config.sample_max_num_sequences, total_batch_size))
                 if self.config.sample_max_num_sequences > 0
                 else self._max_fitting_batch_size(
                     total=total_batch_size,
                     mode="sample",
+                    seq_len=max_length,
                     estimate_bytes_fn=lambda bs: self._estimate_sample_memory_bytes(
                         model,
                         batch_size=bs,
