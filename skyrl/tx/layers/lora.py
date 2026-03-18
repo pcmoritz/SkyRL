@@ -1,6 +1,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 from skyrl.tinker.types import LoraConfig
 from skyrl.tx.layers.connectors import LoRAConnector, is_connector_path
@@ -94,7 +95,10 @@ class LoRAMixin:
         # Flatten x: (tokens, features) for linear, (tokens,) for embed, in the latter case feature_shape is ()
         feature_shape = x.shape[base_output.ndim - 1 :]
         x_flat = x.reshape(-1, *feature_shape)
-        adapter_indices_expanded = jnp.repeat(adapter_indices, x_flat.shape[0] // adapter_indices.shape[0])
+        repeat_factor = x_flat.shape[0] // adapter_indices.shape[0]
+        adapter_indices_expanded = jnp.broadcast_to(
+            adapter_indices[:, None], (adapter_indices.shape[0], repeat_factor)
+        ).reshape(-1)
 
         # Sort tokens to prepare for ragged_dot
         x_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
@@ -102,11 +106,43 @@ class LoRAMixin:
         )
 
         # Apply LoRA: x @ A @ B (or A[x] @ B for embeddings)
-        intermediate = self._apply_lora_weight(self.lora_A[...], x_sorted, adapter_indices_sorted, group_sizes)
-        lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B[...], group_sizes)
+        if type(self).__name__ == "LoRAEmbed":
+            intermediate = self._apply_lora_weight(self.lora_A[...], x_sorted, adapter_indices_sorted, group_sizes)
+            lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B[...], group_sizes)
+        else:
+            # `ragged_dot` does not have an explicit-sharding rule in JAX today.
+            # Run just these kernels under auto sharding with fixed layouts,
+            # then continue in explicit mode.
+            ragged_dot_intermediate = jax.sharding.auto_axes(
+                lambda lhs, rhs, sizes: jax.lax.ragged_dot(lhs, rhs, sizes),
+                out_sharding=self.lora_intermediate_sharding,
+            )
+            ragged_dot_output = jax.sharding.auto_axes(
+                lambda lhs, rhs, sizes: jax.lax.ragged_dot(lhs, rhs, sizes),
+                out_sharding=self.lora_output_sharding,
+            )
+            intermediate = ragged_dot_intermediate(x_sorted, self.lora_A[...], group_sizes)
+            lora_output_sorted = ragged_dot_output(intermediate, self.lora_B[...], group_sizes)
 
         # Unsort, reshape, scale
-        lora_output = lora_output_sorted[unsort_indices].reshape(base_output.shape)
+        unsorted_output_sharding = (
+            self.output_sharding if type(self).__name__ == "LoRAEmbed" else self.lora_output_sharding
+        )
+        lora_output = lora_output_sorted.at[unsort_indices].get(
+            mode="fill",
+            fill_value=0,
+            out_sharding=unsorted_output_sharding,
+        ).reshape(base_output.shape)
+        if type(self).__name__ != "LoRAEmbed":
+            activation_output_sharding = NamedSharding(
+                self.mesh,
+                PartitionSpec(
+                    self.batch_axis,
+                    *([None] * (base_output.ndim - 2)),
+                    self.feature_axis,
+                ),
+            )
+            lora_output = jax.sharding.reshard(lora_output, activation_output_sharding)
         scaling = self.lora_scaling[...][adapter_indices_expanded]
         lora_output = lora_output * scaling.reshape(base_output.shape[:-1] + (1,))
         return base_output + lora_output
@@ -138,6 +174,10 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             embedding_init=nnx.with_partitioning(embedding_init, sharding),
             rngs=rngs,
         )
+        mesh = jax.sharding.get_mesh()
+        self.output_sharding = NamedSharding(mesh, PartitionSpec("fsdp", None, None))
+        self.lora_lookup_sharding = NamedSharding(mesh, PartitionSpec("fsdp", None))
+        self.lora_b_lookup_sharding = NamedSharding(mesh, PartitionSpec("fsdp", None, None))
 
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
@@ -160,10 +200,61 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
         """For embeddings, lookup in weight instead of matmul: weight[adapter, token_id, :]."""
         assert lora_weight.ndim == 3
         assert x_sorted.ndim == 1  # (tokens,) integer indices
-        return lora_weight[adapter_indices_sorted, x_sorted, :]
+        return lora_weight.at[adapter_indices_sorted, x_sorted, :].get(
+            mode="fill",
+            fill_value=0,
+            out_sharding=self.lora_lookup_sharding,
+        )
+
+    def apply_lora(
+        self,
+        x: jax.Array,
+        base_output: jax.Array,
+        adapter_indices: jax.Array | None,
+    ) -> jax.Array:
+        if self.max_lora_adapters == 0 or adapter_indices is None:
+            return base_output
+
+        if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
+            raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
+
+        assert adapter_indices.shape[0] == x.shape[0]
+
+        x_flat = x.reshape(-1)
+        repeat_factor = x_flat.shape[0] // adapter_indices.shape[0]
+        adapter_indices_expanded = jnp.broadcast_to(
+            adapter_indices[:, None], (adapter_indices.shape[0], repeat_factor)
+        ).reshape(-1)
+
+        # Embedding LoRA is a token lookup followed by a per-token rank projection.
+        # Using direct gathers avoids ragged_dot, which does not have an explicit
+        # sharding rule in JAX.
+        lora_a = self.lora_A[...].at[adapter_indices_expanded, x_flat, :].get(
+            mode="fill",
+            fill_value=0,
+            out_sharding=self.lora_lookup_sharding,
+        )
+        lora_b = self.lora_B[...].at[adapter_indices_expanded, :, :].get(
+            mode="fill",
+            fill_value=0,
+            out_sharding=self.lora_b_lookup_sharding,
+        )
+        lora_output = jnp.einsum("tr,trf->tf", lora_a, lora_b)
+        scaling = self.lora_scaling[...][adapter_indices_expanded]
+        lora_output = lora_output * scaling[:, None]
+        lora_output = jax.sharding.reshard(lora_output.reshape(base_output.shape), self.output_sharding)
+        return base_output + lora_output
 
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        base_out = super().__call__(x)
+        if not jnp.issubdtype(x.dtype, jnp.integer):
+            raise ValueError("Input type must be an integer or unsigned integer.")
+
+        # Match nnx.Embed dtype promotion, but use explicit gather sharding.
+        (embedding,) = self.promote_dtype((self.embedding[...],), dtype=self.dtype, inexact=False)
+        if self.num_embeddings == 1:
+            base_out = jnp.broadcast_to(embedding, x.shape + (self.features,))
+        else:
+            base_out = embedding.at[x].get(mode="fill", fill_value=0, out_sharding=self.output_sharding)
         return self.apply_lora(x, base_out, adapter_indices)
 
     @property
@@ -216,9 +307,41 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             dtype=param_dtype,
             rngs=rngs,
         )
+        mesh = jax.sharding.get_mesh()
+        self.mesh = mesh
+        self.batch_axis = "fsdp"
+        self.feature_axis = "tp" if sharding[1] == "tp" else None
+        self.lora_intermediate_sharding = NamedSharding(mesh, PartitionSpec(self.batch_axis, None))
+        self.lora_output_sharding = NamedSharding(mesh, PartitionSpec(self.batch_axis, self.feature_axis))
 
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        base_out = super().__call__(x)
+        activation_output_sharding = NamedSharding(
+            self.mesh,
+            PartitionSpec(
+                self.batch_axis,
+                *([None] * (x.ndim - 2)),
+                self.feature_axis,
+            ),
+        )
+        kernel = self.kernel[...]
+        bias = self.bias[...] if self.bias is not None else None
+        x, kernel, bias = self.promote_dtype((x, kernel, bias), dtype=self.dtype)
+        base_linear = jax.sharding.auto_axes(
+            lambda lhs, rhs: jax.lax.dot_general(
+                lhs,
+                rhs,
+                (((lhs.ndim - 1,), (0,)), ((), ())),
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+            ),
+            out_sharding=activation_output_sharding,
+        )
+        base_out = jax.sharding.reshard(base_linear(x, kernel), activation_output_sharding)
+        if bias is not None:
+            base_out = jax.sharding.reshard(
+                base_out + jnp.reshape(bias, (1,) * (base_out.ndim - 1) + (-1,)),
+                activation_output_sharding,
+            )
         return self.apply_lora(x, base_out, adapter_indices)
 
 

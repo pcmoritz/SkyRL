@@ -149,7 +149,11 @@ class AccumulatedGradients:
     def add(self, lora_grads: nnx.State, adapter_indices: jax.Array) -> "AccumulatedGradients":
         """Accumulate gradients and increment counts."""
         # Count occurrences of each adapter index in the batch
-        batch_counts = jnp.bincount(adapter_indices, length=self.counts.shape[0])
+        batch_counts = jax.nn.one_hot(
+            adapter_indices,
+            self.counts.shape[0],
+            dtype=self.counts.dtype,
+        ).sum(axis=0)
         return AccumulatedGradients(
             grad_sum=jax.tree.map(lambda a, b: a + b, self.grad_sum, lora_grads),
             counts=self.counts + batch_counts,
@@ -223,7 +227,10 @@ class JaxBackendImpl(AbstractBackend):
                 config.tensor_parallel_size,
             ),
             ("fsdp", "ep", "tp"),
-            axis_types=(jax.sharding.AxisType.Auto,) * 3,
+            # Use explicit axis semantics so parameter PartitionSpecs are enforced.
+            # Auto axes can silently replicate TP-sharded weights/work, which makes
+            # higher tensor parallel sizes slower instead of faster.
+            axis_types=(jax.sharding.AxisType.Explicit,) * 3,
         )
         with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(
@@ -284,11 +291,11 @@ class JaxBackendImpl(AbstractBackend):
         clip_low_threshold = np.asarray(
             [float(config.get("clip_low_threshold", _DEFAULT_PPO_CLIP_LOW_THRESHOLD)) for config in configs],
             dtype=np.float32,
-        )
+        )[:, None]
         clip_high_threshold = np.asarray(
             [float(config.get("clip_high_threshold", _DEFAULT_PPO_CLIP_HIGH_THRESHOLD)) for config in configs],
             dtype=np.float32,
-        )
+        )[:, None]
         return LossFnConfig(
             clip_low_threshold=clip_low_threshold,
             clip_high_threshold=clip_high_threshold,
@@ -358,32 +365,26 @@ class JaxBackendImpl(AbstractBackend):
                 target_ids,
             )
 
-            def compute_loss_per_example(
-                loss_fn_type,
-                target_logprobs,
-                loss_mask,
-                sampling_logprobs,
-                advantages,
-                loss_fn_config,
-            ):
-                return jax.lax.switch(
-                    loss_fn_type,
-                    LOSS_FUNCTIONS,
-                    target_logprobs,
-                    loss_mask,
-                    sampling_logprobs,
-                    advantages,
-                    loss_fn_config,
+            # Avoid `vmap` over batch here: explicit sharding requires the mapped
+            # axis to line up across all inputs and cotangents during backward.
+            batch_loss_sharding = jax.NamedSharding(jax.sharding.get_abstract_mesh(), jax.P("fsdp", None))
+            per_token_losses = jnp.zeros_like(target_logprobs)
+            for idx, loss_fn in enumerate(LOSS_FUNCTIONS):
+                loss_values = jax.sharding.reshard(
+                    loss_fn(
+                        target_logprobs,
+                        loss_mask,
+                        sampling_logprobs,
+                        advantages,
+                        loss_fn_config,
+                    ),
+                    batch_loss_sharding,
                 )
-
-            per_token_losses = jax.vmap(compute_loss_per_example)(
-                loss_fn_types,
-                target_logprobs,
-                loss_mask,
-                sampling_logprobs,
-                advantages,
-                loss_fn_config,
-            )
+                selector = jax.sharding.reshard(
+                    (loss_fn_types == idx).astype(loss_values.dtype)[:, None],
+                    batch_loss_sharding,
+                )
+                per_token_losses = per_token_losses + loss_values * selector
 
             per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
             # Return sum of losses (we'll divide gradients by per-adapter batch size later)
@@ -482,8 +483,8 @@ class JaxBackendImpl(AbstractBackend):
             # All batch arrays are sharded along batch dimension
             batch_sharded_1d = jax.NamedSharding(self.mesh, jax.P("fsdp"))
             loss_fn_config_shardings = LossFnConfig(
-                clip_low_threshold=batch_sharded_1d,
-                clip_high_threshold=batch_sharded_1d,
+                clip_low_threshold=batch_sharded_2d,
+                clip_high_threshold=batch_sharded_2d,
             )
             input_shardings = (
                 batch_sharded_2d,  # input_ids
@@ -569,13 +570,12 @@ class JaxBackendImpl(AbstractBackend):
             lora_config=lora_config,
         )
 
-        # Create optimizer
+        # Create optimizer and initialize adapter state under the mesh context.
+        # Explicit mesh axes require these parameter updates to run with the mesh set.
         with jax.set_mesh(self.mesh):
             optimizer = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
             self.optimizers[model_id] = nnx.Optimizer(self.model, optimizer, wrt=self.model.is_lora_param)
-
-        # Configure adapter
-        init_lora_adapter(self.model, adapter_index, lora_config)
+            init_lora_adapter(self.model, adapter_index, lora_config)
         logger.info(f"Created model {model_id} with adapter_index={adapter_index}, config={lora_config}")
 
     def delete_model(self, model_id: str) -> None:
@@ -688,7 +688,7 @@ class JaxBackendImpl(AbstractBackend):
                         pad_to_fsdp(loss_fn_config.clip_low_threshold[mb_start:mb_end], fsdp_size),
                         pad_to_fsdp(loss_fn_config.clip_high_threshold[mb_start:mb_end], fsdp_size),
                     ),
-                    (sharding_2d,) * 6 + (sharding_1d,) * 4,
+                    (sharding_2d,) * 6 + (sharding_1d,) * 2 + (sharding_2d,) * 2,
                 )
                 mb_loss_fn_config = LossFnConfig(
                     clip_low_threshold=mb_clip_low_threshold,
@@ -786,16 +786,17 @@ class JaxBackendImpl(AbstractBackend):
         if self.accumulated_grads.counts[adapter_index] == 0:
             logger.warning(f"No accumulated gradients for model {model_id}; applying step with zero gradients")
 
-        # Update hyperparameters from the request
-        hp = optimizer.opt_state.hyperparams
-        hp["learning_rate"][...] = learning_rate
-        hp["b1"][...] = request_data.adam_params.beta1
-        hp["b2"][...] = request_data.adam_params.beta2
-        hp["eps"][...] = request_data.adam_params.eps
-        hp["weight_decay"][...] = request_data.adam_params.weight_decay
-
-        # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
         with jax.set_mesh(self.mesh):
+            # Hyperparameter state lives on the explicit mesh too, so mutate it
+            # under the mesh context before running the compiled optimizer step.
+            hp = optimizer.opt_state.hyperparams
+            hp["learning_rate"][...] = learning_rate
+            hp["b1"][...] = request_data.adam_params.beta1
+            hp["b2"][...] = request_data.adam_params.beta2
+            hp["eps"][...] = request_data.adam_params.eps
+            hp["weight_decay"][...] = request_data.adam_params.weight_decay
+
+            # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
             self.accumulated_grads, optim_metrics = self._compute_grads_and_update(
                 self.accumulated_grads,
                 self.lora_params,

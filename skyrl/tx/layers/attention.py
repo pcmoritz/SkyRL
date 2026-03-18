@@ -2,11 +2,14 @@
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh
 
-# cuDNN flash attention supported dtypes
-# https://github.com/jax-ml/jax/blob/8b1f782540f71fbe230a2dccd331975faafc6c83/jax/_src/cudnn/fused_attention_stablehlo.py#L290
-_CUDNN_SUPPORTED_DTYPES = (jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2)
 
+def _attention_output_sharding(q: jax.Array) -> NamedSharding:
+    sharding = getattr(q, "sharding", None)
+    if isinstance(sharding, NamedSharding):
+        return sharding
+    return NamedSharding(get_abstract_mesh(), PartitionSpec("fsdp", None, "tp", None))
 
 def dot_product_attention(
     q: jax.Array,
@@ -33,20 +36,22 @@ def dot_product_attention(
         Attention output of shape [batch, q_len, num_heads, head_dim]
     """
     scale = 1.0 / head_dim**0.5
+    output_sharding = _attention_output_sharding(q)
 
-    if jax.default_backend() == "gpu" and q.dtype in _CUDNN_SUPPORTED_DTYPES:
-        kv_seq_lengths = attention_mask.sum(axis=1).astype(jnp.int32)
-        q_seq_lengths = jnp.minimum(kv_seq_lengths, q.shape[1])
-        return jax.nn.dot_product_attention(
-            q,
-            k,
-            v,
-            scale=scale,
-            is_causal=is_causal,
-            query_seq_lengths=q_seq_lengths,
-            key_value_seq_lengths=kv_seq_lengths,
-            implementation="cudnn",
+    if jax.default_backend() == "gpu":
+        attention_impl = jax.sharding.auto_axes(
+            lambda query, key, value, mask: jax.nn.dot_product_attention(
+                query,
+                key,
+                value,
+                scale=scale,
+                mask=mask[:, None, None, :].astype(bool),
+                is_causal=is_causal,
+                implementation="xla",
+            ),
+            out_sharding=output_sharding,
         )
+        return jax.sharding.reshard(attention_impl(q, k, v, attention_mask), output_sharding)
 
     # CPU/TPU fallback
     return jax.nn.dot_product_attention(

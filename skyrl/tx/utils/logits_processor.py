@@ -5,6 +5,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 from skyrl.tx.models.configs import ModelConfig
 
@@ -59,10 +60,17 @@ class LogitsProcessorMixin(ABC):
         """
         chunk_size = self.get_model_config().loss_chunk_size
         if chunk_size > 0:
-            return self._compute_chunked_logprobs(hidden_states, target_ids, chunk_size, adapter_indices)
+            logprobs = self._compute_chunked_logprobs(hidden_states, target_ids, chunk_size, adapter_indices)
         else:
             logits = self.compute_logits(hidden_states, adapter_indices)
-            return self.logits_to_logprobs(logits, target_ids)
+            logprobs = self.logits_to_logprobs(logits, target_ids)
+        return jax.sharding.reshard(
+            logprobs,
+            NamedSharding(
+                jax.sharding.get_abstract_mesh(),
+                PartitionSpec("fsdp", *([None] * (logprobs.ndim - 1))),
+            ),
+        )
 
     @staticmethod
     def logits_to_logprobs(logits: jax.Array, target_ids: jax.Array) -> jax.Array:
@@ -76,7 +84,16 @@ class LogitsProcessorMixin(ABC):
             Log probabilities for target tokens [B, T] or [B].
         """
         log_sum_exp = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
-        target_logits = jnp.take_along_axis(logits, target_ids[..., None], axis=-1)
+        vocab_size = logits.shape[-1]
+        flat_logits = logits.reshape(-1, vocab_size)
+        flat_target_ids = target_ids.reshape(-1)
+        flat_row_indices = jnp.arange(flat_target_ids.shape[0], dtype=jnp.int32)
+        flat_target_logits = flat_logits.at[flat_row_indices[:, None], flat_target_ids[:, None]].get(
+            mode="fill",
+            fill_value=-jnp.inf,
+            out_sharding=NamedSharding(jax.sharding.get_abstract_mesh(), PartitionSpec(None, None)),
+        )
+        target_logits = flat_target_logits.reshape(target_ids.shape + (1,))
         return (target_logits - log_sum_exp).squeeze(-1)
 
     def _compute_chunked_logprobs(
@@ -103,7 +120,7 @@ class LogitsProcessorMixin(ABC):
         if adapter_indices is None:
             flat_adapter_indices = jnp.zeros(total_tokens, dtype=jnp.int32)
         else:
-            flat_adapter_indices = jnp.repeat(adapter_indices, T)  # [B*T]
+            flat_adapter_indices = jnp.broadcast_to(adapter_indices[:, None], (B, T)).reshape(-1)  # [B*T]
 
         # Pad to multiple of chunk_size for clean slicing
         num_chunks = (total_tokens + chunk_size - 1) // chunk_size

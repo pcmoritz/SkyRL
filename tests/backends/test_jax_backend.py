@@ -44,6 +44,12 @@ def test_delete_model_basic():
     assert not backend.has_model(model_id)
 
 
+def test_backend_uses_explicit_mesh_axes():
+    """TP/FSDP partition specs should run on explicit mesh axes, not auto axes."""
+    backend = create_backend()
+    assert backend.mesh.axis_types == (jax.sharding.AxisType.Explicit,) * 3
+
+
 def test_delete_non_existent_model():
     """Test deleting a non-existent model raises ValueError."""
     backend = create_backend()

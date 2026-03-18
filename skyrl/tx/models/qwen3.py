@@ -1,6 +1,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 from jax.sharding import get_abstract_mesh
 
 from skyrl.tx.layers.attention import dot_product_attention
@@ -265,7 +266,9 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
         hidden_states = hidden_states.reshape(-1, hidden_size)
         # Expand adapter_indices to match flattened hidden_states
         if adapter_indices is not None:
-            adapter_indices = jnp.repeat(adapter_indices, seq_len)
+            adapter_indices = jnp.broadcast_to(adapter_indices[:, None], (adapter_indices.shape[0], seq_len)).reshape(
+                -1
+            )
         router_logits = self.gate(hidden_states)
 
         hidden_states = self.experts(hidden_states, router_logits, adapter_indices)
@@ -373,7 +376,19 @@ class Qwen3Model(nnx.Module):
         )
 
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
-        hidden_states = jnp.repeat(hidden_states[..., None, :], self.config.mhc_expansion_rate, axis=-2)
+        if self.config.mhc_expansion_rate == 1:
+            hidden_states = hidden_states.reshape(
+                hidden_states.shape[:-1] + (1, hidden_states.shape[-1])
+            )
+        else:
+            hidden_states = jnp.broadcast_to(
+                hidden_states[..., None, :],
+                hidden_states.shape[:-1] + (self.config.mhc_expansion_rate, hidden_states.shape[-1]),
+            )
+        hidden_states = jax.sharding.reshard(
+            hidden_states,
+            NamedSharding(get_abstract_mesh(), PartitionSpec("fsdp", None, None, None)),
+        )
 
         hidden_states, all_hidden_states, new_kv_cache = self.layers(
             hidden_states,

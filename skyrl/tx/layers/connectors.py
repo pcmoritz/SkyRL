@@ -4,6 +4,7 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 from skyrl.tx.layers.util import Param
 
@@ -44,6 +45,10 @@ class LoRAConnector(nnx.Module):
     ) -> None:
         self.expansion_rate = expansion_rate
         self.sinkhorn_iters = sinkhorn_iters
+        self.fast_path_output_sharding = NamedSharding(
+            jax.sharding.get_mesh(),
+            PartitionSpec("fsdp", None, None, None),
+        )
         n = expansion_rate
         C = hidden_dim
 
@@ -158,7 +163,8 @@ class LoRAConnector(nnx.Module):
         B, T, n, C = residual.shape
         if self.expansion_rate == 1:
             # Single-stream fast path: plain residual connection.
-            return residual + output[..., None, :]
+            output = jax.sharding.reshard(output.reshape(B, T, 1, C), self.fast_path_output_sharding)
+            return residual + output
 
         adapter_indices = self._get_adapter_indices(B, adapter_indices)
 
