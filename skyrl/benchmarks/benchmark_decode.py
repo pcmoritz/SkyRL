@@ -1,22 +1,18 @@
-"""Benchmark decode performance and verify XLA buffer donation / command buffers.
+"""Benchmark decode performance.
 
 Usage:
-    # Baseline:
-    python -m skyrl.benchmarks.benchmark_decode
+    # Single batch size:
+    python skyrl/benchmarks/benchmark_decode.py
 
-    # With XLA command buffers (reduces kernel launch overhead):
-    XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CUDNN,CUBLAS" \
-        python -m skyrl.benchmarks.benchmark_decode
+    # Sweep batch sizes:
+    python skyrl/benchmarks/benchmark_decode.py --batch-sizes 1,8,32,64,128
 
-    # With JAX profiler trace (inspect in chrome://tracing or Perfetto):
-    python -m skyrl.benchmarks.benchmark_decode --profile /tmp/jax-trace
-
-    # Dump XLA HLO to inspect buffer donation:
-    XLA_FLAGS="--xla_dump_to=/tmp/xla-dump --xla_dump_hlo_as_text" \
-        python -m skyrl.benchmarks.benchmark_decode
+    # With JAX profiler trace:
+    python skyrl/benchmarks/benchmark_decode.py --profile /tmp/jax-trace
 """
 
 import argparse
+import os
 import tempfile
 import time
 
@@ -31,55 +27,54 @@ from skyrl.tx.models.configs import Qwen3Config
 from skyrl.tx.models.qwen3 import Qwen3ForCausalLM
 from skyrl.tx.utils.models import load_safetensors
 
+PROMPT = "Explain the theory of relativity in simple terms"
+
+
+def bench(model, tokenizer, batch_size, max_tokens, warmup, runs):
+    prompts = [PROMPT] * batch_size
+    batch = tokenizer(prompts, return_tensors="np", padding=True)
+    input_ids = jnp.array(batch.input_ids)
+    attention_mask = jnp.array(batch.attention_mask)
+    sampling_params = [
+        types.SamplingParams(max_tokens=max_tokens, temperature=0.6, seed=42 + i) for i in range(batch_size)
+    ]
+
+    for _ in range(warmup):
+        result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
+        jax.block_until_ready(result.generated_ids)
+
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
+        jax.block_until_ready(result.generated_ids)
+        times.append(time.perf_counter() - t0)
+
+    times = np.array(times)
+    total_tokens = batch_size * max_tokens
+    return times.mean(), times.std(), total_tokens / times.mean(), times.mean() / max_tokens * 1000
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Qwen3 decode performance")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model name")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
-    parser.add_argument("--max-tokens", type=int, default=64, help="Max new tokens to generate")
-    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations")
-    parser.add_argument("--runs", type=int, default=5, help="Timed iterations")
-    parser.add_argument("--profile", type=str, default=None, help="Path to save JAX profiler trace")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--batch-sizes", default="1,8,32,64,128", help="Comma-separated batch sizes")
+    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--profile", type=str, default=None)
     args = parser.parse_args()
-
-    import os
+    batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
 
     print(f"Backend: {jax.default_backend()}")
     print(f"Devices: {jax.device_count()}")
     print(f"XLA_FLAGS: {os.environ.get('XLA_FLAGS', '(not set)')}")
-    print()
 
-    # Load model
-    print(f"Loading {args.model}...")
+    print(f"\nLoading {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="right")
     hf_model = AutoModelForCausalLM.from_pretrained(args.model, use_safetensors=True)
     base_config = PretrainedConfig.from_pretrained(args.model)
     config = Qwen3Config(base_config, max_lora_adapters=0, max_lora_rank=0, shard_attention_heads=True)
-
-    prompts = [
-        "Explain the theory of relativity in simple terms",
-        "Write a short story about a robot learning to paint",
-        "What are the main differences between Python and Rust",
-        "Describe how neural networks learn from data",
-        "What causes the northern lights to appear in the sky",
-        "How do computers store and retrieve information",
-        "Explain the water cycle and its importance to life",
-        "What is the history of the internet and web",
-    ]
-    prompts = prompts[: args.batch_size]
-    if len(prompts) < args.batch_size:
-        prompts = prompts * (args.batch_size // len(prompts) + 1)
-        prompts = prompts[: args.batch_size]
-
-    batch = tokenizer(prompts, return_tensors="np", padding=True)
-    input_ids = jnp.array(batch.input_ids)
-    attention_mask = jnp.array(batch.attention_mask)
-    prompt_len = input_ids.shape[1]
-
-    sampling_params = [
-        types.SamplingParams(max_tokens=args.max_tokens, temperature=0.6, seed=42 + i)
-        for i in range(args.batch_size)
-    ]
 
     with tempfile.TemporaryDirectory() as tmp:
         hf_model.save_pretrained(tmp, safe_serialization=True)
@@ -90,53 +85,33 @@ def main():
             model = Qwen3ForCausalLM(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)
 
-        print(f"Config: batch_size={args.batch_size}, prompt_len={prompt_len}, max_new_tokens={args.max_tokens}")
-        param_count = sum(p.size for p in jax.tree.leaves(nnx.state(model)))
-        print(f"Parameters: {param_count / 1e6:.1f}M")
-        print()
+        param_bytes = sum(p.size * p.dtype.itemsize for p in jax.tree.leaves(nnx.state(model)))
+        print(f"Parameters: {param_bytes / 1e6:.0f} MB ({param_bytes / 1e9:.2f} GB)")
+        print(f"max_tokens: {args.max_tokens}\n")
 
-        # Warmup (triggers JIT compilation)
-        print(f"Warmup ({args.warmup} iterations)...")
-        for i in range(args.warmup):
-            t0 = time.perf_counter()
-            result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
-            jax.block_until_ready(result.generated_ids)
-            t1 = time.perf_counter()
-            print(f"  warmup {i}: {(t1 - t0) * 1000:.1f} ms")
+        print(f"{'batch':>6} {'ms/step':>8} {'tok/s':>8} {'ms/tok':>8} {'GB/s':>8}")
+        print("-" * 46)
+        for bs in batch_sizes:
+            mean_s, std_s, tok_s, ms_per_step = bench(model, tokenizer, bs, args.max_tokens, args.warmup, args.runs)
+            # Approximate bandwidth: weights read once per step
+            gbps = param_bytes / (ms_per_step / 1000) / 1e9
+            print(f"{bs:>6} {ms_per_step:>8.2f} {tok_s:>8.0f} {mean_s / (bs * args.max_tokens) * 1000:>8.3f} {gbps:>8.1f}")
 
-        # Timed runs
-        print(f"\nBenchmark ({args.runs} iterations)...")
-        times = []
-        for i in range(args.runs):
-            t0 = time.perf_counter()
-            result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
-            jax.block_until_ready(result.generated_ids)
-            t1 = time.perf_counter()
-            elapsed = t1 - t0
-            times.append(elapsed)
-            tokens = sum(len(ids) for ids in result.generated_ids)
-            print(f"  run {i}: {elapsed * 1000:.1f} ms, {tokens} tokens, {tokens / elapsed:.0f} tok/s")
-
-        times = np.array(times)
-        avg_tokens = sum(len(ids) for ids in result.generated_ids)
-        print(f"\nResults:")
-        print(f"  Mean: {times.mean() * 1000:.1f} ± {times.std() * 1000:.1f} ms")
-        print(f"  Min:  {times.min() * 1000:.1f} ms")
-        print(f"  Throughput: {avg_tokens / times.mean():.0f} tok/s")
-        print(f"  Per-token:  {times.mean() / args.max_tokens * 1000:.2f} ms/tok")
-
-        # Profiler trace
         if args.profile:
-            print(f"\nCollecting profiler trace to {args.profile}...")
+            bs = batch_sizes[-1]
+            prompts = [PROMPT] * bs
+            batch = tokenizer(prompts, return_tensors="np", padding=True)
+            input_ids = jnp.array(batch.input_ids)
+            attention_mask = jnp.array(batch.attention_mask)
+            sampling_params = [
+                types.SamplingParams(max_tokens=args.max_tokens, temperature=0.6, seed=42 + i) for i in range(bs)
+            ]
+            print(f"\nCollecting profiler trace (batch_size={bs}) to {args.profile}...")
             jax.profiler.start_trace(args.profile)
             result = model.generate(input_ids, attention_mask, sampling_params=sampling_params)
             jax.block_until_ready(result.generated_ids)
             jax.profiler.stop_trace()
-            print(f"Trace saved. Open with: chrome://tracing or https://ui.perfetto.dev/")
-            print()
-            print("What to look for:")
-            print("  - Large 'memcpy DtoD' ops inside the while loop = buffer donation failure")
-            print("  - Many small gaps between kernels = kernel launch overhead (try command buffers)")
+            print("Trace saved. Open with https://ui.perfetto.dev/")
 
 
 if __name__ == "__main__":
