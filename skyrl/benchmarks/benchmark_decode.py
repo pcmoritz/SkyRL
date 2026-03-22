@@ -42,9 +42,11 @@ def main():
     parser.add_argument("--profile", type=str, default=None, help="Path to save JAX profiler trace")
     args = parser.parse_args()
 
+    import os
+
     print(f"Backend: {jax.default_backend()}")
     print(f"Devices: {jax.device_count()}")
-    print(f"XLA_FLAGS: {jax._src.config.FLAGS.jax_xla_backend or 'default'}")
+    print(f"XLA_FLAGS: {os.environ.get('XLA_FLAGS', '(not set)')}")
     print()
 
     # Load model
