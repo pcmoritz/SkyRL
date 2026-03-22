@@ -20,5 +20,4 @@ class RMSNorm(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        return self.weight * x / rms
+        return self.weight * x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)

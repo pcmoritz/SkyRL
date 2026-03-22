@@ -7,32 +7,21 @@ import jax
 from jax import numpy as jnp
 
 
-def apply_rope(
-    inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta: float, interleave: bool = False
-) -> jax.Array:
-    """Apply Rotary Position Embeddings (RoPE).
-
-    Args:
-        inputs: Input tensor of shape [B, T, num_heads, head_dim]
-        position_ids: Position indices of shape [B, T]
-        head_dim: Dimension of each attention head
-        theta: Base for the geometric progression (rope_theta)
-        interleave: If True, use interleaved slicing (x[..., ::2], x[..., 1::2])
-            instead of splitting the last dimension in half.
-
-    Returns:
-        Tensor with RoPE applied, same shape as inputs
-    """
+def compute_rope_freqs(position_ids: jax.Array, head_dim: int, theta: float) -> tuple[jax.Array, jax.Array]:
+    """Precompute sin/cos frequencies for RoPE, shareable across layers and Q/K."""
     fraction = 2 * jnp.arange(0, head_dim // 2, dtype=jnp.float32) / head_dim
     timescale = jnp.pow(theta, fraction)
     x = (position_ids[..., None] / timescale[None, None, :])[..., None, :]
-    sin, cos = jnp.sin(x), jnp.cos(x)
+    return jnp.sin(x), jnp.cos(x)
 
+
+def apply_rope(inputs: jax.Array, freqs: tuple[jax.Array, jax.Array], interleave: bool = False) -> jax.Array:
+    """Apply precomputed RoPE frequencies to inputs of shape [B, T, num_heads, head_dim]."""
+    sin, cos = freqs
     if interleave:
         a, b = inputs[..., ::2], inputs[..., 1::2]
     else:
         a, b = jnp.split(inputs, 2, axis=-1)
-
     return jnp.concatenate([a * cos - b * sin, a * sin + b * cos], axis=-1).astype(inputs.dtype)
 
 
@@ -68,13 +57,13 @@ def get_rope(
             mscale = yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])
 
             def rotary_emb(inputs: jax.Array, positions: jax.Array) -> jax.Array:
-                return apply_rope(inputs, positions, head_dim, rope_theta, interleave=True)
+                return apply_rope(inputs, compute_rope_freqs(positions, head_dim, rope_theta), interleave=True)
 
         case "default":
             mscale = 1.0
 
             def rotary_emb(inputs: jax.Array, positions: jax.Array) -> jax.Array:
-                return apply_rope(inputs, positions, head_dim, rope_theta)
+                return apply_rope(inputs, compute_rope_freqs(positions, head_dim, rope_theta))
 
         case _:
             raise ValueError(f"Unsupported rope_type: {rope_type}")

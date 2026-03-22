@@ -185,6 +185,7 @@ class StackedDecoderLayers(nnx.Module):
         output_hidden_states: bool,
         gradient_checkpointing: bool,
         is_training: bool = False,
+        **layer_kwargs,
     ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
         """Forward pass through all layers.
 
@@ -200,6 +201,7 @@ class StackedDecoderLayers(nnx.Module):
             output_hidden_states: Whether to return intermediate hidden states.
             gradient_checkpointing: Whether to use gradient checkpointing.
             is_training: Whether in training mode. Skips KV cache to save memory.
+            **layer_kwargs: Extra keyword arguments forwarded to each layer (e.g. rope_freqs).
 
         Returns:
             Tuple of (final_hidden_states, all_hidden_states, kv_cache).
@@ -242,6 +244,7 @@ class StackedDecoderLayers(nnx.Module):
                     positions=positions,
                     adapter_indices=adapter_indices,
                     kv_cache=layer_kv,
+                    **layer_kwargs,
                 )
                 updated_keys.append(k)
                 updated_values.append(v)
@@ -261,6 +264,7 @@ class StackedDecoderLayers(nnx.Module):
                 positions=positions,
                 adapter_indices=adapter_indices,
                 kv_cache=None,
+                **layer_kwargs,
             )
 
             hs_output = new_hs if output_hidden_states else None
@@ -358,6 +362,7 @@ class MultiStackedDecoderLayers(nnx.Module):
         output_hidden_states: bool,
         gradient_checkpointing: bool,
         is_training: bool = False,
+        **layer_kwargs,
     ) -> tuple[jax.Array, list[jax.Array], KVCache | None]:
         all_hidden_states: list[jax.Array] = []
 
@@ -382,6 +387,7 @@ class MultiStackedDecoderLayers(nnx.Module):
                 output_hidden_states=output_hidden_states,
                 gradient_checkpointing=gradient_checkpointing,
                 is_training=is_training,
+                **layer_kwargs,
             )
             all_hidden_states.extend(layer_hidden_states)
             if not is_training:

@@ -7,7 +7,7 @@ from skyrl.tx.layers.attention import dot_product_attention
 from skyrl.tx.layers.connectors import LoRAConnector
 from skyrl.tx.layers.layernorm import RMSNorm
 from skyrl.tx.layers.lora import FusedLoRALinear, LoRAEmbed, LoRAExpert, LoRALinear
-from skyrl.tx.layers.rotary_embedding import apply_rope
+from skyrl.tx.layers.rotary_embedding import apply_rope, compute_rope_freqs
 from skyrl.tx.layers.stacked import StackedDecoderLayers
 from skyrl.tx.layers.util import prepare_routing, shard_map_ep
 from skyrl.tx.models.configs import Qwen3Config
@@ -72,6 +72,7 @@ class Qwen3Attention(nnx.Module):
         positions: jax.Array,
         adapter_indices: jax.Array | None = None,
         kv_cache: tuple[jax.Array, jax.Array] | None = None,
+        rope_freqs: tuple[jax.Array, jax.Array],
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         B, T, _ = x.shape
 
@@ -81,8 +82,8 @@ class Qwen3Attention(nnx.Module):
         v = v.reshape(B, T, self.num_kv_heads, self.head_dim)
 
         # Apply RoPE
-        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
-        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
+        q = apply_rope(q, rope_freqs)
+        k = apply_rope(k, rope_freqs)
 
         # Handle KV cache
         if kv_cache is not None:
@@ -279,6 +280,7 @@ class Qwen3DecoderLayer(nnx.Module):
         positions: jax.Array,
         adapter_indices: jax.Array | None = None,
         kv_cache: tuple[jax.Array, jax.Array] | None = None,
+        rope_freqs: tuple[jax.Array, jax.Array],
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         residual = hidden_states
         hidden_states, residual_norm = self.attn_connector.pre(hidden_states, self.input_layernorm, adapter_indices)
@@ -289,6 +291,7 @@ class Qwen3DecoderLayer(nnx.Module):
             positions=positions,
             adapter_indices=adapter_indices,
             kv_cache=kv_cache,
+            rope_freqs=rope_freqs,
         )
         hidden_states = self.attn_connector.post(residual, hidden_states, residual_norm, adapter_indices)
 
@@ -344,6 +347,9 @@ class Qwen3Model(nnx.Module):
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
         hidden_states = jnp.repeat(hidden_states[..., None, :], self.config.mhc_expansion_rate, axis=-2)
 
+        head_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+        rope_freqs = compute_rope_freqs(positions, head_dim, self.config.rope_theta)
+
         hidden_states, all_hidden_states, new_kv_cache = self.layers(
             hidden_states,
             attention_mask=attention_mask,
@@ -353,6 +359,7 @@ class Qwen3Model(nnx.Module):
             output_hidden_states=output_hidden_states,
             gradient_checkpointing=self.config.gradient_checkpointing,
             is_training=is_training,
+            rope_freqs=rope_freqs,
         )
 
         hidden_states = hidden_states.sum(axis=-2)
