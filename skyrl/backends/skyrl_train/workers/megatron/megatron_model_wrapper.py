@@ -10,6 +10,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
 
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+    _packed_seq_pad_multiple_from_config,
     get_model_config,
     make_batch_generator,
     postprocess_packed_seqs,
@@ -111,12 +112,15 @@ class MegatronModelWrapper:
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
 
+            model_config = get_model_config(model)
+            pad_multiple = _packed_seq_pad_multiple_from_config(model_config)
+
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             if rollout_expert_indices is not None:
                 setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
                     batch["attention_mask"],
-                    model_config=get_model_config(model),
+                    model_config=model_config,
                     use_sample_packing=self.use_sample_packing,
                 )
 
@@ -129,6 +133,7 @@ class MegatronModelWrapper:
                     sequences,
                     attention_mask,
                     pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                    pad_to_multiple_of=pad_multiple,
                 )
                 new_attention_mask = None
                 new_position_ids = None
@@ -138,6 +143,7 @@ class MegatronModelWrapper:
                     attention_mask,
                     position_ids,
                     pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                    pad_to_multiple_of=pad_multiple,
                 )
                 packed_seq_params = None
 
@@ -398,12 +404,15 @@ class MegatronModelWrapper:
             # after this PR https://github.com/NovaSky-AI/SkyRL/pull/1285.
             batch = next(batch_iter)
 
+            model_config = get_model_config(model)
+            pad_multiple = _packed_seq_pad_multiple_from_config(model_config)
+
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             if rollout_expert_indices is not None:
                 setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
                     batch["attention_mask"],
-                    model_config=get_model_config(model),
+                    model_config=model_config,
                     use_sample_packing=self.use_sample_packing,
                 )
 
@@ -416,6 +425,7 @@ class MegatronModelWrapper:
                     sequences,
                     attention_mask,
                     pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                    pad_to_multiple_of=pad_multiple,
                 )
                 new_attention_mask = None
                 new_position_ids = None
@@ -425,6 +435,7 @@ class MegatronModelWrapper:
                     attention_mask,
                     position_ids,
                     pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                    pad_to_multiple_of=pad_multiple,
                 )
                 packed_seq_params = None
 

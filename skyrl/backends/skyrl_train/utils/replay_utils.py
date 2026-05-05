@@ -89,23 +89,26 @@ def _split_replay_indices(rollout_expert_indices: torch.Tensor) -> List[torch.Te
 def _remove_left_padding_from_indices(
     rollout_expert_indices: torch.Tensor,
     attention_mask: torch.Tensor,
+    pad_to_multiple_of: int = 1,
 ) -> torch.Tensor:
     """Apply the same left-padding removal as remove_left_padding to routing indices.
 
     Args:
         rollout_expert_indices: [batch, padded_seq_len, layers, topk]
         attention_mask: [batch, padded_seq_len] (int or bool)
+        pad_to_multiple_of: extra alignment (e.g. 8 for FP8) — must match the
+            value passed to ``preprocess_packed_seqs`` so layouts agree.
 
     Returns:
         [batch, effective_seq_len, layers, topk] with real tokens packed left.
     """
-    import megatron.core.parallel_state as mpu
+    from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+        get_packed_seq_align_size,
+    )
 
     seq_lens = attention_mask.sum(dim=1)
     effective_seq_len = seq_lens.max().item()
-    tp_size = mpu.get_tensor_model_parallel_world_size()
-    cp_size = mpu.get_context_parallel_world_size()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    align_size = get_packed_seq_align_size(pad_to_multiple_of=pad_to_multiple_of)
     if align_size > 1:
         pad_size = (align_size - effective_seq_len % align_size) % align_size
         effective_seq_len += pad_size
@@ -128,6 +131,7 @@ def _remove_left_padding_from_indices(
 def _pack_replay_indices(
     rollout_expert_indices: torch.Tensor,
     attention_mask: torch.Tensor,
+    pad_to_multiple_of: int = 1,
 ) -> torch.Tensor:
     """Pack routing indices to match the token layout produced by preprocess_packed_seqs.
 
@@ -135,19 +139,28 @@ def _pack_replay_indices(
     sequence with per-sample alignment padding.  The MoE router sees tokens in
     this packed order, so replay indices must follow the same layout.
 
+    Args:
+        rollout_expert_indices: [batch, padded_seq_len, layers, topk]
+        attention_mask: [batch, padded_seq_len] (int or bool)
+        pad_to_multiple_of: extra alignment (e.g. 8 for FP8) — must match the
+            value passed to ``preprocess_packed_seqs`` so layouts agree.
+
     Returns:
         [1, total_packed_len, layers, topk] matching the packed model input.
     """
     import megatron.core.parallel_state as mpu
+
+    from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+        get_packed_seq_align_size,
+    )
 
     batch_size = rollout_expert_indices.shape[0]
     num_layers = rollout_expert_indices.shape[2]
     topk = rollout_expert_indices.shape[3]
 
     seq_lens = attention_mask.sum(dim=-1, dtype=torch.int32)
-    tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    align_size = get_packed_seq_align_size(pad_to_multiple_of=pad_to_multiple_of)
 
     pad_sizes = (align_size - seq_lens % align_size) % align_size
     seqlens_padded = seq_lens + pad_sizes
@@ -253,12 +266,21 @@ def setup_per_microbatch_replay_forward(
         RouterReplayAction,
     )
 
+    from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+        _packed_seq_pad_multiple_from_config,
+    )
+
     _patch_alltoall_dispatcher_for_replay()
 
+    pad_to_multiple_of = _packed_seq_pad_multiple_from_config(model_config)
     if use_sample_packing:
-        aligned = _pack_replay_indices(rollout_expert_indices, attention_mask)
+        aligned = _pack_replay_indices(
+            rollout_expert_indices, attention_mask, pad_to_multiple_of=pad_to_multiple_of
+        )
     else:
-        aligned = _remove_left_padding_from_indices(rollout_expert_indices, attention_mask)
+        aligned = _remove_left_padding_from_indices(
+            rollout_expert_indices, attention_mask, pad_to_multiple_of=pad_to_multiple_of
+        )
 
     # TP splitting: sequence parallelism across the tensor model parallel region
     tp_size = mpu.get_tensor_model_parallel_world_size()

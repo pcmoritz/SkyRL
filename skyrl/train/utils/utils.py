@@ -777,6 +777,7 @@ def initialize_ray(cfg: SkyRLTrainConfig):
         os.environ["SKYRL_LOG_FILE"] = log_file
         # Pass log file path to workers so they can redirect their output
         env_vars["SKYRL_LOG_FILE"] = log_file
+        env_vars["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.

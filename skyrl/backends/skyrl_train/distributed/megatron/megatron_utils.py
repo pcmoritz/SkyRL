@@ -21,6 +21,7 @@
 # limitations under the License.
 
 import gc
+import math
 from typing import List, Union
 
 import torch
@@ -34,6 +35,39 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_attr_wrapped_model
 
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+
+# FP8 GEMMs in TransformerEngine require the leading flat dim to be a multiple
+# of 8 (see assert_dim_for_fp8_exec). When sample packing is used, the packed
+# sequence length is that leading dim, so the per-sequence alignment must be a
+# multiple of 8 whenever FP8 is enabled — otherwise sums of unaligned per-seq
+# lengths can hit the assert (e.g. dims=[1182, 2048]).
+FP8_PACKED_SEQ_ALIGN = 8
+
+
+def get_packed_seq_align_size(pad_to_multiple_of: int = 1) -> int:
+    """Per-sequence alignment used when packing sequences.
+
+    The per-seq pad must be a multiple of TP*CP (with the *2 factor for
+    CP>1 causal-mask load balancing) so each shard splits evenly. When the
+    caller also needs the *total* packed length to be a multiple of some
+    value (e.g. 8 for FP8 GEMM), we take the LCM so both constraints hold.
+    """
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    if pad_to_multiple_of > 1:
+        align_size = math.lcm(align_size, pad_to_multiple_of)
+    return align_size
+
+
+def _packed_seq_pad_multiple_from_config(model_config) -> int:
+    """Return the multiple-of-N alignment required by `model_config`.
+
+    Currently only FP8 imposes a packed-seq alignment requirement (8).
+    """
+    if model_config is not None and getattr(model_config, "fp8", None) is not None:
+        return FP8_PACKED_SEQ_ALIGN
+    return 1
 
 
 def make_batch_generator(batches, vpp_size):
@@ -321,21 +355,27 @@ def load_megatron_optimizer(optimizers):
 
 
 def preprocess_packed_seqs(
-    input_ids: torch.Tensor, attention_mask: torch.Tensor, pre_process: bool = True
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pre_process: bool = True,
+    pad_to_multiple_of: int = 1,
 ) -> tuple[torch.Tensor, PackedSeqParams]:
     """
     Preprocess packed sequences
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
     gets second and second last chunks, and so on), this is for load balancing with causal masking.
     See https://github.com/NVIDIA/TransformerEngine/issues/1368
+
+    When `pad_to_multiple_of > 1` (e.g. 8 for FP8), the per-sequence alignment is
+    bumped to LCM(TP*CP-align, pad_to_multiple_of) so the resulting total packed
+    length also satisfies the requested multiple.
     """
     batch_size = input_ids.shape[0]
 
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    align_size = get_packed_seq_align_size(pad_to_multiple_of=pad_to_multiple_of)
 
     pad_size = (align_size - seqlens_in_batch % align_size) % align_size
     seqlens_in_batch_padded = seqlens_in_batch + pad_size
@@ -471,10 +511,15 @@ def remove_left_padding(
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
     pre_process: bool = True,
+    pad_to_multiple_of: int = 1,
 ):
     """
     Remove left padding from input_ids, attention_mask and position_ids
     return new_input_ids, new_attention_mask, new_position_ids
+
+    When `pad_to_multiple_of > 1` (e.g. 8 for FP8), the resulting seq_len is
+    bumped to LCM(TP, pad_to_multiple_of) so the leading flat dim entering
+    TE GEMMs satisfies the FP8 alignment requirement.
     """
     assert attention_mask.ndim == 2
     assert position_ids.ndim == 2
@@ -484,10 +529,11 @@ def remove_left_padding(
     shape = list(input_ids.shape)  # batch_size, seq_len,...
     seq_lens = attention_mask.sum(dim=1)
     seq_len = seq_lens.max().item()
-    if mpu.get_tensor_model_parallel_world_size() > 1:
-        sp_world_size = mpu.get_tensor_model_parallel_world_size()
-        pad_size = (sp_world_size - seq_len % sp_world_size) % sp_world_size
-        seq_len = seq_len + pad_size
+    align_size = mpu.get_tensor_model_parallel_world_size()
+    if pad_to_multiple_of > 1:
+        align_size = math.lcm(align_size, pad_to_multiple_of)
+    pad_size = (align_size - seq_len % align_size) % align_size
+    seq_len = seq_len + pad_size
     shape[1] = seq_len
     if pre_process:
         new_input_ids = torch.zeros(dtype=input_ids.dtype, device=input_ids.device, size=shape)
