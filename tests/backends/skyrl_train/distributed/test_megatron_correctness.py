@@ -273,3 +273,73 @@ class TestWeightSyncPauseFlush:
 
         dispatch._inference_engine_client.pause_generation.assert_awaited_once()
         dispatch._inference_engine_client.resume_generation.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# C6: adapter swaps require resident grad buffers + optimizer state
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterSwapResidency:
+    """A LoRA adapter swap copies the live param buffer, grad buffer, fp32 main
+    params and Adam state to/from pinned CPU slots. Megatron's offload *frees*
+    grad_data in place (``storage().resize_(0)``), so swapping against an
+    offloaded policy hands cudaMemcpyAsync a dangling pointer and dies with
+    "CUDA error: invalid argument"."""
+
+    def test_ensure_active_adapter_backloads_optimizer_before_swap(self):
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        call_order = []
+
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch._actor_groups = {"policy": MagicMock()}
+        dispatch._ensure_on_gpu = MagicMock(
+            side_effect=lambda model, need_optimizer=True, need_model=True: call_order.append(
+                ("ensure_on_gpu", need_optimizer, need_model)
+            )
+        )
+        dispatch._actor_groups["policy"].async_run_ray_method = MagicMock(
+            side_effect=lambda *args, **kwargs: call_order.append(("swap", args[1]))
+        )
+
+        with patch("skyrl.backends.skyrl_train.workers.worker_dispatch.ray.get"):
+            dispatch.ensure_active_adapter("policy", "model_abc")
+
+        assert call_order == [("ensure_on_gpu", True, True), ("swap", "swap_to_adapter")]
+
+    def test_ensure_active_adapter_noop_without_model_id(self):
+        """FFT / single-tenant path must not perturb the offload state."""
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch._actor_groups = {"policy": MagicMock()}
+        dispatch._ensure_on_gpu = MagicMock()
+
+        dispatch.ensure_active_adapter("policy", None)
+
+        dispatch._ensure_on_gpu.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_swap_precedes_weight_sync_offload(self):
+        """``_prepare_for_weight_sync`` pushes the optimizer (and with it the
+        grad buffers) off GPU, so the swap has to happen before it — not after.
+        """
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        call_order = []
+
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch.colocate_all = True
+        dispatch.cfg = _fft_dispatch_cfg()
+        dispatch._inference_engine_client = AsyncMock()
+        dispatch._broadcast_to_inference_engines = MagicMock(
+            side_effect=lambda *args, **kwargs: call_order.append("broadcast")
+        )
+        dispatch._prepare_for_weight_sync = MagicMock(side_effect=lambda: call_order.append("prepare"))
+        dispatch._finish_weight_sync = MagicMock(side_effect=lambda: call_order.append("finish"))
+        dispatch.ensure_active_adapter = MagicMock(side_effect=lambda *args: call_order.append("swap"))
+
+        await dispatch.save_weights_for_sampler(model_id="model_abc")
+
+        assert call_order == ["swap", "prepare", "broadcast", "finish"]
